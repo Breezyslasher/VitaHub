@@ -221,23 +221,39 @@ set(HUB_SOURCES
     hub/src/hub_settings.cpp
     hub/src/modules.cpp
     hub/src/theme.cpp
+
+    # hub/core: Vita_plex's platform layer and self-updater, renamed to VitaHub
+    hub/core/src/platform/platform_common.cpp
+    hub/core/src/utils/app_update.cpp
+    hub/core/src/utils/http_client.cpp
+    hub/core/src/utils/update_verify.cpp
 )
 if(PLATFORM_PSV)
     # pthread stack floor + stdio lock stubs, shared by every module. miniz is
-    # used by the Plex/ABS/Suwayomi update installers (utils/vita_install).
-    list(APPEND HUB_SOURCES hub/src/vita_stubs.c lib/miniz/miniz.c)
+    # used by the update installers (utils/vita_install).
+    list(APPEND HUB_SOURCES
+        hub/core/src/platform/platform_psv.cpp
+        hub/core/src/utils/vita_install.cpp
+        hub/src/vita_stubs.c
+        lib/miniz/miniz.c)
     set_source_files_properties(lib/miniz/miniz.c PROPERTIES COMPILE_DEFINITIONS "MINIZ_NO_STDIO;MINIZ_NO_TIME")
+else()
+    list(APPEND HUB_SOURCES hub/core/src/platform/platform_desktop.cpp)
 endif()
 
 add_executable(${PROJECT_NAME} ${HUB_SOURCES})
 target_include_directories(${PROJECT_NAME} PRIVATE
     hub/include
+    hub/core/include
+    hub/core_shim
+    lib/miniz
     ${BOREALIS_LIBRARY}/include
     ${BOREALIS_LIBRARY}/include/borealis/extern)
 target_compile_definitions(${PROJECT_NAME} PRIVATE
     VITAHUB=1
     VITAHUB_VERSION=\"${APP_VERSION}\"
     VITAHUB_DISPLAY_VERSION=\"${APP_DISPLAY_VERSION}\"
+    VITAHUB_HAVE_MBEDCRYPTO=1
     RESOURCE_PREFIX=\"${VITAHUB_RESOURCE_PREFIX}\")
 foreach(_m PLEX ABS SUWAYOMI MUSIC)
     if(VITAHUB_MODULE_${_m})
@@ -296,6 +312,28 @@ endif()
 # Packaging
 # ---------------------------------------------------------------------------
 if(PLATFORM_PSV)
+    # ── Updater stub (self-update helper), as in Vita_plex ────────────────
+    # A tiny second Vita app (VHUBUPD01). VitaHub can't promote over itself
+    # while running, so at update time it installs and launches this stub
+    # and quits; the stub promotes the downloaded VPK and relaunches VitaHub.
+    # Its .vpk ships inside VitaHub.vpk as updater.vpk.
+    add_executable(vitahub_updater
+        hub/core/src/updater_stub/main.cpp
+        hub/core/src/utils/vita_install.cpp
+        lib/miniz/miniz.c)
+    target_include_directories(vitahub_updater PRIVATE hub/core/include lib/miniz)
+    target_compile_definitions(vitahub_updater PRIVATE __PSV__ MINIZ_NO_STDIO MINIZ_NO_TIME)
+    target_link_libraries(vitahub_updater
+        mbedcrypto vita2d freetype png z
+        SceGxm_stub SceDisplay_stub SceCommonDialog_stub ScePgf_stub SceCtrl_stub
+        ScePromoterUtil_stub SceSysmodule_stub SceAppMgr_stub SceIofilemgr_stub SceLibKernel_stub)
+    vita_create_self(vitahub_updater.self vitahub_updater UNSAFE NOASLR)
+    # No FILE args: vita_create_vpk accumulates them in a variable it does not
+    # clear between calls, so they would leak into VitaHub.vpk below.
+    vita_create_vpk(vitahub_updater.vpk VHUBUPD01 vitahub_updater.self
+        VERSION 01.00
+        NAME "VitaHub Updater")
+
     vita_create_self(${PROJECT_NAME}.self ${PROJECT_NAME} UNSAFE NOASLR)
 
     # Globbed so a new icon or layout can never be silently left out.
@@ -332,6 +370,7 @@ if(PLATFORM_PSV)
         FILE resources/font/switch_icons.ttf              resources/font/switch_icons.ttf
         FILE resources/material/MaterialIcons-Regular.ttf resources/material/MaterialIcons-Regular.ttf
         FILE resources/cacert.pem                         resources/cacert.pem
+        FILE ${CMAKE_BINARY_DIR}/vitahub_updater.vpk      updater.vpk
         ${VITA_RES_FILE_ARGS}
     )
 endif()

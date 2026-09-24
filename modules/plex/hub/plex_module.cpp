@@ -7,7 +7,9 @@
 #include "app/application.hpp"
 #include "app/downloads_manager.hpp"
 #include "app/hint_icons.hpp"
+#include "platform/platform.hpp"
 #include "utils/http_client.hpp"
+#include "utils/shell_integration.hpp"
 #include "view/video_view.hpp"
 
 namespace vitahub {
@@ -30,6 +32,19 @@ class PlexModule : public Module {
         return i;
     }
 
+    // Windows: the AppUserModelID the taskbar and toasts are keyed on has to
+    // be set before any window exists. No-op elsewhere.
+    void beforeWindow() override { vitaplex::shell::init(); }
+
+    bool acceptDeepLink(const std::string& url) override {
+        if (url.rfind("plex://", 0) == 0 || url.rfind("vitaplex://", 0) == 0 ||
+            url.rfind("https://app.plex.tv", 0) == 0) {
+            vitaplex::platform::offerDeepLink(url);
+            return true;
+        }
+        return false;
+    }
+
     void registerViews() override {
         brls::Application::registerXMLView("vitaplex:VideoView", vitaplex::VideoView::create);
     }
@@ -44,6 +59,7 @@ class PlexModule : public Module {
                 brls::Application::notify("Plex failed to start");
                 return;
             }
+            vitaplex::shell::setShortcutAllowed(app.getSettings().windowsStartMenuShortcut);
             m_started = true;
             paintModuleTheme(*this);
             app.start();

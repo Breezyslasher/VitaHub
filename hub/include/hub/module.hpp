@@ -36,6 +36,18 @@ class Module {
 
     virtual const ModuleInfo& info() const = 0;
 
+    /// Process-level setup that has to happen before borealis creates the
+    /// window (e.g. Plex's Windows shell identity). Called once, at startup.
+    virtual void beforeWindow() {}
+
+    /// A URL VitaHub was launched with (command line / Android intent). If the
+    /// module recognises it, it keeps it for when it starts and returns true;
+    /// the hub then opens that module.
+    virtual bool acceptDeepLink(const std::string& url) {
+        (void)url;
+        return false;
+    }
+
     /// Register the module's custom XML views. Called once, at hub startup,
     /// after brls::Application::init().
     virtual void registerViews() {}

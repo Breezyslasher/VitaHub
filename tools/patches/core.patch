@@ -1,0 +1,35 @@
+diff --git a/hub/core/src/platform/platform_psv.cpp b/hub/core/src/platform/platform_psv.cpp
+index 5dbc707..f6d9ee0 100644
+--- a/hub/core/src/platform/platform_psv.cpp
++++ b/hub/core/src/platform/platform_psv.cpp
+@@ -36,8 +36,12 @@
+ // Reduced from 192 MB to 172 MB - leaves more room for GPU VRAM and system.
+ // With optimized view recycling and image caching, the app uses significantly
+ // less heap, so this headroom is no longer needed.
++#ifndef VITAHUB_HEAP_MB
++#define VITAHUB_HEAP_MB 172
++#endif
+ extern "C" {
+-int _newlib_heap_size_user = 172 * 1024 * 1024;          // 172 MB heap
++// VitaHub: one heap for every service, sized by -DVITAHUB_HEAP_MB.
++int _newlib_heap_size_user = VITAHUB_HEAP_MB * 1024 * 1024;
+ unsigned int sceUserMainThreadStackSize = 2 * 1024 * 1024; // 2 MB stack
+ }
+ 
+@@ -76,10 +80,12 @@ bool initVitaSystem() {
+     // Start with reduced clock speeds for browsing (saves battery).
+     // PlayerActivity raises clocks to max when playback starts,
+     // and lowers them again when playback ends.
+-    scePowerSetArmClockFrequency(333);
+-    scePowerSetBusClockFrequency(166);
+-    scePowerSetGpuClockFrequency(166);
+-    scePowerSetGpuXbarClockFrequency(111);
++    // VitaHub: the highest clocks any of its apps used (Vita_abs and
++    // Vita_Suwayomi run at 444/222/222/166; Vita_plex at 333/166/166/111).
++    scePowerSetArmClockFrequency(444);
++    scePowerSetBusClockFrequency(222);
++    scePowerSetGpuClockFrequency(222);
++    scePowerSetGpuXbarClockFrequency(166);
+ 
+     loadShaderCompiler();
+ 

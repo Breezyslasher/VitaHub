@@ -35,6 +35,9 @@ Usage:
                           --src music=../Vita-Music-Assistant
   tools/import_modules.py --src plex=../Vita_plex --only plex
   tools/import_modules.py ... --no-patch     # stop before step 5
+
+The Vita_plex checkout also provides hub/core/: VitaHub's platform layer and
+self-updater, renamed from Vita_plex's (see import_core()).
 """
 
 import argparse
@@ -73,8 +76,7 @@ MODULES = {
             "src/main.cpp",
             "src/updater_stub",
             "src/updater_ps4",
-            "src/utils/vita_stubs.c",
-            "include/player/mpv_player.h",  # unused duplicate of mpv_player.hpp
+                    "include/player/mpv_player.h",  # unused duplicate of mpv_player.hpp
         ],
         "wrap_headers": {
             "include/platform/paths.hpp": r"^// Legacy constant",
@@ -292,6 +294,121 @@ def import_module(name, src_repo, apply_patch=True):
         print("[%s] applied %s" % (name, os.path.relpath(patch, ROOT)))
 
 
+# ---------------------------------------------------------------------------
+# Hub core: VitaHub's own platform layer and self-updater.
+#
+# Vita_plex has the most complete platform layer of the four apps (every
+# platform VitaHub builds for) and a signed, multi-platform in-app updater.
+# The hub gets its own copy of those files, renamed to VitaHub: namespace
+# vitahub, the VitaHub GitHub repo, VitaHub title IDs and install paths.
+# ---------------------------------------------------------------------------
+CORE_FILES = [
+    "include/platform/platform.hpp",
+    "include/platform/paths.hpp",
+    "include/platform/android_assets.hpp",
+    "include/utils/app_update.hpp",
+    "include/utils/async.hpp",
+    "include/utils/http_client.hpp",
+    "include/utils/ps4_install.hpp",
+    "include/utils/update_verify.hpp",
+    "include/utils/vita_install.hpp",
+    "src/platform/android_assets.cpp",
+    "src/platform/platform_android.cpp",
+    "src/platform/platform_common.cpp",
+    "src/platform/platform_desktop.cpp",
+    "src/platform/platform_ios.mm",
+    "src/platform/platform_ps4.cpp",
+    "src/platform/platform_psv.cpp",
+    "src/platform/platform_switch.cpp",
+    "src/utils/app_update.cpp",
+    "src/utils/http_client.cpp",
+    "src/utils/ps4_install.cpp",
+    "src/utils/update_verify.cpp",
+    "src/utils/vita_head_bin.h",
+    "src/utils/vita_install.cpp",
+    "src/utils/switch_stubs.c",
+    "src/updater_stub/main.cpp",
+    "src/updater_ps4/main.cpp",
+]
+
+# Names that must NOT be renamed: the Android Java classes. VitaHub's Android
+# project keeps Vita_plex's Java sources (the Plex module's JNI code looks
+# them up by name), so the hub's native code has to use the same names.
+CORE_KEEP = [
+    "org/VitaPlex/app/VitaPlexActivity", "org_VitaPlex_app_VitaPlexActivity",
+    "org.VitaPlex.app.VitaPlexActivity",
+    "org/VitaPlex/app", "org_VitaPlex_app", "org.VitaPlex.app",
+    "org/vitaPlex/app", "org_vitaPlex_app", "org.vitaPlex.app",
+    # Exported by patches/borealis/psv_platform.cpp under this name.
+    "vitaplex_set_audio_playback_active", "vitaplex_set_video_render_hook",
+    "vitaplex_signal_video_frame",
+]
+
+CORE_RENAMES = [
+    ("Breezyslasher/Vita_plex", "Breezyslasher/VitaHub"),
+    ("VitaPlexMainEntry", "VitaHubMainEntry"),
+    ("VITA_PLEX_DISPLAY_VERSION", "VITAHUB_DISPLAY_VERSION"),
+    ("VITA_PLEX_VERSION", "VITAHUB_VERSION"),
+    ("VITAPLEX_", "VITAHUB_"),
+    ("VPLX00002", "VHUB00002"),   # PS4 app
+    ("VPLX00003", "VHUB00003"),   # PS4 updater helper
+    ("VPLXUPD01", "VHUBUPD01"),   # Vita updater stub
+    ("VPLEX0001", "VHUB00001"),   # Vita app
+    ("Vita_plex", "VitaHub"),
+    ("VitaPlex", "VitaHub"),
+    ("vitaplex", "vitahub"),
+    ("VITAPLEX", "VITAHUB"),
+]
+
+
+def rename_for_core(text):
+    keep = {}
+    for i, k in enumerate(CORE_KEEP):
+        token = "\x00KEEP%d\x00" % i
+        keep[token] = k
+        text = text.replace(k, token)
+    for old, new in CORE_RENAMES:
+        text = text.replace(old, new)
+    for token, k in keep.items():
+        text = text.replace(token, k)
+    return text
+
+
+def import_core(plex_repo, apply_patch=True):
+    dst = os.path.join(ROOT, "hub", "core")
+    for sub in ("include", "src"):
+        path = os.path.join(dst, sub)
+        if os.path.isdir(path):
+            shutil.rmtree(path)
+    for rel in CORE_FILES:
+        with open(os.path.join(plex_repo, rel), encoding="utf-8", errors="surrogateescape") as f:
+            text = f.read()
+        if rel == "include/platform/paths.hpp":
+            text = wrap_header(text, "vitaplex", r"^#if defined\(__vita__\)")
+        elif rel in ("include/platform/android_assets.hpp",):
+            text = wrap_header(text, "vitaplex", r"^#if defined\(__ANDROID__\)")
+        elif rel == "src/platform/android_assets.cpp":
+            text = wrap_header(text, "vitaplex", r"^#include <borealis/core/logger.hpp>")
+        if rel.endswith((".cpp", ".hpp", ".h", ".mm")) and "updater_" not in rel:
+            text, _ = nest_global_namespaces(text, "vitaplex", GLOBAL_NAMESPACES)
+        text = rename_for_core(text)
+        if rel == "src/updater_stub/main.cpp":
+            # The stub is its own tiny program; give it back the global
+            # vita:: name that the import nested into vitahub::.
+            text = text.replace('#include "utils/vita_install.hpp"\n',
+                                '#include "utils/vita_install.hpp"\n\nnamespace vita = vitahub::vita;\n', 1)
+        out = os.path.join(dst, rel)
+        os.makedirs(os.path.dirname(out), exist_ok=True)
+        with open(out, "w", encoding="utf-8", errors="surrogateescape") as f:
+            f.write(text)
+    print("[core] imported %d files from Vita_plex into hub/core (namespace vitahub)" % len(CORE_FILES))
+    patch = os.path.join(ROOT, "tools", "patches", "core.patch")
+    if apply_patch and os.path.exists(patch) and os.path.getsize(patch) > 0:
+        if subprocess.call(["git", "apply", "--whitespace=nowarn", patch], cwd=ROOT) != 0:
+            subprocess.check_call(["git", "apply", "--3way", "--whitespace=nowarn", patch], cwd=ROOT)
+        print("[core] applied tools/patches/core.patch")
+
+
 # Resource files that legitimately differ between the apps; the hub decides.
 RESOURCE_OWNED_BY_HUB = {
     os.path.normpath(p) for p in (
@@ -352,6 +469,8 @@ def main():
         if args.only and name not in args.only:
             continue
         import_module(name, path, apply_patch=not args.no_patch)
+    if "plex" in srcs and (not args.only or "core" in args.only or "plex" in args.only):
+        import_core(srcs["plex"], apply_patch=not args.no_patch)
     if not args.no_resources:
         merge_resources(srcs)
 

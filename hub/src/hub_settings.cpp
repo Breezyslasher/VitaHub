@@ -3,15 +3,10 @@
 #include <borealis/core/logger.hpp>
 #include <nlohmann/json.hpp>
 
-#include <cstdlib>
+#include <filesystem>
 #include <fstream>
-#include <sstream>
 
-#if defined(__vita__)
-#include <psp2/io/stat.h>
-#else
-#include <sys/stat.h>
-#endif
+#include "platform/paths.hpp"
 
 namespace vitahub {
 
@@ -19,38 +14,17 @@ namespace {
 
 HubSettings s_settings;
 
-void makeDir(const std::string& path) {
-#if defined(__vita__)
-    sceIoMkdir(path.c_str(), 0777);
-#else
-    // Create each component; ignore "already exists".
-    for (size_t pos = 1; pos != std::string::npos; ) {
-        pos = path.find('/', pos + 1);
-        mkdir(path.substr(0, pos).c_str(), 0755);
-    }
-#endif
-}
-
-std::string settingsPath() { return hubDataDir() + "/hub.json"; }
+// ux0:data/VitaHub/hub.json on Vita, the per-platform VitaHub data
+// directory elsewhere (hub/core/include/platform/paths.hpp).
+std::string settingsPath() { return platformPath("hub.json"); }
 
 }  // namespace
-
-std::string hubDataDir() {
-#if defined(__vita__)
-    return "ux0:data/VitaHub";
-#else
-    const char* xdg  = std::getenv("XDG_DATA_HOME");
-    const char* home = std::getenv("HOME");
-    if (xdg && xdg[0] == '/') return std::string(xdg) + "/VitaHub";
-    if (home && *home) return std::string(home) + "/.local/share/VitaHub";
-    return "./VitaHub";
-#endif
-}
 
 HubSettings& hubSettings() { return s_settings; }
 
 void loadHubSettings() {
-    makeDir(hubDataDir());
+    // std::fstream works on every target (Vita's newlib forwards to sceIo),
+    // as in Vita_plex's own settings code.
     std::ifstream in(settingsPath());
     if (!in) return;
     try {
@@ -59,19 +33,24 @@ void loadHubSettings() {
         s_settings.launchTarget = static_cast<LaunchTarget>(j.value("launchTarget", 0));
         s_settings.lastModule   = j.value("lastModule", std::string());
         s_settings.showFps      = j.value("showFps", false);
+        s_settings.autoCheckUpdates     = j.value("autoCheckUpdates", true);
+        s_settings.skippedUpdateVersion = j.value("skippedUpdateVersion", std::string());
     } catch (const std::exception& e) {
         brls::Logger::warning("VitaHub: ignoring unreadable {}: {}", settingsPath(), e.what());
     }
 }
 
 void saveHubSettings() {
-    makeDir(hubDataDir());
     nlohmann::json j = {
         {"unifiedTheme", s_settings.unifiedTheme},
         {"launchTarget", static_cast<int>(s_settings.launchTarget)},
         {"lastModule", s_settings.lastModule},
         {"showFps", s_settings.showFps},
+        {"autoCheckUpdates", s_settings.autoCheckUpdates},
+        {"skippedUpdateVersion", s_settings.skippedUpdateVersion},
     };
+    std::error_code ec;
+    std::filesystem::create_directories(std::filesystem::path(settingsPath()).parent_path(), ec);
     std::ofstream out(settingsPath(), std::ios::trunc);
     if (!out) {
         brls::Logger::error("VitaHub: cannot write {}", settingsPath());

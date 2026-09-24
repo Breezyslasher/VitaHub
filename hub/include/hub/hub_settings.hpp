@@ -17,13 +17,14 @@ struct HubSettings {
     LaunchTarget launchTarget = LaunchTarget::HUB;
     std::string lastModule;
     bool showFps = false;
+    // Self-updater (hub/core/src/utils/app_update.cpp).
+    bool autoCheckUpdates = true;
+    std::string skippedUpdateVersion;
 };
 
 HubSettings& hubSettings();
 void loadHubSettings();
 void saveHubSettings();
 
-/// Hub data directory: ux0:data/VitaHub on Vita, $XDG_DATA_HOME/VitaHub on desktop.
-std::string hubDataDir();
 
 }  // namespace vitahub

@@ -2,6 +2,7 @@
 
 #include "hub/hub_settings.hpp"
 #include "hub/theme.hpp"
+#include "utils/app_update.hpp"
 #include "vitahub/bridge.hpp"
 
 #include <functional>
@@ -196,6 +197,25 @@ brls::View* createSettingsPage() {
                      saveHubSettings();
                  });
     page->addView(launch);
+
+    page->addView(makeHeader("Updates"));
+    auto* check = new brls::DetailCell();
+    check->setText("Check for updates");
+    check->setDetailText(std::string("Installed: ") + VITAHUB_DISPLAY_VERSION);
+    check->registerClickAction([](brls::View*) {
+        app_update::checkForUpdates(true);
+        return true;
+    });
+    page->addView(check);
+    auto* autoCheck = new brls::BooleanCell();
+    autoCheck->init("Check when VitaHub starts", s.autoCheckUpdates, [](bool on) {
+        hubSettings().autoCheckUpdates = on;
+        saveHubSettings();
+    });
+    page->addView(autoCheck);
+    page->addView(makeLabel("VitaHub updates itself from its GitHub releases, and every service "
+                            "updates with it.",
+                            13, theme::dim, true));
 
     page->addView(makeHeader("Diagnostics"));
     auto* fps = new brls::BooleanCell();

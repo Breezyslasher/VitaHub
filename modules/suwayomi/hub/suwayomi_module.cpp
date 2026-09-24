@@ -29,6 +29,12 @@ class SuwayomiModule : public Module {
         return i;
     }
 
+    bool acceptDeepLink(const std::string& url) override {
+        if (url.rfind("vitasuwayomi://", 0) != 0) return false;
+        vitasuwayomi::Application::getInstance().setDeeplink(url);
+        return true;
+    }
+
     void registerViews() override {
         // reader.xml uses <RotatableImage>; the reader registers its other
         // custom views itself.

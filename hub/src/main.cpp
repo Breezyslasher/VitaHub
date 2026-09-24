@@ -2,153 +2,100 @@
  * VitaHub entry point.
  *
  * Owns everything that is process-wide and used to be duplicated in each
- * app's main(): Vita system modules and networking, logging, borealis and the
- * window, and the main loop. Modules only ever run inside this.
+ * app's main(): platform bootstrap (Vita system modules and networking, PS4
+ * Orbis modules, Switch sockets, Android asset extraction, log files),
+ * borealis and the window, and the main loop. Modules only ever run inside
+ * this. The sequence follows Vita_plex's main(), whose platform layer
+ * hub/core is (hub/core/src/platform/platform_<name>.cpp, picked by CMake).
  */
 
 #include <borealis.hpp>
+#ifdef __SWITCH__
+#include <switch.h>
+#include <cstdio>
+#endif
 
 #include <clocale>
-#include <cstdio>
+#include <cstring>
 #include <string>
 
 #include "hub/hub.hpp"
 #include "hub/hub_settings.hpp"
 #include "hub/theme.hpp"
-
-#if defined(__vita__)
-#include <psp2/apputil.h>
-#include <psp2/io/stat.h>
-#include <psp2/kernel/modulemgr.h>
-#include <psp2/kernel/processmgr.h>
-#include <psp2/libssl.h>
-#include <psp2/net/http.h>
-#include <psp2/net/net.h>
-#include <psp2/net/netctl.h>
-#include <psp2/power.h>
-#include <psp2/sysmodule.h>
-
-#include <curl/curl.h>
-
-// One heap for the whole hub. 172 MB is what Vita_plex (video playback)
-// and Vita-Music-Assistant ship; Vita_abs / Vita_Suwayomi used 192 MB, but
-// the GXM video path needs the extra headroom outside the newlib heap more.
-#ifndef VITAHUB_HEAP_MB
-#define VITAHUB_HEAP_MB 172
-#endif
-extern "C" {
-int _newlib_heap_size_user = VITAHUB_HEAP_MB * 1024 * 1024;
-unsigned int sceUserMainThreadStackSize = 2 * 1024 * 1024;
-}
+#include "platform/platform.hpp"
+#include "utils/app_update.hpp"
 
 namespace {
 
-constexpr int NET_MEMORY_SIZE  = 4 * 1024 * 1024;  // Vita_abs / Vita_Suwayomi size
-constexpr int SSL_MEMORY_SIZE  = 512 * 1024;
-constexpr int HTTP_MEMORY_SIZE = 2 * 1024 * 1024;
-char __attribute__((aligned(64))) g_netMemory[NET_MEMORY_SIZE];
-
-void loadShaderCompiler() {
-    if (sceKernelLoadStartModule("ur0:data/libshacccg.suprx", 0, nullptr, 0, nullptr, nullptr) >= 0) return;
-    sceKernelLoadStartModule("vs0:sys/external/libshacccg.suprx", 0, nullptr, 0, nullptr, nullptr);
-}
-
-void initVitaSystem() {
-    SceAppUtilInitParam initParam = {};
-    SceAppUtilBootParam bootParam = {};
-    sceAppUtilInit(&initParam, &bootParam);
-
-    // The highest clocks any of the four apps used (Vita_abs, Vita_Suwayomi).
-    scePowerSetArmClockFrequency(444);
-    scePowerSetBusClockFrequency(222);
-    scePowerSetGpuClockFrequency(222);
-    scePowerSetGpuXbarClockFrequency(166);
-
-    loadShaderCompiler();
-
-    sceSysmoduleLoadModule(SCE_SYSMODULE_NET);
-    sceSysmoduleLoadModule(SCE_SYSMODULE_SSL);
-    sceSysmoduleLoadModule(SCE_SYSMODULE_HTTP);
-    sceSysmoduleLoadModule(SCE_SYSMODULE_HTTPS);
-    sceSysmoduleLoadModule(SCE_SYSMODULE_IME);
-    sceSysmoduleLoadModule(SCE_SYSMODULE_PGF);
-}
-
-bool initVitaNetwork() {
-    SceNetInitParam netInitParam;
-    netInitParam.memory = g_netMemory;
-    netInitParam.size   = NET_MEMORY_SIZE;
-    netInitParam.flags  = 0;
-    int ret = sceNetInit(&netInitParam);
-    if (ret < 0 && ret != (int)0x80410201) return false;  // already initialised is fine
-    ret = sceNetCtlInit();
-    if (ret < 0 && ret != (int)0x80412102) return false;
-    ret = sceSslInit(SSL_MEMORY_SIZE);
-    if (ret < 0 && ret != (int)0x80435001) return false;
-    ret = sceHttpInit(HTTP_MEMORY_SIZE);
-    if (ret < 0 && ret != (int)0x80431002) return false;
-    // The modules' HttpClient::globalInit() calls are reference counted by
-    // curl; this one keeps curl alive for the whole process.
-    curl_global_init(CURL_GLOBAL_DEFAULT);
-    return true;
-}
-
-void cleanupVitaNetwork() {
-    curl_global_cleanup();
-    sceHttpTerm();
-    sceSslTerm();
-    sceNetCtlTerm();
-    sceNetTerm();
+void failAndExit(int code) {
+    vitahub::platform::shutdown();
+    if (vitahub::platform::needsHardExit()) vitahub::platform::hardExit(code);
 }
 
 }  // namespace
-#endif  // __vita__
 
-namespace {
-
-FILE* g_logFile = nullptr;
-
-void openLogFile() {
-#if defined(__vita__)
-    sceIoMkdir("ux0:data/VitaHub", 0777);
-    g_logFile = std::fopen("ux0:data/VitaHub/vitahub.log", "w");
-#endif
-    if (!g_logFile) return;
-    setvbuf(g_logFile, nullptr, _IOLBF, 0);
-    brls::Logger::getLogEvent()->subscribe([](brls::Logger::TimePoint, brls::LogLevel level, std::string log) {
-        const char* tag = "INFO";
-        switch (level) {
-            case brls::LogLevel::LOG_ERROR: tag = "ERROR"; break;
-            case brls::LogLevel::LOG_WARNING: tag = "WARNING"; break;
-            case brls::LogLevel::LOG_DEBUG: tag = "DEBUG"; break;
-            case brls::LogLevel::LOG_VERBOSE: tag = "VERBOSE"; break;
-            default: break;
+// Shared entry point: main() on every platform, SDL_main() on Android
+// (hub/core/src/platform/platform_android.cpp).
+extern "C" int VitaHubMainEntry(int argc, char* argv[]) {
+#ifdef __SWITCH__
+    // Refuse applet-mode launches (the homebrew menu opened from the album
+    // rather than over a title): applets get a fraction of the RAM, so video
+    // playback dies, and only 2 BSD socket sessions (Vita_plex).
+    {
+        AppletType at = appletGetAppletType();
+        if (at != AppletType_Application && at != AppletType_SystemApplication) {
+            consoleInit(NULL);
+            printf("\n  VitaHub needs full memory to run.\n");
+            printf("\n  Launch it with title override: hold R while\n");
+            printf("  opening any game, then start VitaHub from\n");
+            printf("  the homebrew menu.\n");
+            printf("\n  Press + to exit.\n");
+            padConfigureInput(1, HidNpadStyleSet_NpadStandard);
+            PadState pad;
+            padInitializeDefault(&pad);
+            while (appletMainLoop()) {
+                padUpdate(&pad);
+                if (padGetButtonsDown(&pad) & HidNpadButton_Plus) break;
+                consoleUpdate(NULL);
+            }
+            consoleExit(NULL);
+            return 0;
         }
-        std::fprintf(g_logFile, "[%s] %s\n", tag, log.c_str());
-    });
-}
+    }
+#endif
 
-}  // namespace
-
-int main(int argc, char* argv[]) {
-    (void)argc;
-    (void)argv;
     std::setlocale(LC_ALL, "C.UTF-8");
 
-#if defined(__vita__)
-    initVitaSystem();
-    if (!initVitaNetwork()) {
-        sceKernelExitProcess(0);
-        return 1;
+    // Where our own executable lives: on Switch the updater replaces it.
+    if (argc > 0) vitahub::app_update::setSelfPath(argv[0]);
+
+    // A deep link on the command line (desktop URL handlers pass it as the
+    // first argument, Vita_Suwayomi's Android intent as --deeplink <url>).
+    std::string deepLink;
+    for (int i = 1; i < argc; ++i) {
+        if (!argv[i]) continue;
+        if (std::strcmp(argv[i], "--deeplink") == 0 && i + 1 < argc) {
+            deepLink = argv[++i];
+        } else if (deepLink.empty() && std::strstr(argv[i], "://")) {
+            deepLink = argv[i];
+        }
     }
-#endif
 
     brls::Logger::setLogLevel(brls::LogLevel::LOG_INFO);
-    if (!brls::Application::init()) {
-        brls::Logger::error("VitaHub: unable to initialise borealis");
+
+    if (!vitahub::platform::init()) {
+        brls::Logger::error("VitaHub: platform init failed");
+        failAndExit(1);
         return 1;
     }
-    openLogFile();
+
+    for (vitahub::Module* m : vitahub::modules()) m->beforeWindow();
+
+    if (!brls::Application::init()) {
+        brls::Logger::error("VitaHub: unable to initialise borealis");
+        failAndExit(1);
+        return 1;
+    }
 
     // All four apps used the same sidebar padding.
     brls::getStyle().addMetric("brls/sidebar/padding_left", 20);
@@ -166,12 +113,23 @@ int main(int argc, char* argv[]) {
 
     brls::Application::pushActivity(new vitahub::HubActivity(), brls::TransitionAnimation::NONE);
 
-    const vitahub::HubSettings& settings = vitahub::hubSettings();
-    if (settings.launchTarget == vitahub::LaunchTarget::LAST_USED) {
-        if (vitahub::Module* last = vitahub::findModule(settings.lastModule)) {
-            brls::sync([last]() { vitahub::openModule(last); });
+    // Which service to show first: the one a deep link belongs to, else the
+    // last one used if the user asked for that.
+    vitahub::Module* first = nullptr;
+    if (!deepLink.empty()) {
+        for (vitahub::Module* m : vitahub::modules()) {
+            if (m->acceptDeepLink(deepLink)) {
+                first = m;
+                break;
+            }
         }
     }
+    const vitahub::HubSettings& settings = vitahub::hubSettings();
+    if (!first && settings.launchTarget == vitahub::LaunchTarget::LAST_USED)
+        first = vitahub::findModule(settings.lastModule);
+    if (first) brls::sync([first]() { vitahub::openModule(first); });
+
+    if (settings.autoCheckUpdates) vitahub::app_update::checkForUpdates(false);
 
     while (brls::Application::mainLoop()) {
         for (vitahub::Module* m : vitahub::modules()) {
@@ -184,12 +142,11 @@ int main(int argc, char* argv[]) {
     }
     vitahub::saveHubSettings();
 
-#if defined(__vita__)
-    cleanupVitaNetwork();
-    if (g_logFile) std::fclose(g_logFile);
-    sceKernelExitProcess(0);
-#else
-    if (g_logFile) std::fclose(g_logFile);
-#endif
+    vitahub::platform::shutdown();
+    if (vitahub::platform::needsHardExit()) vitahub::platform::hardExit(0);
     return 0;
+}
+
+int main(int argc, char* argv[]) {
+    return VitaHubMainEntry(argc, argv);
 }
