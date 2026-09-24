@@ -413,7 +413,7 @@ def import_core(plex_repo, apply_patch=True):
 # Resource files that legitimately differ between the apps; the hub decides.
 RESOURCE_OWNED_BY_HUB = {
     os.path.normpath(p) for p in (
-        "i18n/en-US/main.json",   # unused by all four apps; hub ships its own
+        "i18n/en-US/main.json",   # unused by all four apps; the hub ships its own
         "images/logo.png",
         "images/logo-small.png",
     )

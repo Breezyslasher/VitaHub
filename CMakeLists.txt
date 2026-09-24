@@ -1408,6 +1408,7 @@ if(PLATFORM_PSV)
         FILE app/platform/psv/sce_sys/livearea/contents/startup.png  sce_sys/livearea/contents/startup.png
         FILE app/platform/psv/sce_sys/livearea/contents/template.xml sce_sys/livearea/contents/template.xml
         FILE ${BOREALIS_DIR}/resources/i18n/en-US/hints.json resources/i18n/en-US/hints.json
+        FILE resources/i18n/en-US/main.json                  resources/i18n/en-US/main.json
         FILE resources/font/font.ttf                      resources/font/font.ttf
         FILE resources/font/icon.ttf                      resources/font/icon.ttf
         FILE resources/font/switch_font.ttf               resources/font/switch_font.ttf
