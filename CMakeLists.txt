@@ -1651,3 +1651,19 @@ elseif(PLATFORM_DESKTOP)
         COMMENT "Copying resources (app + borealis) for desktop build"
     )
 endif()
+
+# iOS / tvOS: the MPVKit / libcurl header paths found above were added to the
+# hub target only; the service modules include <mpv/client.h> and <curl/curl.h>
+# too. (Every other platform finds them on the toolchain's default paths.)
+if(PLATFORM_IOS OR PLATFORM_TVOS)
+    get_target_property(_hub_includes ${PROJECT_NAME} INCLUDE_DIRECTORIES)
+    set(_third_party_includes)
+    foreach(_dir IN LISTS _hub_includes)
+        if(NOT _dir MATCHES "^${PROJECT_SOURCE_DIR}/(hub|lib/borealis)")
+            list(APPEND _third_party_includes "${_dir}")
+        endif()
+    endforeach()
+    foreach(_t IN LISTS VITAHUB_MODULE_TARGETS)
+        target_include_directories(${_t} PRIVATE ${_third_party_includes})
+    endforeach()
+endif()
