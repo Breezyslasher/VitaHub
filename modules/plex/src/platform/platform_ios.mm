@@ -244,6 +244,7 @@ const CaptionStyle& getSystemCaptionStyle() {
 // No deep-link plumbing on this port; nothing ever hands us a URL.
 std::string takePendingDeepLink() { return {}; }
 void setDeepLinkHandler(std::function<void()>) {}
+void offerDeepLink(const std::string&) {}
 
 bool init() {
     if (!::vitaplex::HttpClient::globalInit()) {
@@ -295,7 +296,8 @@ bool needsHardExit() { return false; }
 }  // namespace platform
 }  // namespace vitaplex
 
-// Lives at the top level (matches the declaration in paths.hpp).
+// Lives in the vitaplex namespace, where VitaHub's import wraps paths.hpp.
+namespace vitaplex {
 // iOS apps are sandboxed; the writable area is the per-app Documents
 // directory under the container. NSFileManager resolves the absolute
 // path on first call; cache it for the process lifetime.
@@ -315,3 +317,5 @@ const std::string& getIosDataDir() {
     }
     return s_dir;
 }
+
+}  // namespace vitaplex

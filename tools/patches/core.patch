@@ -19,6 +19,34 @@ index 2eeca2d..5ddf628 100644
 +// VitaHub: Java_org_VitaPlex_app_VitaPlexActivity_nativeDeepLink (a plex://
 +// link arriving while the app runs) is exported by the Plex module's copy of
 +// this file, which owns Plex deep links; defining it here too would clash.
+diff --git a/hub/core/src/platform/platform_ios.mm b/hub/core/src/platform/platform_ios.mm
+index 2cebe01..9e814ac 100644
+--- a/hub/core/src/platform/platform_ios.mm
++++ b/hub/core/src/platform/platform_ios.mm
+@@ -244,6 +244,7 @@ const CaptionStyle& getSystemCaptionStyle() {
+ // No deep-link plumbing on this port; nothing ever hands us a URL.
+ std::string takePendingDeepLink() { return {}; }
+ void setDeepLinkHandler(std::function<void()>) {}
++void offerDeepLink(const std::string&) {}
+ 
+ bool init() {
+     if (!::vitahub::HttpClient::globalInit()) {
+@@ -295,7 +296,8 @@ bool needsHardExit() { return false; }
+ }  // namespace platform
+ }  // namespace vitahub
+ 
+-// Lives at the top level (matches the declaration in paths.hpp).
++// Lives in the vitahub namespace, where VitaHub's import wraps paths.hpp.
++namespace vitahub {
+ // iOS apps are sandboxed; the writable area is the per-app Documents
+ // directory under the container. NSFileManager resolves the absolute
+ // path on first call; cache it for the process lifetime.
+@@ -315,3 +317,5 @@ const std::string& getIosDataDir() {
+     }
+     return s_dir;
+ }
++
++}  // namespace vitahub
 diff --git a/hub/core/src/platform/platform_psv.cpp b/hub/core/src/platform/platform_psv.cpp
 index 5dbc707..f6d9ee0 100644
 --- a/hub/core/src/platform/platform_psv.cpp
