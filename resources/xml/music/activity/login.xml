@@ -1,0 +1,331 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Login 1c "Focused card": one centered glass card on a dark backdrop with
+     a soft cyan aura. 960x544. Brand cyan #00bcee. No on-screen button hints
+     (the Vita shows its own footer glyphs). -->
+<brls:Box
+    width="100%"
+    height="100%"
+    axis="column"
+    justifyContent="center"
+    alignItems="center"
+    backgroundColor="#0b0e13">
+
+    <!-- Card -->
+    <brls:Box
+        id="login/card"
+        width="460"
+        axis="column"
+        alignItems="stretch"
+        backgroundColor="#161b23b8"
+        borderColor="#2b333fff"
+        borderThickness="1"
+        cornerRadius="22"
+        paddingTop="22"
+        paddingBottom="20"
+        paddingLeft="26"
+        paddingRight="26">
+
+        <!-- App icon -->
+        <brls:Box
+            width="100%"
+            axis="row"
+            justifyContent="center">
+            <brls:Image
+                id="login/app_icon"
+                width="52"
+                height="52"
+                cornerRadius="14"
+                scalingType="fit"
+                image="@res/images/logo-small.png"/>
+        </brls:Box>
+
+        <!-- Title / subtitle -->
+        <brls:Label
+            id="login/title"
+            text="Vita Music Assistant"
+            fontSize="20"
+            marginTop="14"
+            horizontalAlign="center"
+            textColor="#eef2f6ff"/>
+        <brls:Label
+            id="login/subtitle"
+            text="Sign in to continue"
+            fontSize="13"
+            marginTop="2"
+            horizontalAlign="center"
+            textColor="#93a0aeff"/>
+
+        <!-- Segmented mode switch: Music Assist. / Remote -->
+        <brls:Box
+            id="login/seg_track"
+            width="100%"
+            height="44"
+            axis="row"
+            alignItems="stretch"
+            marginTop="20"
+            backgroundColor="#12161dff"
+            borderColor="#283240ff"
+            borderThickness="1"
+            cornerRadius="12"
+            padding="5">
+            <brls:Box
+                id="login/seg_ma"
+                grow="1"
+                axis="row"
+                justifyContent="center"
+                alignItems="center"
+                cornerRadius="8"
+                focusable="true"
+                highlightCornerRadius="8">
+                <brls:Label
+                    id="login/seg_ma_label"
+                    text="Music Assist."
+                    fontSize="12"
+                    textColor="#04222eff"/>
+            </brls:Box>
+            <brls:Box
+                id="login/seg_remote"
+                grow="1"
+                axis="row"
+                justifyContent="center"
+                alignItems="center"
+                cornerRadius="8"
+                focusable="true"
+                highlightCornerRadius="8">
+                <brls:Label
+                    id="login/seg_remote_label"
+                    text="Remote"
+                    fontSize="12"
+                    textColor="#93a0aeff"/>
+            </brls:Box>
+        </brls:Box>
+
+        <!-- Music Assistant credential fields -->
+        <brls:Box
+            id="login/fields_credentials"
+            width="100%"
+            axis="column"
+            alignItems="stretch">
+
+            <brls:Label
+                id="login/server_caption"
+                text="SERVER URL"
+                fontSize="10"
+                marginTop="14"
+                marginBottom="4"
+                textColor="#8b95a3ff"/>
+            <brls:Box
+                id="login/server_field"
+                width="100%"
+                height="40"
+                axis="row"
+                alignItems="center"
+                paddingLeft="12"
+                paddingRight="12"
+                backgroundColor="#12161dff"
+                cornerRadius="12"
+                focusable="true"
+                highlightCornerRadius="12">
+                <brls:Label
+                    id="login/server_value"
+                    text="http://your-server:8095"
+                    fontSize="14"
+                    singleLine="true"
+                    textColor="#5d6875ff"/>
+            </brls:Box>
+
+            <brls:Label
+                id="login/username_caption"
+                text="USERNAME"
+                fontSize="10"
+                marginTop="10"
+                marginBottom="4"
+                textColor="#8b95a3ff"/>
+            <brls:Box
+                id="login/username_field"
+                width="100%"
+                height="40"
+                axis="row"
+                alignItems="center"
+                paddingLeft="12"
+                paddingRight="12"
+                backgroundColor="#12161dff"
+                cornerRadius="12"
+                focusable="true"
+                highlightCornerRadius="12">
+                <brls:Label
+                    id="login/username_value"
+                    text="Not set"
+                    fontSize="14"
+                    singleLine="true"
+                    textColor="#5d6875ff"/>
+            </brls:Box>
+
+            <brls:Label
+                id="login/password_caption"
+                text="PASSWORD"
+                fontSize="10"
+                marginTop="10"
+                marginBottom="4"
+                textColor="#8b95a3ff"/>
+            <brls:Box
+                id="login/password_field"
+                width="100%"
+                height="40"
+                axis="row"
+                alignItems="center"
+                paddingLeft="12"
+                paddingRight="12"
+                backgroundColor="#12161dff"
+                cornerRadius="12"
+                focusable="true"
+                highlightCornerRadius="12">
+                <brls:Label
+                    id="login/password_value"
+                    text="Not set"
+                    fontSize="14"
+                    singleLine="true"
+                    textColor="#5d6875ff"/>
+            </brls:Box>
+        </brls:Box>
+
+        <!-- Remote field (Remote mode only) -->
+        <brls:Box
+            id="login/fields_remote"
+            width="100%"
+            axis="column"
+            alignItems="stretch"
+            visibility="gone">
+
+            <brls:Label
+                id="login/remote_caption"
+                text="REMOTE ID"
+                fontSize="10"
+                marginTop="14"
+                marginBottom="4"
+                textColor="#8b95a3ff"/>
+            <brls:Box
+                width="100%"
+                axis="row"
+                alignItems="stretch">
+                <brls:Box
+                    id="login/remote_field"
+                    grow="1"
+                    height="56"
+                    axis="row"
+                    justifyContent="center"
+                    alignItems="center"
+                    paddingLeft="12"
+                    paddingRight="12"
+                    backgroundColor="#12161dff"
+                    cornerRadius="12"
+                    focusable="true"
+                    highlightCornerRadius="12">
+                    <brls:Label
+                        id="login/remote_value"
+                        text="Enter Remote ID"
+                        fontSize="18"
+                        singleLine="true"
+                        textColor="#5d6875ff"/>
+                    <brls:Box
+                        id="login/remote_caret"
+                        width="2"
+                        height="26"
+                        marginLeft="4"
+                        backgroundColor="#00bceeff"/>
+                </brls:Box>
+                <!-- QR scan: open the camera and scan the Remote ID code -->
+                <brls:Box
+                    id="login/remote_scan_button"
+                    width="56"
+                    height="56"
+                    axis="row"
+                    justifyContent="center"
+                    alignItems="center"
+                    marginLeft="8"
+                    backgroundColor="#12161dff"
+                    cornerRadius="12"
+                    focusable="true"
+                    highlightCornerRadius="12">
+                    <brls:Image
+                        id="login/remote_scan_icon"
+                        width="24"
+                        height="24"
+                        scalingType="fit"
+                        image="@res/icons/qrcode-scan.png"/>
+                </brls:Box>
+            </brls:Box>
+
+            <!-- Signaling host hint -->
+            <brls:Box
+                width="100%"
+                axis="row"
+                justifyContent="center"
+                alignItems="center"
+                marginTop="6">
+                <brls:Box
+                    width="8"
+                    height="8"
+                    cornerRadius="4"
+                    marginRight="6"
+                    borderColor="#5d6875ff"
+                    borderThickness="1"/>
+                <brls:Label
+                    id="login/signaling_host"
+                    text="signaling.music-assistant.io"
+                    fontSize="11"
+                    textColor="#5d6875ff"/>
+            </brls:Box>
+        </brls:Box>
+
+        <!-- Connect / Log In button -->
+        <brls:Box
+            id="login/connect_button"
+            width="100%"
+            height="50"
+            axis="row"
+            justifyContent="center"
+            alignItems="center"
+            marginTop="16"
+            backgroundColor="#00bceeff"
+            cornerRadius="12"
+            focusable="true"
+            highlightCornerRadius="12">
+            <brls:Label
+                id="login/connect_label"
+                text="Log In"
+                fontSize="15"
+                textColor="#04222eff"/>
+            <brls:Label
+                id="login/connect_arrow"
+                text="  →"
+                fontSize="15"
+                textColor="#04222eff"/>
+        </brls:Box>
+
+        <!-- Status line -->
+        <brls:Box
+            id="login/status_row"
+            width="100%"
+            axis="row"
+            justifyContent="center"
+            alignItems="center"
+            marginTop="12">
+            <brls:Box
+                id="login/status_dot"
+                width="8"
+                height="8"
+                cornerRadius="4"
+                marginRight="7"
+                backgroundColor="#00bceeff"/>
+            <brls:Label
+                id="login/status"
+                text=""
+                fontSize="12"
+                singleLine="true"
+                textColor="#93a0aeff"/>
+        </brls:Box>
+
+    </brls:Box>
+
+</brls:Box>

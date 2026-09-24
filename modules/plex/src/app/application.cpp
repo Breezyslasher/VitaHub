@@ -1,0 +1,781 @@
+/**
+ * VitaPlex - Application implementation
+ */
+
+#include "app/application.hpp"
+#include "app/plex_client.hpp"
+#include "app/downloads_manager.hpp"
+#include "app/plex_palette.hpp"
+#include "activity/login_activity.hpp"
+#include "activity/main_activity.hpp"
+#include "activity/player_activity.hpp"
+#include "app/synclounge_session.hpp"
+#include "view/media_detail_view.hpp"
+
+#include <borealis.hpp>
+#include <fstream>
+#include <cstring>
+#include <filesystem>
+#include <cmath>
+#include <memory>
+#include <atomic>
+#include "platform/paths.hpp"
+#include "platform/platform.hpp"
+#include "utils/image_loader.hpp"
+#include "view/home_user_picker.hpp"
+
+namespace vitaplex {
+
+Application& Application::getInstance() {
+    static Application instance;
+    return instance;
+}
+
+bool Application::init() {
+    brls::Logger::setLogLevel(brls::LogLevel::LOG_DEBUG);
+    brls::Logger::info("VitaPlex {} initializing...", VITA_PLEX_VERSION);
+
+    // Ensure the platform data root exists (settings/downloads/keys). This
+    // used to be a sceIoMkdir on Vita and a std::filesystem::create_directories
+    // everywhere else — both end up in the same newlib file descriptor layer
+    // on Vita, so the std::filesystem path is portable across every target.
+    {
+        std::error_code ec;
+        std::filesystem::create_directories(
+            std::filesystem::path(platformPath("settings.json")).parent_path(), ec);
+    }
+
+    // Seed platform-specific defaults BEFORE loading the settings file, so
+    // the loader only overrides them if the user has previously saved values.
+    const auto& vc = platform::getVideoConstraints();
+    m_settings.maxBitrate = vc.defaultBitrate;
+    m_settings.videoQuality = static_cast<VideoQuality>(vc.defaultVideoQualityIndex);
+
+    // Load saved settings
+    brls::Logger::info("Loading saved settings...");
+    bool loaded = loadSettings();
+    brls::Logger::info("Settings load result: {}", loaded ? "success" : "failed/not found");
+
+    // Apply settings
+    applyTheme();
+    applyLogLevel();
+
+    m_initialized = true;
+    return true;
+}
+
+void Application::start() {
+    brls::Logger::info("Application::run - isLoggedIn={}, serverUrl={}",
+                       isLoggedIn(), m_serverUrl.empty() ? "(empty)" : m_serverUrl);
+
+    // SyncLounge auto-join prompt: when the room host starts new content that
+    // resolves to a confident local match and we're NOT already in a player,
+    // offer to join via the same options popover the START menu uses. Fires
+    // on the UI thread (the session marshals it).
+    SyncLoungeSession::instance().setMatchPromptCallback(
+        [](const std::string& ratingKey, const std::string& title) {
+            if (PlayerActivity::isActive()) return;          // already watching — auto-load handles it
+            if (SyncLoungeSession::instance().isHost()) return;  // we're driving the party
+            std::vector<OptionRow> rows;
+            rows.push_back({ "play.png", "Join the watch party", "", true, false,
+                [ratingKey](brls::View*) {
+                    Application::getInstance().pushPlayerActivity(ratingKey);
+                    return true;
+                }});
+            rows.push_back({ "cross.png", "Not now", "", false, true,
+                [](brls::View*) { return true; }});
+            MediaDetailView::showCenteredChoice("Watch party", title, std::move(rows));
+        });
+
+    // Check if we have saved login credentials. A local-server session has
+    // no token by design (the server admits this client without auth), so
+    // the server URL alone is enough to restore it.
+    if ((isLoggedIn() || m_settings.localServerMode) && !m_serverUrl.empty()) {
+        brls::Logger::info("Restoring saved session{}...",
+                           isLoggedIn() ? "" : " (local server, no account)");
+        // Verify connection and go to main
+        PlexClient::getInstance().setAuthToken(m_authToken);
+        // Use connectToServer to properly initialize (including Live TV check)
+        if (PlexClient::getInstance().connectToServer(m_serverUrl)) {
+            brls::Logger::info("Restored session and connected to server");
+            // Bidirectional sync: push local offline progress, pull server progress
+            DownloadsManager::getInstance().init();
+            DownloadsManager::getInstance().syncProgressBidirectional();
+            // Push Main first regardless — if the user backs out of the
+            // picker (or never has one, because no Plex Home), they land
+            // on the app as the last-used user. Then overlay the picker
+            // when Auto-login is off. showHomeUserPicker no-ops when the
+            // account has no Plex Home or only the owner.
+            pushMainActivity();
+            if (!m_settings.autoLoginAsLastUser) {
+                showHomeUserPicker(nullptr);
+            }
+        } else {
+            brls::Logger::error("Failed to connect to saved server, showing login");
+            pushLoginActivity();
+        }
+    } else {
+        brls::Logger::info("No saved session, showing login screen");
+        // Show login screen
+        pushLoginActivity();
+    }
+}
+
+void Application::run() {
+    start();
+
+    // Main loop handled by Borealis
+    while (brls::Application::mainLoop()) {
+        // Application keeps running
+    }
+}
+
+void Application::shutdown() {
+    saveSettings();
+    m_initialized = false;
+    brls::Logger::info("VitaPlex shutting down");
+}
+
+void Application::pushLoginActivity() {
+    brls::Application::pushActivity(new LoginActivity());
+}
+
+void Application::showHomeUserPicker(std::function<void()> onComplete) {
+    // No master token = nothing to switch with. Caller proceeds as-is.
+    if (m_masterAuthToken.empty()) {
+        if (onComplete) onComplete();
+        return;
+    }
+
+    std::vector<HomeUser> users;
+    if (!PlexClient::getInstance().fetchHomeUsers(m_masterAuthToken, users)) {
+        brls::Logger::warning("showHomeUserPicker: fetchHomeUsers failed");
+        if (onComplete) onComplete();
+        return;
+    }
+
+    // 0 users = no Plex Home on this account. 1 user = just the owner;
+    // /switch isn't needed because master token IS that user's token.
+    if (users.size() < 2) {
+        if (onComplete) onComplete();
+        return;
+    }
+
+    int selected = 0;
+    if (!m_currentHomeUserUuid.empty()) {
+        for (size_t i = 0; i < users.size(); i++) {
+            if (users[i].uuid == m_currentHomeUserUuid) {
+                selected = (int)i;
+                break;
+            }
+        }
+    }
+
+    // Did the picker actually switch, or did the user back out? Only a real
+    // switch invalidates what's on screen, and the picker reports "resolved"
+    // either way, so trySwitch records it for the completion handler below.
+    auto switched = std::make_shared<bool>(false);
+
+    // The verbatim switch / token-store logic, lifted out of the old dropdown
+    // handler and returning success so the picker can flash the PIN dots on a
+    // wrong PIN. Plex Home /switch is a quick call; keep it synchronous as
+    // before. Presentation lives in view/home_user_picker.hpp.
+    auto trySwitch = [switched](const HomeUser& user, const std::string& pin) -> bool {
+        Application& app = Application::getInstance();
+        std::string newToken;
+        if (!PlexClient::getInstance().switchHomeUser(
+                app.getMasterAuthToken(), user.uuid, pin, newToken)) {
+            return false;
+        }
+        // newToken is the user's plex.tv account token, NOT a media-server
+        // token — for a managed/shared user the server 401s and authenticates
+        // as "guest". Resolve and adopt the per-server access token instead.
+        PlexClient::getInstance().useHomeUserTokens(newToken);
+        app.setCurrentHomeUserUuid(user.uuid);
+        app.setCurrentHomeUserTitle(user.title);
+        app.saveSettings();
+        // Say which account every request from here on belongs to. A non-owner
+        // is refused by the endpoints Plex scopes to the server owner, so a log
+        // that doesn't name the user can't be read.
+        brls::Logger::info("Home user switch: now running as '{}' ({})",
+                           user.title, user.admin ? "server owner" : "NOT the server owner");
+        *switched = true;
+        return true;
+    };
+
+    // Everything on screen was fetched with the previous user's token: the
+    // library list, the home rails, continue-watching, watched state. Plex
+    // shares libraries per user, so the new user may not even have the
+    // libraries still listed in the sidebar — opening one would fail, and it
+    // would look like a broken endpoint rather than a stale view.
+    //
+    // rebuildSidebar() re-fetches /library/sections and drops every tab, so
+    // each one is rebuilt by its factory on next focus and refetches under the
+    // new token. MainActivity is the first activity on the stack and borealis
+    // refuses to pop that, so refreshing it in place is the way to do this.
+    //
+    // Deferred to the next frame rather than run here: this lands inside the
+    // picker's own pop callback, and clearing tabs while that teardown is still
+    // unwinding the focus stack is asking for trouble. MainActivity is
+    // re-resolved inside the callback so a logout mid-switch can't leave a
+    // dangling pointer (same pattern as the Live TV probe).
+    auto finish = [switched, onComplete]() {
+        // Caller's handler first — the Settings one repaints labels on views that rebuildSidebar() is about to destroy.
+        if (onComplete) onComplete();
+        if (!*switched) return;
+        brls::sync([]() {
+            if (auto* main = MainActivity::getInstance()) {
+                brls::Logger::info("Home user switch: reloading libraries for the new user");
+                main->rebuildSidebar();
+            }
+        });
+    };
+
+    homepicker::show(users, selected, trySwitch, finish);
+}
+
+void Application::pushMainActivity() {
+    brls::Application::pushActivity(new MainActivity());
+}
+
+void Application::pushPlayerActivity(const std::string& mediaKey, bool isLocalFile) {
+    brls::Application::pushActivity(new PlayerActivity(mediaKey, isLocalFile));
+}
+
+void Application::pushLiveTVPlayerActivity(const std::string& streamUrl, const std::string& channelTitle,
+                                           const std::string& liveSessionUuid) {
+    brls::Application::pushActivity(
+        PlayerActivity::createForStream(streamUrl, channelTitle, liveSessionUuid));
+}
+
+void Application::applyTheme() {
+    namespace pal = vitaplex::palette;
+
+    // The app ships ONE cohesive dark "all-Plex" palette, so force the dark
+    // variant regardless of the (now-cosmetic) theme setting.
+    brls::Application::getPlatform()->setThemeVariant(brls::ThemeVariant::DARK);
+
+    // Repaint the borealis theme slots in place (no submodule fork). Applied
+    // to BOTH tables so any stray light-theme read still lands on the warm
+    // palette. Two rules keep focus and selection distinct from across a room:
+    //   - Plex GOLD is the accent: brand / active / selected / primary FILL.
+    //   - The highlight gradient is a warm cream HALO (gold -> #FFD46B), never
+    //     a fill — so a focused control reads differently from a gold-filled
+    //     selected one. (We deliberately move the old cyan glow to warm; the
+    //     halo's brightness + the fact selection is a *fill* keep them apart.)
+    // Click ripple. Kept very faint (was 0.15) — on the centered menus/dialogs
+    // the rows are wide, so a 15% gold fill pulsing on select read as a
+    // screen-wide gold flash. 0.04 is barely-there press feedback; the focus
+    // halo already signals the active row.
+    const NVGcolor goldPulse   = pal::goldTint(0.04f);          // click ripple, gold low-alpha
+    const NVGcolor spinnerGold = nvgRGBA(229, 160, 13, 90);     // global loading spinner
+    for (brls::Theme* t : { &brls::Theme::getDarkTheme(),
+                            &brls::Theme::getLightTheme() }) {
+        // surfaces (warm charcoal)
+        t->addColor("brls/clear",                     pal::bg);
+        t->addColor("brls/background",                pal::bg);
+        t->addColor("brls/sidebar/background",        pal::panel);
+        t->addColor("brls/sidebar/separator",         pal::line);
+        t->addColor("brls/applet_frame/separator",    pal::line);
+        t->addColor("brls/header/border",             pal::line);
+        // text
+        t->addColor("brls/text",                      pal::text);
+        t->addColor("brls/text_disabled",             pal::dim);
+        t->addColor("brls/header/subtitle",           pal::muted);
+        t->addColor("brls/header/rectangle",          pal::muted);
+        // accent = gold (brand / active / selected)
+        t->addColor("brls/accent",                    pal::gold);
+        t->addColor("brls/sidebar/active_item",       pal::gold);
+        t->addColor("brls/list/listItem_value_color", pal::gold);
+        // primary button = gold FILL + ink text (the "picked" CTA)
+        t->addColor("brls/button/primary_enabled_background",  pal::gold);
+        t->addColor("brls/button/primary_enabled_text",        pal::goldInk);
+        t->addColor("brls/button/primary_disabled_background", pal::surface3);
+        t->addColor("brls/button/primary_disabled_text",       pal::dim);
+        // default (secondary) button = surface-3 / white
+        t->addColor("brls/button/default_enabled_background",  pal::surface3);
+        t->addColor("brls/button/default_disabled_background", pal::surface2);
+        t->addColor("brls/button/default_enabled_text",        pal::text);
+        t->addColor("brls/button/default_disabled_text",       pal::dim);
+        t->addColor("brls/button/enabled_border_color",        pal::line);
+        t->addColor("brls/button/disabled_border_color",       pal::line);
+        // "highlight" text-button variant
+        t->addColor("brls/button/highlight_enabled_text",      pal::gold);
+        t->addColor("brls/button/highlight_disabled_text",     pal::dim);
+        // FOCUS HALO = warm gold-white (the borealis highlight gradient)
+        t->addColor("brls/highlight/color1",     pal::gold);       // inner — ties to gold
+        t->addColor("brls/highlight/color2",     pal::focusHalo);  // outer — bright cream
+        t->addColor("brls/highlight/background", pal::surface2);   // warm fill behind focus
+        t->addColor("brls/click_pulse",          goldPulse);
+        // slider — gold filled line + gold scrubber knob (bright knob with a
+        // deeper-gold rim so it stays distinct from the filled line)
+        t->addColor("brls/slider/line_filled",          pal::gold);
+        t->addColor("brls/slider/line_empty",           pal::surface3);
+        t->addColor("brls/slider/pointer_color",        pal::goldBright);
+        t->addColor("brls/slider/pointer_border_color", pal::goldDeep);
+        // spinner → warm gold
+        t->addColor("brls/spinner/bar_color",           spinnerGold);
+    }
+
+    brls::Logger::info("Applied all-Plex dark palette");
+}
+
+void Application::applyLogLevel() {
+    if (m_settings.debugLogging) {
+        brls::Logger::setLogLevel(brls::LogLevel::LOG_DEBUG);
+        brls::Logger::info("Debug logging enabled");
+    } else {
+        brls::Logger::setLogLevel(brls::LogLevel::LOG_INFO);
+        brls::Logger::info("Debug logging disabled");
+    }
+}
+
+bool Application::supports4K() {
+    return platform::supports4KDecode();
+}
+
+std::vector<VideoQuality> Application::qualityLadder() {
+    std::vector<VideoQuality> tiers = { VideoQuality::ORIGINAL };
+    if (supports4K()) tiers.push_back(VideoQuality::QUALITY_4K);
+    tiers.insert(tiers.end(), {
+        VideoQuality::QUALITY_1080P, VideoQuality::QUALITY_720P,
+        VideoQuality::QUALITY_480P,  VideoQuality::QUALITY_360P,
+        VideoQuality::QUALITY_240P,
+    });
+    return tiers;
+}
+
+void Application::videoLimitFor(VideoQuality quality, int& outWidth, int& outHeight) {
+    const auto& vc = platform::getVideoConstraints();
+    outWidth  = vc.maxVideoWidth;
+    outHeight = vc.maxVideoHeight;
+    if (quality == VideoQuality::QUALITY_4K && supports4K()) {
+        outWidth  = 3840;
+        outHeight = 2160;
+    }
+}
+
+const char* Application::resolutionFor(VideoQuality quality) {
+    switch (quality) {
+        case VideoQuality::QUALITY_4K:
+            if (supports4K()) return "3840x2160";
+            break;                                  // else the default below
+        case VideoQuality::QUALITY_1080P: return "1920x1080";
+        case VideoQuality::QUALITY_720P:  return "1280x720";
+        case VideoQuality::QUALITY_480P:  return "854x480";
+        case VideoQuality::QUALITY_360P:  return "640x360";
+        case VideoQuality::QUALITY_240P:  return "426x240";
+        case VideoQuality::ORIGINAL:      break;
+    }
+    return platform::getVideoConstraints().defaultResolution;
+}
+
+std::string Application::getQualityString(VideoQuality quality) {
+    switch (quality) {
+        case VideoQuality::ORIGINAL: return "Original (Direct Play)";
+        case VideoQuality::QUALITY_4K: return "4K (40 Mbps)";
+        case VideoQuality::QUALITY_1080P: return "1080p (20 Mbps)";
+        case VideoQuality::QUALITY_720P: return "720p (4 Mbps)";
+        case VideoQuality::QUALITY_480P: return "480p (2 Mbps)";
+        case VideoQuality::QUALITY_360P: return "360p (1 Mbps)";
+        case VideoQuality::QUALITY_240P: return "240p (500 Kbps)";
+        default: return "Unknown";
+    }
+}
+
+std::string Application::getThemeString(AppTheme theme) {
+    switch (theme) {
+        case AppTheme::SYSTEM: return "System";
+        case AppTheme::LIGHT: return "Light";
+        case AppTheme::DARK: return "Dark";
+        default: return "Unknown";
+    }
+}
+
+std::string Application::getSubtitleSizeString(SubtitleSize size) {
+    switch (size) {
+        case SubtitleSize::SMALL: return "Small";
+        case SubtitleSize::MEDIUM: return "Medium";
+        case SubtitleSize::LARGE: return "Large";
+        default: return "Unknown";
+    }
+}
+
+bool Application::loadSettings() {
+    // Single unified path: std::ifstream works on every target (on Vita it
+    // goes through newlib's POSIX shim into sceIoOpen). This replaces the
+    // old #ifdef __vita__ duplicate of the loader that called sceIoOpen
+    // directly and reached for a hard-coded "ux0:data/VitaPlex/settings.json".
+    const std::string settingsPath = platformPath("settings.json");
+    brls::Logger::debug("loadSettings: Opening {}", settingsPath);
+
+    std::ifstream ifs(settingsPath);
+    if (!ifs.is_open()) {
+        brls::Logger::debug("No settings file found");
+        return false;
+    }
+
+    std::string content((std::istreambuf_iterator<char>(ifs)),
+                         std::istreambuf_iterator<char>());
+    ifs.close();
+    if (content.empty()) {
+        brls::Logger::debug("Settings file is empty");
+        return false;
+    }
+
+    // Simple JSON parsing for strings (handles whitespace after colon)
+    auto extractString = [&content](const std::string& key) -> std::string {
+        std::string search = "\"" + key + "\":";
+        size_t pos = content.find(search);
+        if (pos == std::string::npos) return "";
+        pos += search.length();
+        while (pos < content.length() && (content[pos] == ' ' || content[pos] == '\t')) pos++;
+        if (pos >= content.length() || content[pos] != '"') return "";
+        pos++;
+        size_t end = content.find("\"", pos);
+        if (end == std::string::npos) return "";
+        return content.substr(pos, end - pos);
+    };
+
+    auto extractInt = [&content](const std::string& key) -> int {
+        std::string search = "\"" + key + "\":";
+        size_t pos = content.find(search);
+        if (pos == std::string::npos) return 0;
+        pos += search.length();
+        while (pos < content.length() && (content[pos] == ' ' || content[pos] == '\t')) pos++;
+        size_t end = content.find_first_of(",}\n", pos);
+        if (end == std::string::npos) return 0;
+        return atoi(content.substr(pos, end - pos).c_str());
+    };
+
+    auto extractBool = [&content](const std::string& key, bool defaultVal = false) -> bool {
+        std::string search = "\"" + key + "\":";
+        size_t pos = content.find(search);
+        if (pos == std::string::npos) return defaultVal;
+        pos += search.length();
+        while (pos < content.length() && (content[pos] == ' ' || content[pos] == '\t')) pos++;
+        return (content.substr(pos, 4) == "true");
+    };
+
+    // Authentication
+    m_authToken = extractString("authToken");
+    m_serverUrl = extractString("serverUrl");
+    m_username  = extractString("username");
+
+    // Plex Home user state. masterAuthToken falls back to authToken when
+    // the saved file predates the home-users feature, so the very first
+    // load after upgrading still has a valid master token to list users
+    // with — otherwise the picker would be empty.
+    m_masterAuthToken      = extractString("masterAuthToken");
+    if (m_masterAuthToken.empty()) m_masterAuthToken = m_authToken;
+    m_currentHomeUserUuid  = extractString("currentHomeUserUuid");
+    m_currentHomeUserTitle = extractString("currentHomeUserTitle");
+
+    // homeUser is the one that matters when reading a log: every request below
+    // carries that user's per-server token, and a non-owner is refused by the
+    // endpoints Plex scopes to the server owner. Without it there is no way to
+    // tell from a log which account a run was made under.
+    brls::Logger::info("loadSettings: authToken={}, serverUrl={}, username={}, homeUser={}",
+                       m_authToken.empty() ? "(empty)" : "(set)",
+                       m_serverUrl.empty() ? "(empty)" : m_serverUrl,
+                       m_username.empty()  ? "(empty)" : m_username,
+                       m_currentHomeUserTitle.empty() ? "(none — server owner)"
+                                                      : m_currentHomeUserTitle);
+
+    // UI settings
+    m_settings.theme = static_cast<AppTheme>(extractInt("theme"));
+    m_settings.debugLogging = extractBool("debugLogging", true);
+
+    // Layout settings
+    m_settings.hiddenLibraries = extractString("hiddenLibraries");
+    m_settings.sidebarOrder    = extractString("sidebarOrder");
+    m_settings.hiddenSidebarItems = extractString("hiddenSidebarItems");
+    m_settings.librarySortPrefs = extractString("librarySortPrefs");
+    m_settings.localServerMode = extractBool("localServerMode", false);
+    m_settings.lastHadLiveTV = extractBool("lastHadLiveTV", false);
+    m_settings.autoCheckUpdates = extractBool("autoCheckUpdates", true);
+    m_settings.skippedUpdateVersion = extractString("skippedUpdateVersion");
+
+    // Content display settings
+    m_settings.showCollections  = extractBool("showCollections", true);
+    m_settings.showPlaylists    = extractBool("showPlaylists", true);
+    m_settings.showGenres       = extractBool("showGenres", true);
+    m_settings.hideTitlesInGrid = extractBool("hideTitlesInGrid", false);
+    m_settings.skipSingleSeason = extractBool("skipSingleSeason", false);
+
+    // Playback settings
+    m_settings.autoPlayNext    = extractBool("autoPlayNext", true);
+    m_settings.resumePlayback  = extractBool("resumePlayback", true);
+    m_settings.showSubtitles   = extractBool("showSubtitles", true);
+    m_settings.subtitleSize    = static_cast<SubtitleSize>(extractInt("subtitleSize"));
+    m_settings.seekInterval    = extractInt("seekInterval");
+    if (m_settings.seekInterval <= 0) m_settings.seekInterval = 10;
+    m_settings.controlsAutoHideSeconds = extractInt("controlsAutoHideSeconds");
+    if (m_settings.controlsAutoHideSeconds < 0) m_settings.controlsAutoHideSeconds = 5;
+    m_settings.autoSkipIntro   = extractBool("autoSkipIntro", false);
+    m_settings.autoSkipCredits = extractBool("autoSkipCredits", false);
+    m_settings.playerLayout    = extractInt("playerLayout");
+    if (m_settings.playerLayout < 0 || m_settings.playerLayout > 2) m_settings.playerLayout = 0;
+    m_settings.videoPlayerLayout = extractInt("videoPlayerLayout");
+    if (m_settings.videoPlayerLayout < 0 || m_settings.videoPlayerLayout > 2) m_settings.videoPlayerLayout = 0;
+    {
+        std::string lang = extractString("defaultSubtitleLanguage");
+        if (!lang.empty()) m_settings.defaultSubtitleLanguage = lang;
+    }
+    {
+        std::string sls = extractString("syncLoungeServer");
+        if (!sls.empty()) m_settings.syncLoungeServer = sls;
+        m_settings.syncLoungeRoom = extractString("syncLoungeRoom");
+    }
+
+    m_settings.showMpvStats = extractBool("showMpvStats", false);
+
+    // Transcode settings. If the setting isn't present in the JSON, keep
+    // the platform defaults Application::init() seeded earlier.
+    {
+        const auto& vc = platform::getVideoConstraints();
+        int vq = extractInt("videoQuality");
+        if (vq > 0) {
+            m_settings.videoQuality = static_cast<VideoQuality>(vq);
+        }
+        m_settings.forceTranscode = extractBool("forceTranscode", false);
+        int mb = extractInt("maxBitrate");
+        if (mb > 0) {
+            m_settings.maxBitrate = mb;
+        } else {
+            m_settings.maxBitrate = vc.defaultBitrate;
+        }
+        // A saved tier this device cannot decode has to be dropped, not merely
+        // hidden: the picker would show one thing while the transcode request
+        // carried another, and the stored bitrate would stay at the tier's.
+        // Reachable from a config written before a capability check tightened,
+        // or carried between devices.
+        auto offered = [](VideoQuality q) {
+            for (VideoQuality t : qualityLadder()) if (t == q) return true;
+            return false;
+        };
+        if (!offered(m_settings.videoQuality)) {
+            brls::Logger::info("Video quality {} unavailable here — falling back",
+                               getQualityString(m_settings.videoQuality));
+            m_settings.videoQuality = static_cast<VideoQuality>(vc.defaultVideoQualityIndex);
+            m_settings.maxBitrate   = vc.defaultBitrate;
+        }
+    }
+
+    // Network settings
+    m_settings.connectionTimeout = extractInt("connectionTimeout");
+    if (m_settings.connectionTimeout <= 0) m_settings.connectionTimeout = 180;
+    m_settings.directPlay = extractBool("directPlay", false);
+
+    // Download settings
+    m_settings.windowsStartMenuShortcut = extractBool("windowsStartMenuShortcut", true);
+    m_settings.deleteAfterWatch = extractBool("deleteAfterWatch", false);
+    {
+        int dq = extractInt("downloadQuality");   // 0 (ORIGINAL) when absent
+        // Upper bound tracks the enum — 4K was appended as 6, and the old
+        // `<= 5` silently discarded it, leaving the picker on Original.
+        if (dq >= 0 && dq <= (int)VideoQuality::QUALITY_4K)
+            m_settings.downloadQuality = static_cast<VideoQuality>(dq);
+        // Same reasoning as videoQuality above: a tier this device cannot
+        // decode must not survive into the transcode request.
+        bool dqOffered = false;
+        for (VideoQuality t : qualityLadder()) if (t == m_settings.downloadQuality) dqOffered = true;
+        if (!dqOffered) m_settings.downloadQuality = VideoQuality::ORIGINAL;
+    }
+    m_settings.downloadKeepOriginalAudio = extractBool("downloadKeepOriginalAudio", false);
+    m_settings.downloadIncludeSubtitles  = extractBool("downloadIncludeSubtitles", false);
+
+    // Music settings
+    int lyricsProv = extractInt("lyricsProvider");
+    if (lyricsProv >= 0 && lyricsProv <= 2)
+        m_settings.lyricsProvider = static_cast<LyricsProvider>(lyricsProv);
+
+    m_settings.lyricsWordByWord = extractBool("lyricsWordByWord", true);
+    int lyricsTim = extractInt("lyricsTiming");
+    if (lyricsTim >= 0 && lyricsTim <= 2)
+        m_settings.lyricsTiming = static_cast<LyricsTiming>(lyricsTim);
+
+    int trackAction = extractInt("trackDefaultAction");
+    if (trackAction >= 0 && trackAction <= 4) {
+        m_settings.trackDefaultAction = static_cast<TrackDefaultAction>(trackAction);
+    }
+    m_settings.audioPassthrough = extractBool("audioPassthrough", false);
+    m_settings.backgroundMusic = extractBool("backgroundMusic", true);
+    m_settings.musicShuffleDefault = extractBool("musicShuffleDefault", false);
+
+    // Live TV / DVR settings
+    m_settings.defaultDvrShowSectionId     = extractString("defaultDvrShowSectionId");
+    m_settings.defaultDvrShowSectionTitle  = extractString("defaultDvrShowSectionTitle");
+    m_settings.defaultDvrMovieSectionId    = extractString("defaultDvrMovieSectionId");
+    m_settings.defaultDvrMovieSectionTitle = extractString("defaultDvrMovieSectionTitle");
+    // Migrate the old single default into both slots. Its library type
+    // was never recorded, and everything downstream filters by type, so
+    // only the matching slot will ever apply — the other behaves as unset.
+    if (m_settings.defaultDvrShowSectionId.empty() &&
+        m_settings.defaultDvrMovieSectionId.empty()) {
+        const std::string legacyId    = extractString("defaultDvrSectionId");
+        const std::string legacyTitle = extractString("defaultDvrSectionTitle");
+        if (!legacyId.empty()) {
+            m_settings.defaultDvrShowSectionId     = legacyId;
+            m_settings.defaultDvrShowSectionTitle  = legacyTitle;
+            m_settings.defaultDvrMovieSectionId    = legacyId;
+            m_settings.defaultDvrMovieSectionTitle = legacyTitle;
+        }
+    }
+    {
+        int v = extractInt("dvrStartOffsetMinutes");
+        if (v >= 0 && v <= 60) m_settings.dvrStartOffsetMinutes = v;
+    }
+    {
+        int v = extractInt("dvrEndOffsetMinutes");
+        if (v >= 0 && v <= 60) m_settings.dvrEndOffsetMinutes = v;
+    }
+    m_settings.dvrRecordPartials = extractBool("dvrRecordPartials", true);
+    m_settings.dvrNewAiringsOnly = extractBool("dvrNewAiringsOnly", false);
+    {
+        int v = extractInt("dvrMinVideoQuality");
+        if (v >= 0 && v <= 100) m_settings.dvrMinVideoQuality = v;
+    }
+    {
+        int v = extractInt("liveTvGuideHours");
+        // Up to 14 days (336h). The Plex grid has no API-enforced max; this
+        // ceiling is practical (large windows fetch/hold a lot of EPG data).
+        if (v > 0 && v <= 336) m_settings.liveTvGuideHours = v;
+    }
+    m_settings.autoLoginAsLastUser = extractBool("autoLoginAsLastUser", true);
+    {
+        // 0 = disabled; cap at one week so a corrupt settings file can't pin us to a stale response forever.
+        int v = extractInt("cacheLifetimeMinutes");
+        if (v >= 0 && v <= 10080) m_settings.cacheLifetimeMinutes = v;
+    }
+
+    brls::Logger::info("Settings loaded successfully from {}", settingsPath);
+    return !m_authToken.empty();
+}
+
+bool Application::saveSettings() {
+    // Single unified path: std::ofstream works on every target. Vita's
+    // newlib shim forwards to sceIoOpen under the hood, so this removes
+    // the old #ifdef __vita__ sceIoWrite duplicate.
+    const std::string settingsPath = platformPath("settings.json");
+    std::error_code ec;
+    std::filesystem::create_directories(
+        std::filesystem::path(settingsPath).parent_path(), ec);
+
+    brls::Logger::debug("saveSettings: authToken={}, serverUrl={}, username={}",
+                        m_authToken.empty() ? "(empty)" : "(set)",
+                        m_serverUrl.empty() ? "(empty)" : m_serverUrl,
+                        m_username.empty()  ? "(empty)" : m_username);
+
+    auto b = [](bool v) { return std::string(v ? "true" : "false"); };
+
+    // JSON-escape every user-controlled string before splicing it into the
+    // settings blob. Without this, a server URL or username containing a "
+    // corrupts the file on save (so the next load silently wipes all
+    // settings), and a hostile Plex server could arrange for its username
+    // to contain \",\"authToken\":\"<attacker>\" and rewrite our stored
+    // token on the next save.
+    auto esc = [](const std::string& s) {
+        std::string out;
+        out.reserve(s.size() + 2);
+        for (unsigned char c : s) {
+            switch (c) {
+                case '"':  out += "\\\""; break;
+                case '\\': out += "\\\\"; break;
+                case '\b': out += "\\b"; break;
+                case '\f': out += "\\f"; break;
+                case '\n': out += "\\n"; break;
+                case '\r': out += "\\r"; break;
+                case '\t': out += "\\t"; break;
+                default:
+                    if (c < 0x20) {
+                        char buf[8];
+                        snprintf(buf, sizeof(buf), "\\u%04x", c);
+                        out += buf;
+                    } else {
+                        out += (char)c;
+                    }
+            }
+        }
+        return out;
+    };
+
+    std::string json = "{\n";
+    json += "  \"authToken\": \"" + esc(m_authToken) + "\",\n";
+    json += "  \"masterAuthToken\": \"" + esc(m_masterAuthToken) + "\",\n";
+    json += "  \"currentHomeUserUuid\": \"" + esc(m_currentHomeUserUuid) + "\",\n";
+    json += "  \"currentHomeUserTitle\": \"" + esc(m_currentHomeUserTitle) + "\",\n";
+    json += "  \"serverUrl\": \"" + esc(m_serverUrl) + "\",\n";
+    json += "  \"username\": \"" + esc(m_username) + "\",\n";
+    json += "  \"theme\": " + std::to_string(static_cast<int>(m_settings.theme)) + ",\n";
+    json += "  \"debugLogging\": " + b(m_settings.debugLogging) + ",\n";
+    json += "  \"hiddenLibraries\": \"" + esc(m_settings.hiddenLibraries) + "\",\n";
+    json += "  \"sidebarOrder\": \"" + esc(m_settings.sidebarOrder) + "\",\n";
+    json += "  \"hiddenSidebarItems\": \"" + esc(m_settings.hiddenSidebarItems) + "\",\n";
+    json += "  \"librarySortPrefs\": \"" + esc(m_settings.librarySortPrefs) + "\",\n";
+    json += "  \"localServerMode\": " + b(m_settings.localServerMode) + ",\n";
+    json += "  \"lastHadLiveTV\": " + b(m_settings.lastHadLiveTV) + ",\n";
+    json += "  \"autoCheckUpdates\": " + b(m_settings.autoCheckUpdates) + ",\n";
+    json += "  \"skippedUpdateVersion\": \"" + esc(m_settings.skippedUpdateVersion) + "\",\n";
+    json += "  \"showCollections\": " + b(m_settings.showCollections) + ",\n";
+    json += "  \"showPlaylists\": " + b(m_settings.showPlaylists) + ",\n";
+    json += "  \"showGenres\": " + b(m_settings.showGenres) + ",\n";
+    json += "  \"hideTitlesInGrid\": " + b(m_settings.hideTitlesInGrid) + ",\n";
+    json += "  \"skipSingleSeason\": " + b(m_settings.skipSingleSeason) + ",\n";
+    json += "  \"autoPlayNext\": " + b(m_settings.autoPlayNext) + ",\n";
+    json += "  \"resumePlayback\": " + b(m_settings.resumePlayback) + ",\n";
+    json += "  \"showSubtitles\": " + b(m_settings.showSubtitles) + ",\n";
+    json += "  \"subtitleSize\": " + std::to_string(static_cast<int>(m_settings.subtitleSize)) + ",\n";
+    json += "  \"seekInterval\": " + std::to_string(m_settings.seekInterval) + ",\n";
+    json += "  \"controlsAutoHideSeconds\": " + std::to_string(m_settings.controlsAutoHideSeconds) + ",\n";
+    json += "  \"autoSkipIntro\": " + b(m_settings.autoSkipIntro) + ",\n";
+    json += "  \"autoSkipCredits\": " + b(m_settings.autoSkipCredits) + ",\n";
+    json += "  \"playerLayout\": " + std::to_string(m_settings.playerLayout) + ",\n";
+    json += "  \"videoPlayerLayout\": " + std::to_string(m_settings.videoPlayerLayout) + ",\n";
+    json += "  \"defaultSubtitleLanguage\": \"" + esc(m_settings.defaultSubtitleLanguage) + "\",\n";
+    json += "  \"syncLoungeServer\": \"" + esc(m_settings.syncLoungeServer) + "\",\n";
+    json += "  \"syncLoungeRoom\": \"" + esc(m_settings.syncLoungeRoom) + "\",\n";
+    json += "  \"showMpvStats\": " + b(m_settings.showMpvStats) + ",\n";
+    json += "  \"videoQuality\": " + std::to_string(static_cast<int>(m_settings.videoQuality)) + ",\n";
+    json += "  \"forceTranscode\": " + b(m_settings.forceTranscode) + ",\n";
+    json += "  \"maxBitrate\": " + std::to_string(m_settings.maxBitrate) + ",\n";
+    json += "  \"connectionTimeout\": " + std::to_string(m_settings.connectionTimeout) + ",\n";
+    json += "  \"directPlay\": " + b(m_settings.directPlay) + ",\n";
+    json += "  \"windowsStartMenuShortcut\": " + b(m_settings.windowsStartMenuShortcut) + ",\n";
+    json += "  \"deleteAfterWatch\": " + b(m_settings.deleteAfterWatch) + ",\n";
+    json += "  \"downloadQuality\": " + std::to_string(static_cast<int>(m_settings.downloadQuality)) + ",\n";
+    json += "  \"downloadKeepOriginalAudio\": " + b(m_settings.downloadKeepOriginalAudio) + ",\n";
+    json += "  \"downloadIncludeSubtitles\": " + b(m_settings.downloadIncludeSubtitles) + ",\n";
+    json += "  \"trackDefaultAction\": " + std::to_string(static_cast<int>(m_settings.trackDefaultAction)) + ",\n";
+    json += "  \"lyricsProvider\": " + std::to_string(static_cast<int>(m_settings.lyricsProvider)) + ",\n";
+    json += "  \"lyricsTiming\": " + std::to_string(static_cast<int>(m_settings.lyricsTiming)) + ",\n";
+    json += "  \"lyricsWordByWord\": " + b(m_settings.lyricsWordByWord) + ",\n";
+    json += "  \"audioPassthrough\": " + b(m_settings.audioPassthrough) + ",\n";
+    json += "  \"backgroundMusic\": " + b(m_settings.backgroundMusic) + ",\n";
+    json += "  \"musicShuffleDefault\": " + b(m_settings.musicShuffleDefault) + ",\n";
+    json += "  \"defaultDvrShowSectionId\": \"" + esc(m_settings.defaultDvrShowSectionId) + "\",\n";
+    json += "  \"defaultDvrShowSectionTitle\": \"" + esc(m_settings.defaultDvrShowSectionTitle) + "\",\n";
+    json += "  \"defaultDvrMovieSectionId\": \"" + esc(m_settings.defaultDvrMovieSectionId) + "\",\n";
+    json += "  \"defaultDvrMovieSectionTitle\": \"" + esc(m_settings.defaultDvrMovieSectionTitle) + "\",\n";
+    json += "  \"dvrStartOffsetMinutes\": " + std::to_string(m_settings.dvrStartOffsetMinutes) + ",\n";
+    json += "  \"dvrEndOffsetMinutes\": " + std::to_string(m_settings.dvrEndOffsetMinutes) + ",\n";
+    json += "  \"dvrRecordPartials\": " + b(m_settings.dvrRecordPartials) + ",\n";
+    json += "  \"dvrNewAiringsOnly\": " + b(m_settings.dvrNewAiringsOnly) + ",\n";
+    json += "  \"dvrMinVideoQuality\": " + std::to_string(m_settings.dvrMinVideoQuality) + ",\n";
+    json += "  \"liveTvGuideHours\": " + std::to_string(m_settings.liveTvGuideHours) + ",\n";
+    json += "  \"autoLoginAsLastUser\": " + b(m_settings.autoLoginAsLastUser) + ",\n";
+    json += "  \"cacheLifetimeMinutes\": " + std::to_string(m_settings.cacheLifetimeMinutes) + "\n";
+    json += "}\n";
+
+    std::ofstream ofs(settingsPath, std::ios::trunc);
+    if (!ofs.is_open()) {
+        brls::Logger::error("Failed to open settings for write: {}", settingsPath);
+        return false;
+    }
+    ofs << json;
+    ofs.close();
+    brls::Logger::info("Settings saved to {} ({} bytes)", settingsPath, json.length());
+    return true;
+}
+
+} // namespace vitaplex

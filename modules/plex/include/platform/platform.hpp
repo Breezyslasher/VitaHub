@@ -1,0 +1,455 @@
+#pragma once
+
+/**
+ * VitaPlex platform abstraction layer.
+ *
+ * This header declares a small platform-agnostic interface. CMake selects
+ * exactly one implementation file from src/platform/platform_<name>.cpp at
+ * configure time (one per supported target: psv, ps4, switch, desktop,
+ * android), so application code can call into the platform layer with
+ * **zero #ifdefs**.
+ *
+ * The pattern mirrors how Vita_Suwayomi structures its platform code:
+ *
+ *   include/platform/platform.hpp     (interface — this file)
+ *   src/platform/platform_psv.cpp     (PSV/Vita implementation)
+ *   src/platform/platform_ps4.cpp     (PS4 implementation)
+ *   src/platform/platform_switch.cpp  (Switch implementation)
+ *   src/platform/platform_desktop.cpp (Linux/macOS/Windows implementation)
+ *   src/platform/platform_android.cpp (Android implementation)
+ *
+ * Adding a new function here requires implementing it in every platform_*.cpp
+ * file, which is enforced by the linker — so platforms cannot silently drift.
+ */
+
+#include <string>
+#include <vector>
+#include <cstdint>
+#include <cstdio>
+#include <functional>
+
+namespace vitaplex {
+namespace platform {
+
+/**
+ * Per-platform image / grid sizing constraints.
+ *
+ * Cover image resolution must be tuned per device because:
+ *   - PSV has a 960x544 screen and very limited VRAM, so it should request
+ *     small thumbnails to avoid OOM and keep scrolling smooth.
+ *   - Switch is 1280x720 docked, so medium thumbnails look crisp without
+ *     wasting memory.
+ *   - PS4 / Desktop / Android run at 1080p+ and benefit from much larger
+ *     covers so posters do not look blurry.
+ *
+ * The struct is returned by getImageConstraints() and consumed by the
+ * recycling grid and media item cell. NO platform code should hard-code
+ * these numbers anywhere else.
+ */
+struct ImageConstraints {
+    // Portrait poster (movies, TV shows, seasons)
+    int posterWidth;
+    int posterHeight;
+
+    // Square cover (music albums, artists, playlists)
+    int squareCoverSize;
+
+    // Landscape still (TV episodes, clips/extras)
+    int landscapeWidth;
+    int landscapeHeight;
+
+    // Recycling grid layout
+    int gridColumns;        // how many cells per row
+    int gridCellSpacing;    // pixels between cells
+
+    // Cell typography (kept here so font sizes scale with cell size)
+    int titleFontSize;
+    int subtitleFontSize;
+    int descriptionFontSize;
+
+    // Home tab typography / layout. The row height must be at least
+    // posterHeight + ~45 so portrait covers aren't clipped top/bottom.
+    int homeTitleFontSize;     // big "Home" header
+    int homeSectionFontSize;   // "Recently Added …" section headings
+    int homeRowHeight;         // carousel row height (clamps tall posters)
+
+    // Detail-view horizontal carousels. Each row must clear its cell's
+    // intrinsic height plus ~30-50px for the label/margins, otherwise the
+    // cover tops/bottoms get clipped on taller platforms. `homeRowHeight`
+    // is reused for portrait poster rows (e.g. seasons on a show page).
+    int landscapeRowHeight;    // episode / extras carousel (landscape stills)
+    int squareRowHeight;       // music album / track carousel (square covers)
+
+    // List rows (downloads tab, track list) — pixels per row.
+    int listRowHeight;
+
+    // LiveTV tab layout.
+    int livetvChannelCardWidth;     // horizontal EPG/channel card width
+    int livetvChannelRowHeight;     // channel/DVR carousel height
+    int livetvGuideHeight;          // EPG guide section height
+
+    // Text truncation budgets — how many characters fit before ellipsis.
+    // These are rough values derived from the typical font size and
+    // available cell/label width on each platform; on Vita the 960px
+    // screen can only show ~55 chars on a full row, while desktop 1920p
+    // can comfortably show ~120.
+    int maxCellTitleChars;          // poster/landscape cell title
+    int maxListTitleChars;          // track / download list row title
+    int maxLiveTVProgramChars;      // LiveTV program name under a channel card
+    int maxLiveTVChannelChars;      // LiveTV channel name
+
+    // Sidebar layout. Fraction of viewport width × 1000 so we can stay in
+    // integer-land. minWidth / maxWidth are clamp limits for the dynamic
+    // sidebar growth algorithm in main_activity.cpp.
+    int sidebarMinWidth;
+    int sidebarMaxWidth;
+
+    // Modal / progress dialog width (centered). Fixed-pixel width; on
+    // Vita ~420 is close to half the screen, on desktop we want ~560.
+    int dialogWidth;
+
+    // In-memory thumbnail cache slot count for image_loader. Vita has only
+    // ~115 MB of usable heap so it caches 20; desktop/PS4/Android can afford
+    // 60-100. Each slot holds one decoded cover image (~100-400 KB).
+    int imageCacheSize;
+
+    // Library pagination — how many items to request from Plex per page
+    // when browsing a library section. Vita's tight RAM/VRAM means it has
+    // to paginate aggressively (~60 per page); desktop and PS4 can load
+    // hundreds at a time so the "load more" button is effectively a
+    // fallback rather than the common case.
+    int libraryPageSize;
+    // Playlist track rendering batch size (how many rows are inflated per
+    // incremental render pass). Desktop can inflate many more per tick.
+    int playlistTrackPageSize;
+    // Music carousel item cap — how many albums are shown in the Music
+    // tab's "Recently Added" / "By Artist" carousels before truncation.
+    int musicCarouselLimit;
+
+    // Thumbnail resolutions REQUESTED from the Plex server (photo/:/transcode).
+    // Larger values mean sharper covers but more bandwidth + VRAM per image.
+    // Vita should request small thumbnails (~200x300 portrait) so they don't
+    // blow the image cache; desktop should request ~400x600 so 1080p posters
+    // look sharp.
+    int posterRequestWidth;         // grid-cell poster thumb width
+    int posterRequestHeight;        // grid-cell poster thumb height
+    int squareRequestSize;          // grid-cell square cover (music)
+    int landscapeRequestWidth;      // grid-cell landscape thumb width
+    int landscapeRequestHeight;     // grid-cell landscape thumb height
+    int detailPosterRequestWidth;   // detail-view left poster
+    int detailPosterRequestHeight;  // detail-view left poster (portrait)
+    int photoRequestWidth;          // photo viewer / background art
+    int photoRequestHeight;
+};
+
+/**
+ * Returns the image constraints for the current platform AND current
+ * viewport orientation. The reference points to one of two static
+ * instances per platform — a landscape one and a portrait one — chosen
+ * at call time by isPortrait(). Safe to keep across calls only as long
+ * as the orientation doesn't change between use sites; if you cache the
+ * reference and the user rotates, you'll be reading stale values.
+ *
+ * Most views consume this at construction time, which is fine for
+ * single-orientation use. Views that need to track rotation should
+ * override View::onWindowSizeChanged() and re-query.
+ */
+const ImageConstraints& getImageConstraints();
+
+/**
+ * Live viewport / orientation helpers.
+ *
+ * These pull from brls::Application::contentWidth / contentHeight, which
+ * borealis updates whenever the underlying window resizes. They power
+ * the responsive layout: getImageConstraints() switches between its
+ * landscape and portrait tables based on isPortrait(), and individual
+ * views can read viewportWidth() / viewportHeight() to compute layout
+ * dimensions as a fraction of the screen rather than hard-coded pixels.
+ *
+ * Defined in a shared TU (platform_common.cpp) — same implementation on
+ * every target, since borealis abstracts the windowing system already.
+ */
+bool  isPortrait();
+float viewportWidth();
+float viewportHeight();
+
+/**
+ * True on a phone-shaped screen: the touch ports, when the viewport is
+ * portrait or its long edge is short enough to be a handset.
+ *
+ * This is the platform half of the player's mobile-layout decision, split
+ * out because dialogs need the same answer and had been drawn at desktop
+ * metrics on a phone — a 320-unit panel on a 1280-unit viewport, a quarter
+ * of the width, next to controls sized three times larger.
+ *
+ * It deliberately says nothing about *which* layout a view should use:
+ * PlayerActivity still weighs its own setting and mode first and only
+ * falls through to this.
+ */
+bool  isPhoneScreen();
+
+/**
+ * How much to multiply a design unit by on a phone, 1.0 everywhere else.
+ *
+ * The mobile designs are drawn 412 units wide and borealis' logical
+ * viewport is 1280, so anything authored at handset scale has to be
+ * multiplied to land at the right size.
+ */
+float uiScale();
+
+/**
+ * Subscribe to viewport-orientation changes. Cb fires whenever
+ * isPortrait() flips (NOT on every resize tick — just the orientation
+ * boundary), so consumers can re-apply layout without thrash. The
+ * subscription survives for the lifetime of the process; callers
+ * typically install once during view construction.
+ *
+ * Implementation registers a brls::Application::getWindowSizeChangedEvent()
+ * listener internally and de-bounces orientation flips itself.
+ */
+void onOrientationChanged(std::function<void()> cb);
+
+/**
+ * Per-platform Plex transcode / identification constants.
+ *
+ * These replace the old PLEX_PLATFORM / PLEX_DEVICE / PLEX_MAX_VIDEO_*
+ * #define ifdef chain in include/app/application.hpp. Callers that used
+ * to read the macros directly now pull the relevant field from here.
+ *
+ * Strings are pointers to static string literals owned by the
+ * platform_<name>.cpp file — safe to keep long-term.
+ */
+struct VideoConstraints {
+    const char* plexPlatform;     // X-Plex-Platform, e.g. "Desktop"
+    const char* plexDevice;       // X-Plex-Device, e.g. "PS4"
+    int   maxVideoWidth;          // add-limitation upperBound width
+    int   maxVideoHeight;         // add-limitation upperBound height
+    int   maxVideoLevel;          // H.264 level cap (e.g. 40, 42, 51)
+    int   defaultBitrate;         // kbps when settings.maxBitrate == 0
+    const char* defaultResolution;// e.g. "1920x1080"
+    // Default enum value (int-cast to avoid including application.hpp)
+    // matching vitaplex::VideoQuality. 3=480P, 2=720P, 1=1080P.
+    int   defaultVideoQualityIndex;
+    // Whether this platform's video decoder plays HEVC/H.265 natively. When
+    // true, offline downloads grab the raw source file (fast — no transcode);
+    // when false (the Vita is H.264-only) they route through the Download Queue
+    // for a server-side transcode to H.264 so the file actually plays. Defaults
+    // false so a platform that forgets to set it stays safe — it just gets a
+    // guaranteed-playable transcode instead of a raw file it might not decode.
+    bool  supportsHevc = false;
+};
+
+/**
+ * Returns the Plex transcode / identification constants for the current
+ * platform. Points to a static instance owned by the platform layer.
+ */
+const VideoConstraints& getVideoConstraints();
+
+/**
+ * Whether this device can decode 2160p, gating the 4K transcode tier in
+ * settings. Separate from getVideoConstraints because it is a property of the
+ * hardware, not the port: a PS4 Pro can and a base PS4 cannot, and Android
+ * spans 4K TV boxes and budget phones. Implementations probe once and cache.
+ */
+bool supports4KDecode();
+
+/**
+ * Ask the display for a mode whose refresh rate matches the content, so a
+ * 23.976fps film isn't shown with a 3:2 pulldown cadence on a 60Hz panel.
+ * Pass 0 to hand the display back to the mode it was in. Android only; a
+ * no-op everywhere else, where the port has no say over the display mode.
+ */
+void setPreferredRefreshRate(float contentFps);
+
+/**
+ * Whether the display can show HDR at all. Decides between passing HDR
+ * through and tone-mapping it down for an SDR panel. Android only; false
+ * elsewhere, which leaves those ports on their existing behaviour.
+ */
+bool displaySupportsHdr();
+
+/**
+ * Surround codecs the audio output can take as a bitstream, as a bitmask:
+ * 1 AC3, 2 E-AC3, 4 DTS, 8 DTS-HD, 16 TrueHD. Zero means everything has to be
+ * decoded to PCM, which is the answer on every port that has no way to ask.
+ */
+enum PassthroughCodec {
+    PASSTHROUGH_AC3    = 1 << 0,
+    PASSTHROUGH_EAC3   = 1 << 1,
+    PASSTHROUGH_DTS    = 1 << 2,
+    PASSTHROUGH_DTSHD  = 1 << 3,
+    PASSTHROUGH_TRUEHD = 1 << 4,
+};
+int passthroughCodecs();
+
+/**
+ * The platform's own subtitle styling preferences, where it has any.
+ *
+ * Accessibility settings on Android carry a caption size, colour, edge and
+ * background that a media app is expected to honour; `valid` is false on every
+ * port that exposes nothing, and those keep the app's own styling untouched.
+ * Colours are ARGB. edgeType: 0 none, 1 outline, 2 drop shadow, 3 raised,
+ * 4 depressed. The has* flags say which fields the user actually chose, as
+ * opposed to the platform's defaults.
+ */
+struct CaptionStyle {
+    bool valid = false;
+    float fontScale = 1.0f;
+    unsigned foreground = 0xFFFFFFFFu;
+    unsigned background = 0x00000000u;
+    unsigned edgeColor = 0xFF000000u;
+    int edgeType = 0;
+    bool hasForeground = false;
+    bool hasBackground = false;
+    bool hasEdgeColor = false;
+};
+const CaptionStyle& getSystemCaptionStyle();
+
+/**
+ * A link the OS handed us (plex://, vitaplex://, an app.plex.tv URL), or an
+ * empty string. Reading it clears it, so a link is acted on once.
+ *
+ * Held rather than delivered because a cold start has no UI to open anything
+ * with; the app collects it when it is ready. setDeepLinkHandler registers what
+ * to do with one that arrives while the app is already running — it is invoked
+ * on the UI thread. Both are no-ops on ports with no link plumbing.
+ */
+// Hand the platform layer a URL the OS launched us with. On desktop that is
+// argv[1] — a browser opening a plex:// link runs the Exec line with the URL
+// appended — and there is nowhere else for it to arrive from. A no-op on the
+// consoles, and unused on Android, where links come through the activity.
+void offerDeepLink(const std::string& url);
+std::string takePendingDeepLink();
+void setDeepLinkHandler(std::function<void()> onLinkArrived);
+
+/**
+ * Bootstraps platform-specific subsystems before brls::Application::init().
+ * Loads native modules, initializes networking / SSL / HTTP, sets clock
+ * speeds, opens log files, etc. Returns false on a fatal failure.
+ */
+bool init();
+
+/**
+ * Releases platform-specific resources. Called once near program exit
+ * after brls shutdown. Safe to call even if init() failed.
+ */
+void shutdown();
+
+/**
+ * Path to the on-disk log file the app should write to, or empty string
+ * if logging should remain on stdout / brls::Logger only.
+ *
+ * On platforms whose stdout is invisible (PSV, PS4) this returns a real
+ * file path so callers can redirect log output. On Switch/Desktop/Android
+ * it returns an empty string.
+ */
+std::string getLogPath();
+
+/**
+ * Path the finished run's log is kept at, or "" when getLogPath() is empty.
+ * Derived from getLogPath() by inserting ".prev" before the extension.
+ */
+std::string previousLogPath();
+
+/**
+ * Moves an existing log to previousLogPath() so the new run can truncate
+ * without destroying it. Call before opening the log for writing.
+ */
+void rotateLogForNewRun();
+
+/**
+ * Whether shareLogFile() can do anything on this platform.
+ */
+bool canShareLogFile();
+
+/**
+ * Hands a log file to the platform's share mechanism (Android's share sheet).
+ *
+ * On Android the log is in app-private internal storage, which no file manager
+ * can reach, so reading it in Settings is not enough — this is the only way to
+ * get the file off the device. A no-op where getLogPath() is already somewhere
+ * the user can open.
+ */
+void shareLogFile(const std::string& path);
+
+/**
+ * Opens the platform log file (if any) and subscribes brls::Logger to it.
+ * Idempotent. Called from init() but exposed for tests.
+ */
+void openLogFile();
+
+/**
+ * Closes the platform log file (if open). Called from shutdown().
+ */
+void closeLogFile();
+
+/**
+ * Reads a local file into `out`, capping at `maxBytes`.
+ * Returns true on success. Used by ImageLoader to load downloaded covers
+ * from disk without sprinkling sceIoOpen ifdefs across the UI layer.
+ */
+bool readLocalFile(const std::string& path,
+                   std::vector<uint8_t>& out,
+                   std::size_t maxBytes);
+
+/**
+ * Launch a detached background thread with a platform-appropriate stack
+ * size and proper TLS / kernel-bookkeeping setup. Always prefer this over
+ * bare `std::thread(...).detach()`.
+ *
+ *   Switch: libnx's newlib std::thread shim doesn't always register the
+ *           stack region with the kernel OR initialize TLS — a thread
+ *           launched that way crashes with an Instruction Abort the first
+ *           time it indirect-calls through a vtable or std::function. This
+ *           routes through pthread_create with explicit attr so the stack
+ *           lands in a kernel-managed region and TLS is set up.
+ *   PSV:   stdc++ std::thread defaults to a 256 KB stack which overflows
+ *           on HLS downloads with deep call stacks; use pthread + attr.
+ *   PS4:   same pthread route.
+ *   Desktop / Android: std::thread().detach() is fine, but go through the
+ *           same entry point so call sites don't have to ifdef.
+ *
+ * The task is heap-copied; ownership transfers to the new thread, which
+ * frees it after the body returns. `stackSize` is a hint — platforms with
+ * a fixed thread stack size honor it; std::thread platforms ignore it.
+ */
+void launchThread(std::function<void()> task,
+                  std::size_t stackSize = 512 * 1024);
+
+/**
+ * Maximum number of concurrent network requests the platform's stack
+ * can sustain reliably. Callers that fan out parallel HTTP work
+ * (login_activity's connection-list probe, library prefetch, …) should
+ * gate the worker count with a counting semaphore set to this value.
+ *
+ * Higher is not always better:
+ *
+ *   Switch: libnx's BSD + SSL services have tight per-process socket
+ *           ceilings and a single-threaded DNS resolver. Firing all 17
+ *           Plex Direct connection probes at once produced a flood that
+ *           had 10/17 fail instantly with "Couldn't resolve host name"
+ *           (the resolver was rate-limited / overrun while the rest of
+ *           the requests were queued behind it). 4 keeps the resolver
+ *           and TLS handshake pool happy and still hides round-trip
+ *           latency on the LAN.
+ *   PSV:   sceHttp has a small pool too. 4 matches.
+ *   PS4:   higher headroom but still capped.
+ *   Desktop / Android / iOS / tvOS: 16 — enough that we never bottleneck
+ *           on the gate.
+ */
+std::size_t maxConcurrentNetworkRequests();
+
+/**
+ * Whether the platform exits the process via an SDK-specific call instead
+ * of a normal `return` from main(). True on PSV (sceKernelExitProcess).
+ */
+bool needsHardExit();
+
+/**
+ * Hard-exits the process with the given exit code if needsHardExit() is true.
+ * No-op otherwise. Lets main.cpp call platform::hardExit(1) without ifdefs.
+ */
+[[noreturn]] void hardExit(int code);
+
+}  // namespace platform
+}  // namespace vitaplex

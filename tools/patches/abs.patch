@@ -1,0 +1,125 @@
+diff --git a/modules/abs/include/app/application.hpp b/modules/abs/include/app/application.hpp
+index 39fc29a..290acdd 100644
+--- a/modules/abs/include/app/application.hpp
++++ b/modules/abs/include/app/application.hpp
+@@ -141,6 +141,10 @@ public:
+     // Initialize and run the application
+     bool init();
+     void run();
++    // Startup without the main loop (restore session, push the first
++    // activity). run() = start() + main loop; VitaHub calls start() and
++    // owns the loop itself.
++    void start();
+     void shutdown();
+ 
+     // Navigation
+diff --git a/modules/abs/src/activity/login_activity.cpp b/modules/abs/src/activity/login_activity.cpp
+index 8b1822e..77158bb 100644
+--- a/modules/abs/src/activity/login_activity.cpp
++++ b/modules/abs/src/activity/login_activity.cpp
+@@ -4,6 +4,10 @@
+  */
+ 
+ #include "activity/login_activity.hpp"
++
++#ifdef VITAHUB
++#include "vitahub/bridge.hpp"
++#endif
+ #include "app/application.hpp"
+ #include "app/audiobookshelf_client.hpp"
+ #include "view/progress_dialog.hpp"
+@@ -298,10 +302,18 @@ void LoginActivity::onContentAvailable() {
+ 
+     // Circle quits the app rather than popping to nothing — this is the
+     // root activity when signed out.
++#ifdef VITAHUB
++    // Inside VitaHub, Circle leaves the service instead of the whole hub.
++    this->registerAction("VitaHub", brls::ControllerButton::BUTTON_B, [](brls::View*) {
++        vitahub::returnToHub();
++        return true;
++    });
++#else
+     this->registerAction("Quit", brls::ControllerButton::BUTTON_B, [](brls::View*) {
+         brls::Application::quit();
+         return true;
+     });
++#endif
+ 
+     // Land on the first thing the user still has to do.
+     bool complete = !m_serverUrl.empty() && !m_password.empty() &&
+diff --git a/modules/abs/src/activity/main_activity.cpp b/modules/abs/src/activity/main_activity.cpp
+index 14bdf70..25481a6 100644
+--- a/modules/abs/src/activity/main_activity.cpp
++++ b/modules/abs/src/activity/main_activity.cpp
+@@ -3,6 +3,10 @@
+  */
+ 
+ #include "activity/main_activity.hpp"
++
++#ifdef VITAHUB
++#include "vitahub/bridge.hpp"
++#endif
+ #include "view/home_tab.hpp"
+ #include "view/library_section_tab.hpp"
+ #include "view/search_tab.hpp"
+@@ -118,6 +122,9 @@ void MainActivity::onContentAvailable() {
+             }
+ 
+             tabFrame->addTab("Settings", []() { return new SettingsTab(); });
++#ifdef VITAHUB
++            tabFrame->addTab("VitaHub", []() { return vitahub::createServicesTab("abs"); });
++#endif
+ 
+             // Focus first content tab
+             tabFrame->focusTab(0);
+@@ -192,6 +199,9 @@ void MainActivity::onContentAvailable() {
+         tabFrame->addTab("Search", []() { return new SearchTab(); });
+         tabFrame->addTab("Downloads", []() { return new DownloadsTab(); });
+         tabFrame->addTab("Settings", []() { return new SettingsTab(); });
++#ifdef VITAHUB
++        tabFrame->addTab("VitaHub", []() { return vitahub::createServicesTab("abs"); });
++#endif
+ 
+         // Focus first tab
+         tabFrame->focusTab(0);
+diff --git a/modules/abs/src/app/application.cpp b/modules/abs/src/app/application.cpp
+index 9695c6e..1a196b1 100644
+--- a/modules/abs/src/app/application.cpp
++++ b/modules/abs/src/app/application.cpp
+@@ -48,7 +48,7 @@ bool Application::init() {
+     return true;
+ }
+ 
+-void Application::run() {
++void Application::start() {
+     brls::Logger::info("Application::run - isLoggedIn={}, serverUrl={}",
+                        isLoggedIn(), m_serverUrl.empty() ? "(empty)" : m_serverUrl);
+ 
+@@ -101,6 +101,10 @@ void Application::run() {
+             pushLoginActivity();
+         }
+     }
++}
++
++void Application::run() {
++    start();
+ 
+     // Main loop handled by Borealis
+     while (brls::Application::mainLoop()) {
+diff --git a/modules/abs/src/utils/app_update.cpp b/modules/abs/src/utils/app_update.cpp
+index d9cedd3..7862c20 100644
+--- a/modules/abs/src/utils/app_update.cpp
++++ b/modules/abs/src/utils/app_update.cpp
+@@ -1821,6 +1821,12 @@ void setSelfPath(const char* argv0) {
+ }
+ 
+ void checkForUpdates(bool manual) {
++#ifdef VITAHUB
++    // Inside VitaHub this service updates with the hub. The standalone app's
++    // updater would download and install the separate app instead.
++    if (manual) brls::Application::notify("This service updates with VitaHub");
++    return;
++#endif
+     bool expected = false;
+     if (!s_busy.compare_exchange_strong(expected, true)) return;
+ 

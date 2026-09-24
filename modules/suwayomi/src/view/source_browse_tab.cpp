@@ -1,0 +1,375 @@
+/**
+ * VitaSuwayomi - Source Browse Tab
+ * Browse manga from a specific source
+ */
+
+#include "view/source_browse_tab.hpp"
+#include "view/manga_detail_view.hpp"
+#include "app/suwayomi_client.hpp"
+#include "app/application.hpp"
+#include "utils/image_loader.hpp"
+#include "utils/button_icons.hpp"
+
+#include <borealis.hpp>
+
+namespace vitasuwayomi {
+
+SourceBrowseTab::SourceBrowseTab(const Source& source)
+    : m_source(source)
+    , m_currentPage(1)
+    , m_hasNextPage(false)
+    , m_browseMode(BrowseMode::POPULAR) {
+
+    m_alive = std::make_shared<bool>(true);
+
+    this->setAxis(brls::Axis::COLUMN);
+    this->setPadding(20, 30, 20, 30);
+
+    // Header with icon and title
+    m_headerBox = new brls::Box();
+    m_headerBox->setAxis(brls::Axis::ROW);
+    m_headerBox->setAlignItems(brls::AlignItems::CENTER);
+    m_headerBox->setMarginBottom(15);
+
+    // Source icon
+    m_sourceIcon = new brls::Image();
+    m_sourceIcon->setWidth(32);
+    m_sourceIcon->setHeight(32);
+    m_sourceIcon->setMarginRight(12);
+    m_sourceIcon->setScalingType(brls::ImageScalingType::FIT);
+    m_headerBox->addView(m_sourceIcon);
+
+    // Load icon asynchronously
+    if (!source.iconUrl.empty()) {
+        std::string iconUrl = Application::getInstance().getServerUrl() + source.iconUrl;
+        ImageLoader::loadAsync(iconUrl, [](brls::Image* img) {}, m_sourceIcon, m_alive);
+    }
+
+    // Title
+    m_titleLabel = new brls::Label();
+    m_titleLabel->setText(source.name);
+    m_titleLabel->setFontSize(24);
+    m_headerBox->addView(m_titleLabel);
+
+    this->addView(m_headerBox);
+
+    // Mode buttons
+    auto* modeBox = new brls::Box();
+    modeBox->setAxis(brls::Axis::ROW);
+    modeBox->setMarginBottom(15);
+
+    m_popularBtn = new brls::Button();
+    m_popularBtn->setText("> Popular");
+    m_popularBtn->setMarginRight(10);
+    m_popularBtn->registerClickAction([this](brls::View*) {
+        loadPopular();
+        return true;
+    });
+    modeBox->addView(m_popularBtn);
+
+    if (source.supportsLatest) {
+        m_latestBtn = new brls::Button();
+        m_latestBtn->setText("Latest");
+        m_latestBtn->setMarginRight(10);
+        m_latestBtn->registerClickAction([this](brls::View*) {
+            loadLatest();
+            return true;
+        });
+        modeBox->addView(m_latestBtn);
+    }
+
+    // Search button with Start icon above
+    auto* searchContainer = new brls::Box();
+    searchContainer->setAxis(brls::Axis::COLUMN);
+    searchContainer->setAlignItems(brls::AlignItems::CENTER);
+
+    // Start button icon - use actual image dimensions (64x16)
+    auto* startButtonIcon = new brls::Image();
+    startButtonIcon->setWidth(64);
+    startButtonIcon->setHeight(16);
+    startButtonIcon->setScalingType(brls::ImageScalingType::FIT);
+    setButtonIcon(startButtonIcon, BUTTON_IMG("start_button.png"));
+    startButtonIcon->setMarginBottom(2);
+    searchContainer->addView(startButtonIcon);
+
+    m_searchBtn = new brls::Button();
+    m_searchBtn->setText("Search");
+    m_searchBtn->registerClickAction([this](brls::View*) {
+        showSearchDialog();
+        return true;
+    });
+    searchContainer->addView(m_searchBtn);
+    modeBox->addView(searchContainer);
+
+    this->addView(modeBox);
+
+    // Register Start button to open search dialog
+    // Use brls::sync to defer IME opening to avoid crash during controller input handling
+    this->registerAction("Search", brls::ControllerButton::BUTTON_START, [this](brls::View* view) {
+        brls::sync([this, aliveWeak = std::weak_ptr<bool>(m_alive)]() {
+            auto a = aliveWeak.lock(); if (!a || !*a) return;
+            showSearchDialog();
+        });
+        return true;
+    });
+
+    // Loading label
+    m_loadingLabel = new brls::Label();
+    m_loadingLabel->setText("Loading...");
+    m_loadingLabel->setFontSize(16);
+    m_loadingLabel->setHorizontalAlign(brls::HorizontalAlign::CENTER);
+    m_loadingLabel->setMarginTop(20);
+    m_loadingLabel->setVisibility(brls::Visibility::GONE);
+    this->addView(m_loadingLabel);
+
+    // Content grid
+    m_contentGrid = new RecyclingGrid();
+    m_contentGrid->setGrow(1.0f);
+
+    // Apply display mode and grid size from settings (same as library)
+    const auto& settings = Application::getInstance().getSettings();
+    switch (settings.libraryDisplayMode) {
+        case LibraryDisplayMode::GRID_NORMAL:
+            m_contentGrid->setCompactMode(false);
+            m_contentGrid->setListMode(false);
+            break;
+        case LibraryDisplayMode::GRID_COMPACT:
+            m_contentGrid->setCompactMode(true);
+            break;
+        case LibraryDisplayMode::LIST:
+            m_contentGrid->setListMode(true);
+            break;
+    }
+    switch (settings.libraryGridSize) {
+        case LibraryGridSize::SMALL:
+            m_contentGrid->setGridSize(4);
+            break;
+        case LibraryGridSize::MEDIUM:
+            m_contentGrid->setGridSize(6);
+            break;
+        case LibraryGridSize::LARGE:
+            m_contentGrid->setGridSize(8);
+            break;
+    }
+
+    // Infinite scroll: auto-load next page when nearing the end
+    m_contentGrid->setOnEndReached([this]() {
+        if (m_hasNextPage && !m_isLoadingPage) {
+            loadNextPage();
+        }
+    });
+
+    this->addView(m_contentGrid);
+
+    // Load more button (hidden initially, fallback for manual loading)
+    m_loadMoreBtn = new brls::Button();
+    m_loadMoreBtn->setText("Load More");
+    m_loadMoreBtn->setMarginTop(15);
+    m_loadMoreBtn->setVisibility(brls::Visibility::GONE);
+    m_loadMoreBtn->registerClickAction([this](brls::View*) {
+        loadNextPage();
+        return true;
+    });
+    this->addView(m_loadMoreBtn);
+
+    // Initial load
+    loadPopular();
+}
+
+SourceBrowseTab::~SourceBrowseTab() {
+    if (m_alive) *m_alive = false;
+}
+
+void SourceBrowseTab::willAppear(bool resetState) {
+    brls::Box::willAppear(resetState);
+
+    // Refresh star badges on all cells to reflect library add/remove changes
+    // made while this tab was covered by another activity (e.g. detail view)
+    if (m_contentGrid) {
+        m_contentGrid->refreshLibraryBadges();
+    }
+}
+
+void SourceBrowseTab::willDisappear(bool resetState) {
+    brls::Box::willDisappear(resetState);
+
+    // Invalidate alive flag BEFORE destruction so pending async callbacks bail out
+    if (m_alive) *m_alive = false;
+
+    // Cancel pending image loads to free up worker threads and network bandwidth
+    ImageLoader::cancelAll();
+}
+
+void SourceBrowseTab::onFocusGained() {
+    brls::Box::onFocusGained();
+
+    // Refresh star badges to reflect library add/remove changes from detail view
+    if (m_contentGrid) {
+        m_contentGrid->refreshLibraryBadges();
+    }
+}
+
+void SourceBrowseTab::loadPopular() {
+    m_browseMode = BrowseMode::POPULAR;
+    m_currentPage = 1;
+    m_mangaList.clear();
+    updateModeButtons();
+    loadManga();
+}
+
+void SourceBrowseTab::loadLatest() {
+    m_browseMode = BrowseMode::LATEST;
+    m_currentPage = 1;
+    m_mangaList.clear();
+    updateModeButtons();
+    loadManga();
+}
+
+void SourceBrowseTab::loadSearch(const std::string& query) {
+    m_browseMode = BrowseMode::SEARCH;
+    m_searchQuery = query;
+    m_currentPage = 1;
+    m_mangaList.clear();
+    updateModeButtons();
+    loadManga();
+}
+
+void SourceBrowseTab::loadNextPage() {
+    if (!m_hasNextPage || m_isLoadingPage) return;
+    m_isLoadingPage = true;
+    m_currentPage++;
+
+    // Remember the index of first new item (current list size)
+    int firstNewItemIndex = static_cast<int>(m_mangaList.size());
+
+    // Show loading state on button
+    if (m_loadMoreBtn) {
+        m_loadMoreBtn->setText("Loading...");
+    }
+
+    loadManga(firstNewItemIndex);
+}
+
+void SourceBrowseTab::loadManga(int focusIndexAfterLoad) {
+    brls::Logger::debug("Loading manga from source {} (page {})", m_source.name, m_currentPage);
+
+    // Show loading indicator for first page
+    if (m_currentPage == 1) {
+        m_loadingLabel->setVisibility(brls::Visibility::VISIBLE);
+        m_contentGrid->setVisibility(brls::Visibility::GONE);
+    }
+
+    // Capture member values by value for safe background thread access
+    auto browseMode = m_browseMode;
+    auto sourceId = m_source.id;
+    auto page = m_currentPage;
+    auto query = m_searchQuery;
+
+    brls::async([this, focusIndexAfterLoad, aliveWeak = std::weak_ptr<bool>(m_alive),
+                 browseMode, sourceId, page, query]() {
+        SuwayomiClient& client = SuwayomiClient::getInstance();
+        std::vector<Manga> newManga;
+        bool hasNext = false;
+        bool success = false;
+
+        switch (browseMode) {
+            case BrowseMode::POPULAR:
+                success = client.fetchPopularManga(sourceId, page, newManga, hasNext);
+                break;
+            case BrowseMode::LATEST:
+                success = client.fetchLatestManga(sourceId, page, newManga, hasNext);
+                break;
+            case BrowseMode::SEARCH:
+                success = client.searchManga(sourceId, query, page, newManga, hasNext);
+                break;
+        }
+
+        brls::sync([this, success, newManga, hasNext, focusIndexAfterLoad, aliveWeak]() {
+            auto alive = aliveWeak.lock();
+            if (!alive || !*alive) return;
+            // Hide loading indicator
+            m_loadingLabel->setVisibility(brls::Visibility::GONE);
+            m_contentGrid->setVisibility(brls::Visibility::VISIBLE);
+
+            m_isLoadingPage = false;
+            if (success) {
+                m_hasNextPage = hasNext;
+
+                if (focusIndexAfterLoad > 0) {
+                    // Subsequent page: append new items without rebuilding existing cells
+                    // This preserves the user's current focus position (no focus steal)
+                    for (const auto& manga : newManga) {
+                        m_mangaList.push_back(manga);
+                    }
+                    m_contentGrid->appendItems(newManga);
+                } else {
+                    // First page: full rebuild
+                    for (const auto& manga : newManga) {
+                        m_mangaList.push_back(manga);
+                    }
+                    updateGrid();
+                    if (!m_mangaList.empty()) {
+                        m_contentGrid->focusIndex(0);
+                    }
+                }
+                updateLoadMoreButton();
+            } else {
+                brls::Application::notify("Failed to load manga");
+                // Reset load more button text on failure
+                if (m_loadMoreBtn) {
+                    m_loadMoreBtn->setText("Load More");
+                }
+            }
+        });
+    });
+}
+
+void SourceBrowseTab::updateGrid() {
+    if (!m_contentGrid) return;
+
+    // Use RecyclingGrid's setDataSource for proper grid management
+    m_contentGrid->setShowLibraryBadge(true);  // Show star for library items in browser
+    m_contentGrid->setOnItemSelected([this](const Manga& manga) {
+        onMangaSelected(manga);
+    });
+    m_contentGrid->setDataSource(m_mangaList);
+}
+
+void SourceBrowseTab::updateModeButtons() {
+    // Use text prefix to indicate active state
+    if (m_popularBtn) {
+        m_popularBtn->setText(m_browseMode == BrowseMode::POPULAR ? "> Popular" : "Popular");
+    }
+    if (m_latestBtn) {
+        m_latestBtn->setText(m_browseMode == BrowseMode::LATEST ? "> Latest" : "Latest");
+    }
+    if (m_searchBtn) {
+        m_searchBtn->setText(m_browseMode == BrowseMode::SEARCH ? "> Search" : "Search");
+    }
+}
+
+void SourceBrowseTab::updateLoadMoreButton() {
+    if (m_loadMoreBtn) {
+        m_loadMoreBtn->setText("Load More");
+        m_loadMoreBtn->setVisibility(m_hasNextPage ?
+            brls::Visibility::VISIBLE : brls::Visibility::GONE);
+    }
+}
+
+void SourceBrowseTab::showSearchDialog() {
+    brls::Application::getImeManager()->openForText([this](std::string query) {
+        if (!query.empty()) {
+            loadSearch(query);
+        }
+    }, "Search manga...", "", 100, "");
+}
+
+void SourceBrowseTab::onMangaSelected(const Manga& manga) {
+    brls::Logger::info("Selected manga: {} (id: {})", manga.title, manga.id);
+
+    // Push manga detail view
+    auto* detailView = new MangaDetailView(manga);
+    brls::Application::pushActivity(new brls::Activity(detailView));
+}
+
+} // namespace vitasuwayomi

@@ -1,0 +1,254 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    Player screen — direction A, "Split shelf".
+
+    One frame for both content types: audiobooks and podcasts differ only in
+    what fills the slots, never in layout. Left column is art + two stat
+    tiles; right column is text, progress and transport.
+
+    Sizes are borealis layout units (a 1280-wide logical canvas), which is
+    what the rest of the XML in this repo uses.
+
+    This screen keeps its own fixed palette rather than following the app
+    theme: it is a full-screen playback surface, and the artwork needs a
+    constant dark field to sit on.
+-->
+<brls:Box
+    id="player/container"
+    width="100%"
+    height="100%"
+    axis="row"
+    alignItems="stretch"
+    paddingTop="36"
+    paddingBottom="36"
+    paddingLeft="40"
+    paddingRight="40"
+>
+
+    <!-- ── Left column: cover + stat tiles ───────────────────────────── -->
+    <brls:Box
+        width="300"
+        axis="column"
+        alignItems="stretch"
+        marginRight="36">
+
+        <brls:Image
+            id="player/cover"
+            width="300"
+            height="300"
+            scalingType="fit"
+            cornerRadius="8"
+            marginBottom="18"/>
+
+        <!-- Two stat tiles. Captions and values are rewritten per media
+             type in PlayerActivity::updateInfoSlots(). -->
+        <brls:Box
+            axis="row"
+            alignItems="stretch">
+
+            <brls:Box
+                id="player/tileLeft"
+                grow="1"
+                axis="column"
+                marginRight="10"
+                paddingTop="10"
+                paddingBottom="10"
+                paddingLeft="12"
+                paddingRight="12"
+                cornerRadius="6"
+                borderThickness="1"
+                focusable="true">
+                <brls:Label
+                    id="player/tileLeftCaption"
+                    text="SPEED"
+                    fontSize="10"
+                    singleLine="true"/>
+                <brls:Label
+                    id="player/speedLabel"
+                    text="1.0x"
+                    fontSize="17"
+                    marginTop="2"
+                    singleLine="true"/>
+            </brls:Box>
+
+            <brls:Box
+                id="player/tileRight"
+                grow="1"
+                axis="column"
+                paddingTop="10"
+                paddingBottom="10"
+                paddingLeft="12"
+                paddingRight="12"
+                cornerRadius="6"
+                borderThickness="1">
+                <brls:Label
+                    id="player/tileRightCaption"
+                    text="CHAPTER"
+                    fontSize="10"
+                    singleLine="true"/>
+                <brls:Label
+                    id="player/tileRightValue"
+                    text="—"
+                    fontSize="17"
+                    marginTop="2"
+                    singleLine="true"/>
+            </brls:Box>
+
+        </brls:Box>
+
+    </brls:Box>
+
+    <!-- ── Right column: text, progress, transport ───────────────────── -->
+    <brls:Box
+        grow="1"
+        axis="column"
+        alignItems="stretch">
+
+        <brls:Label
+            id="player/eyebrow"
+            text="NOW PLAYING"
+            fontSize="11"
+            marginBottom="14"
+            singleLine="true"/>
+
+        <!-- Two lines max, then ellipsis (see maxHeight). -->
+        <brls:Label
+            id="player/title"
+            text="Now Playing"
+            fontSize="34"
+            maxHeight="88"
+            marginBottom="8"/>
+
+        <brls:Label
+            id="player/author"
+            text=""
+            fontSize="18"
+            marginBottom="6"
+            singleLine="true"/>
+
+        <brls:Label
+            id="player/subtitle"
+            text=""
+            fontSize="15"
+            singleLine="true"/>
+
+        <brls:Rectangle
+            id="player/rule"
+            height="1"
+            marginTop="22"
+            marginBottom="20"/>
+
+        <!-- Context slot. Exactly one of these is visible at a time:
+             chapter line for books, description for podcasts. -->
+        <brls:Label
+            id="player/chapterInfo"
+            text=""
+            fontSize="17"
+            marginBottom="20"
+            singleLine="true"/>
+
+        <brls:Label
+            id="player/description"
+            text=""
+            fontSize="15"
+            lineHeight="1.55"
+            maxHeight="70"
+            marginBottom="20"
+            visibility="gone"/>
+
+        <brls:Slider
+            id="player/progress"
+            width="100%"
+            height="8"
+            marginBottom="10"/>
+
+        <brls:Box
+            axis="row"
+            justifyContent="spaceBetween"
+            alignItems="center">
+            <brls:Label
+                id="player/timeElapsed"
+                text="0:00"
+                fontSize="14"
+                singleLine="true"/>
+            <brls:Label
+                id="player/timeRemaining"
+                text="-0:00"
+                fontSize="14"
+                singleLine="true"/>
+        </brls:Box>
+
+        <!-- Transport. Plain focusable Boxes rather than brls::Button:
+             borealis paints a highlight FILL behind a focused Button, which
+             washes out the accent play button to a flat dark square (the
+             same fix the in-app updater's makeButton uses). Focus is the
+             ring only — see setHideHighlightBackground in onContentAvailable.
+             Icon paths and the panel colours are set from code so they can
+             follow the seek interval and the app theme. -->
+        <brls:Box
+            id="player/controlButtons"
+            axis="row"
+            alignItems="center"
+            marginTop="26">
+
+            <brls:Box
+                id="player/btnRewind"
+                axis="row"
+                justifyContent="center"
+                alignItems="center"
+                width="96"
+                height="64"
+                cornerRadius="8"
+                marginRight="22"
+                focusable="true">
+                <brls:Image
+                    id="player/rewindIcon"
+                    width="34"
+                    height="34"
+                    scalingType="fit"/>
+            </brls:Box>
+
+            <brls:Box
+                id="player/btnPlayPause"
+                axis="row"
+                justifyContent="center"
+                alignItems="center"
+                width="88"
+                height="88"
+                cornerRadius="44"
+                marginRight="22"
+                focusable="true">
+                <brls:Image
+                    id="player/playPauseIcon"
+                    width="40"
+                    height="40"
+                    scalingType="fit"/>
+            </brls:Box>
+
+            <brls:Box
+                id="player/btnForward"
+                axis="row"
+                justifyContent="center"
+                alignItems="center"
+                width="96"
+                height="64"
+                cornerRadius="8"
+                focusable="true">
+                <brls:Image
+                    id="player/forwardIcon"
+                    width="34"
+                    height="34"
+                    scalingType="fit"/>
+            </brls:Box>
+
+        </brls:Box>
+
+        <!-- Absorbs the slack so the block above keeps a fixed vertical
+             rhythm regardless of how tall the context slot ends up. No
+             button-hint row: the controls are self-evident and the spec's
+             hint line was dropped deliberately. -->
+        <brls:Box grow="1"/>
+
+    </brls:Box>
+
+</brls:Box>

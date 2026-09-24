@@ -1,0 +1,467 @@
+/**
+ * RotatableImage implementation
+ * Uses direct NanoVG rendering to avoid edge clamping artifacts
+ */
+
+#include "view/rotatable_image.hpp"
+#include "utils/perf_overlay.hpp"
+#include <cmath>
+
+#ifndef NVG_PI
+#define NVG_PI 3.14159265358979323846264338327f
+#endif
+
+namespace vitasuwayomi {
+
+RotatableImage::RotatableImage() {
+    // Set default properties
+    this->setFocusable(false);
+}
+
+RotatableImage::~RotatableImage() {
+    clearImage();
+}
+
+void RotatableImage::clearImage() {
+    NVGcontext* vg = brls::Application::getNVGContext();
+
+    // Clear single image
+    if (m_nvgImage != 0 && vg) {
+        nvgDeleteImage(vg, m_nvgImage);
+    }
+    m_nvgImage = 0;
+
+    // Clear segments
+    if (vg) {
+        for (int handle : m_segmentNvgImages) {
+            if (handle != 0) nvgDeleteImage(vg, handle);
+        }
+    }
+    m_segmentNvgImages.clear();
+    m_segmentSrcHeights.clear();
+    m_origWidth = 0;
+    m_origHeight = 0;
+
+    m_imageWidth = 0;
+    m_imageHeight = 0;
+}
+
+void RotatableImage::setImageFromMem(const unsigned char* data, size_t size) {
+    NVGcontext* vg = brls::Application::getNVGContext();
+    if (!vg || !data || size == 0) {
+        return;
+    }
+
+    // Clear existing image
+    clearImage();
+
+    // Create NVG image from memory
+    m_nvgImage = nvgCreateImageMem(vg, 0, const_cast<unsigned char*>(data), size);
+
+    if (m_nvgImage != 0) {
+        // Get image dimensions
+        nvgImageSize(vg, m_nvgImage, &m_imageWidth, &m_imageHeight);
+        brls::Logger::debug("RotatableImage: Loaded image {}x{}", m_imageWidth, m_imageHeight);
+    } else {
+        brls::Logger::error("RotatableImage: Failed to create NVG image");
+    }
+
+    this->invalidate();
+}
+
+void RotatableImage::setImageFromFile(const std::string& path) {
+    NVGcontext* vg = brls::Application::getNVGContext();
+    if (!vg || path.empty()) {
+        return;
+    }
+
+    // Clear existing image
+    clearImage();
+
+    // Create NVG image from file
+    m_nvgImage = nvgCreateImage(vg, path.c_str(), 0);
+
+    if (m_nvgImage != 0) {
+        nvgImageSize(vg, m_nvgImage, &m_imageWidth, &m_imageHeight);
+        brls::Logger::debug("RotatableImage: Loaded image from file {}x{}", m_imageWidth, m_imageHeight);
+    } else {
+        brls::Logger::error("RotatableImage: Failed to load image from {}", path);
+    }
+
+    this->invalidate();
+}
+
+void RotatableImage::setImageSegments(const std::vector<std::vector<uint8_t>>& segments,
+                                       int origWidth, int origHeight,
+                                       const std::vector<int>& segmentSrcHeights) {
+    NVGcontext* vg = brls::Application::getNVGContext();
+    if (!vg || segments.empty() || origWidth <= 0 || origHeight <= 0) return;
+
+    // Clear any existing image/segments
+    clearImage();
+
+    for (const auto& segData : segments) {
+        int nvgImg = nvgCreateImageMem(vg, 0, const_cast<unsigned char*>(segData.data()), segData.size());
+        if (nvgImg == 0) {
+            brls::Logger::error("RotatableImage: Failed to create segment NVG image");
+            // Clean up on failure
+            for (int handle : m_segmentNvgImages) {
+                nvgDeleteImage(vg, handle);
+            }
+            m_segmentNvgImages.clear();
+            m_segmentSrcHeights.clear();
+            return;
+        }
+        m_segmentNvgImages.push_back(nvgImg);
+    }
+
+    m_segmentSrcHeights = segmentSrcHeights;
+    m_origWidth = origWidth;
+    m_origHeight = origHeight;
+    // Set m_imageWidth/Height to original dims for calculateImageBounds compatibility
+    m_imageWidth = origWidth;
+    m_imageHeight = origHeight;
+
+    brls::Logger::info("RotatableImage: Loaded {} segments for {}x{} image",
+                       m_segmentNvgImages.size(), origWidth, origHeight);
+    this->invalidate();
+}
+
+void RotatableImage::calculateImageBounds(float viewX, float viewY, float viewW, float viewH,
+                                          float& imgX, float& imgY, float& imgW, float& imgH) {
+    if (m_imageWidth <= 0 || m_imageHeight <= 0) {
+        imgX = viewX;
+        imgY = viewY;
+        imgW = viewW;
+        imgH = viewH;
+        return;
+    }
+
+    // For 90/270 degree rotation, the effective dimensions are swapped
+    bool isRotated90or270 = (m_rotationDegrees == 90.0f || m_rotationDegrees == 270.0f);
+    int effectiveWidth = isRotated90or270 ? m_imageHeight : m_imageWidth;
+    int effectiveHeight = isRotated90or270 ? m_imageWidth : m_imageHeight;
+
+    float imageAspect = (float)effectiveWidth / (float)effectiveHeight;
+    float viewAspect = viewW / viewH;
+
+    switch (m_scaleMode) {
+        case ImageScaleMode::FIT_SCREEN:
+            // Fit entire image within view, maintaining aspect ratio
+            if (viewAspect > imageAspect) {
+                // View is wider - fit to height
+                imgH = viewH;
+                imgW = viewH * imageAspect;
+                imgX = viewX + (viewW - imgW) / 2.0f;
+                imgY = viewY;
+            } else {
+                // View is taller - fit to width
+                imgW = viewW;
+                imgH = viewW / imageAspect;
+                imgX = viewX;
+                imgY = viewY + (viewH - imgH) / 2.0f;
+            }
+            break;
+
+        case ImageScaleMode::FIT_WIDTH:
+            // Fit width to screen width, scale height proportionally
+            imgW = viewW;
+            imgH = viewW / imageAspect;
+            imgX = viewX;
+            imgY = viewY + (viewH - imgH) / 2.0f;
+            break;
+
+        case ImageScaleMode::FIT_HEIGHT:
+            // Fit height to screen height, scale width proportionally
+            imgH = viewH;
+            imgW = viewH * imageAspect;
+            imgX = viewX + (viewW - imgW) / 2.0f;
+            imgY = viewY;
+            break;
+
+        case ImageScaleMode::ORIGINAL:
+        default:
+            // Show at native 1:1 pixel resolution, centered in view
+            imgW = (float)effectiveWidth;
+            imgH = (float)effectiveHeight;
+            imgX = viewX + (viewW - imgW) / 2.0f;
+            imgY = viewY + (viewH - imgH) / 2.0f;
+            break;
+    }
+}
+
+void RotatableImage::draw(NVGcontext* vg, float x, float y, float width, float height,
+                          brls::Style style, brls::FrameContext* ctx) {
+    if (m_perfPrimary) {
+        auto& perf = PerfOverlay::getInstance();
+        perf.endFrame();
+        perf.beginFrame();
+    }
+    PERF_BEGIN("reader_draw");
+
+    nvgSave(vg);
+
+    bool hasSlide = (m_slideX != 0.0f || m_slideY != 0.0f);
+
+    if (hasSlide) {
+
+        // During swipe: clip in the SWIPE direction only to prevent pages
+        // from overlapping each other. The cross-axis is left unclipped
+        // so wide/tall images (FIT_WIDTH, FIT_HEIGHT, rotated) aren't cut off.
+        //
+        // Use nvgScissor (not nvgIntersectScissor) because borealis sets a
+        // parent scissor at the view bounds. nvgIntersectScissor would intersect
+        // with that parent scissor, negating our cross-axis extension and
+        // cutting off images that extend beyond the view.
+        const float PAD = 4000.0f;
+        float clipX = x, clipY = y, clipW = width, clipH = height;
+        if (m_slideY != 0.0f && m_slideX == 0.0f) {
+            // Vertical swipe (90/270 rotation): keep Y tight, extend X
+            clipX -= PAD;
+            clipW += 2.0f * PAD;
+        } else {
+            // Horizontal swipe (0/180 rotation): keep X tight, extend Y
+            clipY -= PAD;
+            clipH += 2.0f * PAD;
+        }
+        nvgScissor(vg, clipX, clipY, clipW, clipH);
+        nvgTranslate(vg, m_slideX, m_slideY);
+    }
+
+    // Draw the background to fill margins
+    nvgBeginPath(vg);
+    nvgRect(vg, x, y, width, height);
+    nvgFillColor(vg, m_bgColor);
+    nvgFill(vg);
+
+    // If no image at all, just show background
+    if (m_nvgImage == 0 && m_segmentNvgImages.empty()) {
+        nvgRestore(vg);
+        return;
+    }
+    if (m_imageWidth <= 0 || m_imageHeight <= 0) {
+        nvgRestore(vg);
+        return;
+    }
+
+    // Segmented image drawing (tall images auto-split for GPU texture limit)
+    if (!m_segmentNvgImages.empty() && m_origHeight > 0) {
+        float imgX, imgY, imgW, imgH;
+        calculateImageBounds(x, y, width, height, imgX, imgY, imgW, imgH);
+
+        bool isRotated90or270 = (m_rotationDegrees == 90.0f || m_rotationDegrees == 270.0f);
+        bool hasRotation = (m_rotationDegrees != 0.0f);
+
+        // Determine drawing space: for rotated images, apply rotation transform
+        // and draw segments in pre-rotation coordinates
+        float drawX, drawY, drawW, drawH;
+        if (hasRotation) {
+            float centerX = imgX + imgW / 2.0f;
+            float centerY = imgY + imgH / 2.0f;
+            nvgTranslate(vg, centerX, centerY);
+            nvgRotate(vg, m_rotationRadians);
+            nvgTranslate(vg, -centerX, -centerY);
+
+            if (isRotated90or270) {
+                // Swap back to pre-rotation dimensions
+                drawW = imgH;
+                drawH = imgW;
+            } else {
+                // 180° - same dimensions
+                drawW = imgW;
+                drawH = imgH;
+            }
+            drawX = (imgX + imgW / 2.0f) - drawW / 2.0f;
+            drawY = (imgY + imgH / 2.0f) - drawH / 2.0f;
+        } else {
+            drawX = imgX;
+            drawY = imgY;
+            drawW = imgW;
+            drawH = imgH;
+        }
+
+        // Draw segments stacked vertically in (possibly pre-rotation) space
+        float yPos = drawY;
+        for (size_t i = 0; i < m_segmentNvgImages.size(); i++) {
+            float segFraction = (float)m_segmentSrcHeights[i] / (float)m_origHeight;
+            float segDisplayH = drawH * segFraction;
+
+            NVGpaint paint = nvgImagePattern(vg, drawX, yPos, drawW, segDisplayH,
+                                              0, m_segmentNvgImages[i], 1.0f);
+            nvgBeginPath(vg);
+            nvgRect(vg, drawX, yPos, drawW, segDisplayH);
+            nvgFillPaint(vg, paint);
+            nvgFill(vg);
+
+            yPos += segDisplayH;
+        }
+        nvgRestore(vg);
+        return;
+    }
+
+    // Single-texture image drawing (normal path)
+    float imgX, imgY, imgW, imgH;
+    calculateImageBounds(x, y, width, height, imgX, imgY, imgW, imgH);
+
+    // Calculate center of the destination area
+    float centerX = imgX + imgW / 2.0f;
+    float centerY = imgY + imgH / 2.0f;
+
+    // Apply zoom transform (scale + translate)
+    if (m_zoomLevel != 1.0f) {
+        // Translate to center, apply zoom, then apply pan offset
+        nvgTranslate(vg, centerX, centerY);
+        nvgScale(vg, m_zoomLevel, m_zoomLevel);
+        nvgTranslate(vg, m_zoomOffset.x, m_zoomOffset.y);
+        nvgTranslate(vg, -centerX, -centerY);
+    }
+
+    // For rotated images, we need to render differently
+    bool isRotated90or270 = (m_rotationDegrees == 90.0f || m_rotationDegrees == 270.0f);
+
+    if (isRotated90or270) {
+        // For 90/270 rotation, we need to swap the pattern dimensions
+        // The image pattern needs to be sized for the rotated output
+        nvgTranslate(vg, centerX, centerY);
+        nvgRotate(vg, m_rotationRadians);
+        nvgTranslate(vg, -centerX, -centerY);
+
+        // When rotated 90/270, swap width/height for the pattern
+        // The pattern should map the original texture to a rect that when rotated fills imgW x imgH
+        float patternW = imgH;  // Swapped
+        float patternH = imgW;  // Swapped
+        float patternX = centerX - patternW / 2.0f;
+        float patternY = centerY - patternH / 2.0f;
+
+        NVGpaint imgPaint = nvgImagePattern(vg, patternX, patternY, patternW, patternH, 0, m_nvgImage, 1.0f);
+
+        nvgBeginPath(vg);
+        nvgRect(vg, patternX, patternY, patternW, patternH);
+        nvgFillPaint(vg, imgPaint);
+        nvgFill(vg);
+    } else if (m_rotationDegrees == 180.0f) {
+        // 180 degree rotation - same dimensions, just rotated
+        nvgTranslate(vg, centerX, centerY);
+        nvgRotate(vg, m_rotationRadians);
+        nvgTranslate(vg, -centerX, -centerY);
+
+        NVGpaint imgPaint = nvgImagePattern(vg, imgX, imgY, imgW, imgH, 0, m_nvgImage, 1.0f);
+
+        nvgBeginPath(vg);
+        nvgRect(vg, imgX, imgY, imgW, imgH);
+        nvgFillPaint(vg, imgPaint);
+        nvgFill(vg);
+    } else {
+        // No rotation (0 degrees)
+        NVGpaint imgPaint = nvgImagePattern(vg, imgX, imgY, imgW, imgH, 0, m_nvgImage, 1.0f);
+
+        nvgBeginPath(vg);
+        nvgRect(vg, imgX, imgY, imgW, imgH);
+        nvgFillPaint(vg, imgPaint);
+        nvgFill(vg);
+    }
+
+    // Restore state (removes scissor, slide offset, rotation transforms)
+    nvgRestore(vg);
+
+    PERF_END("reader_draw");
+
+    // Draw perf overlay on top if this is the primary reader image
+    if (m_perfPrimary) {
+        nvgResetScissor(vg);
+        PerfOverlay::getInstance().draw(vg, brls::Application::contentWidth, brls::Application::contentHeight);
+    }
+}
+
+void RotatableImage::setRotation(float degrees) {
+    // Normalize to 0, 90, 180, 270
+    int normalized = static_cast<int>(degrees) % 360;
+    if (normalized < 0) normalized += 360;
+
+    // Snap to nearest 90 degree increment
+    if (normalized < 45) {
+        m_rotationDegrees = 0.0f;
+    } else if (normalized < 135) {
+        m_rotationDegrees = 90.0f;
+    } else if (normalized < 225) {
+        m_rotationDegrees = 180.0f;
+    } else if (normalized < 315) {
+        m_rotationDegrees = 270.0f;
+    } else {
+        m_rotationDegrees = 0.0f;
+    }
+
+    // Convert to radians
+    m_rotationRadians = m_rotationDegrees * NVG_PI / 180.0f;
+
+    brls::Logger::debug("RotatableImage: setRotation({}) -> {} degrees", degrees, m_rotationDegrees);
+    this->invalidate();
+}
+
+void RotatableImage::cycleRotation() {
+    float newRotation = m_rotationDegrees + 90.0f;
+    if (newRotation >= 360.0f) {
+        newRotation = 0.0f;
+    }
+    setRotation(newRotation);
+}
+
+void RotatableImage::setZoomLevel(float level) {
+    m_zoomLevel = std::max(1.0f, std::min(4.0f, level));  // Clamp between 1.0x and 4.0x
+    this->invalidate();
+}
+
+void RotatableImage::setZoomOffset(brls::Point offset) {
+    m_zoomOffset = offset;
+    this->invalidate();
+}
+
+void RotatableImage::resetZoom() {
+    m_zoomLevel = 1.0f;
+    m_zoomOffset = {0, 0};
+    this->invalidate();
+}
+
+void RotatableImage::setSlideOffset(float x, float y) {
+    m_slideX = x;
+    m_slideY = y;
+}
+
+void RotatableImage::resetSlideOffset() {
+    m_slideX = 0.0f;
+    m_slideY = 0.0f;
+}
+
+void RotatableImage::takeImageFrom(RotatableImage* source) {
+    if (!source) return;
+
+    // Clear our current image
+    clearImage();
+
+    // Transfer single NVG image handle and dimensions
+    m_nvgImage = source->m_nvgImage;
+    m_imageWidth = source->m_imageWidth;
+    m_imageHeight = source->m_imageHeight;
+
+    // Transfer segments
+    m_segmentNvgImages = std::move(source->m_segmentNvgImages);
+    m_segmentSrcHeights = std::move(source->m_segmentSrcHeights);
+    m_origWidth = source->m_origWidth;
+    m_origHeight = source->m_origHeight;
+
+    // Clear the source without deleting handles (we own them now)
+    source->m_nvgImage = 0;
+    source->m_imageWidth = 0;
+    source->m_imageHeight = 0;
+    source->m_origWidth = 0;
+    source->m_origHeight = 0;
+
+    this->invalidate();
+    source->invalidate();
+}
+
+brls::View* RotatableImage::create() {
+    return new RotatableImage();
+}
+
+} // namespace vitasuwayomi

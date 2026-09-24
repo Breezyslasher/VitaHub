@@ -1,0 +1,186 @@
+diff --git a/modules/plex/include/app/application.hpp b/modules/plex/include/app/application.hpp
+index f7c2626..8b02fa5 100644
+--- a/modules/plex/include/app/application.hpp
++++ b/modules/plex/include/app/application.hpp
+@@ -286,6 +286,10 @@ public:
+     // Initialize and run the application
+     bool init();
+     void run();
++    // Startup without the main loop (restore session, push the first
++    // activity). run() = start() + main loop; VitaHub calls start() and
++    // owns the loop itself.
++    void start();
+     void shutdown();
+ 
+     // Navigation
+diff --git a/modules/plex/src/activity/main_activity.cpp b/modules/plex/src/activity/main_activity.cpp
+index f0a3665..88795d0 100644
+--- a/modules/plex/src/activity/main_activity.cpp
++++ b/modules/plex/src/activity/main_activity.cpp
+@@ -3,6 +3,10 @@
+  */
+ 
+ #include "activity/main_activity.hpp"
++
++#ifdef VITAHUB
++#include "vitahub/bridge.hpp"
++#endif
+ #include "utils/app_update.hpp"
+ #include "view/home_tab.hpp"
+ #include "view/library_section_tab.hpp"
+@@ -429,6 +433,9 @@ void MainActivity::buildSidebarTabs() {
+         tabFrame->addTab("Downloads", []() { return new DownloadsTab(); });
+         tabFrame->addSeparator();
+         tabFrame->addTab("Settings", []() { return new SettingsTab(); });
++#ifdef VITAHUB
++        tabFrame->addTab("VitaHub", []() { return vitahub::createServicesTab("plex"); });
++#endif
+         return;
+     }
+ 
+@@ -502,6 +509,9 @@ void MainActivity::buildSidebarTabs() {
+     // Settings is always pinned to the bottom.
+     tabFrame->addSeparator();
+     tabFrame->addTab("Settings", []() { return new SettingsTab(); });
++#ifdef VITAHUB
++    tabFrame->addTab("VitaHub", []() { return vitahub::createServicesTab("plex"); });
++#endif
+ 
+     // Hold any sidebar item to open the editor (touch equivalent of START), and
+     // show a focus-only START hint so the shortcut is discoverable.
+diff --git a/modules/plex/src/app/application.cpp b/modules/plex/src/app/application.cpp
+index ade1e5f..db8fba0 100644
+--- a/modules/plex/src/app/application.cpp
++++ b/modules/plex/src/app/application.cpp
+@@ -64,7 +64,7 @@ bool Application::init() {
+     return true;
+ }
+ 
+-void Application::run() {
++void Application::start() {
+     brls::Logger::info("Application::run - isLoggedIn={}, serverUrl={}",
+                        isLoggedIn(), m_serverUrl.empty() ? "(empty)" : m_serverUrl);
+ 
+@@ -119,6 +119,10 @@ void Application::run() {
+         // Show login screen
+         pushLoginActivity();
+     }
++}
++
++void Application::run() {
++    start();
+ 
+     // Main loop handled by Borealis
+     while (brls::Application::mainLoop()) {
+diff --git a/modules/plex/src/platform/platform_android.cpp b/modules/plex/src/platform/platform_android.cpp
+index caeb3e9..e1cb013 100644
+--- a/modules/plex/src/platform/platform_android.cpp
++++ b/modules/plex/src/platform/platform_android.cpp
+@@ -26,9 +26,11 @@
+ // SDL_main symbol here and forward it to the shared entry point.
+ extern "C" int VitaPlexMainEntry(int argc, char* argv[]);
+ 
++#ifndef VITAHUB  // inside VitaHub the hub owns the entry point (hub/core)
+ extern "C" int SDL_main(int argc, char* argv[]) {
+     return VitaPlexMainEntry(argc, argv);
+ }
++#endif
+ 
+ namespace vitaplex {
+ namespace platform {
+diff --git a/modules/plex/src/platform/platform_ios.mm b/modules/plex/src/platform/platform_ios.mm
+index 1e33110..b2c4f1f 100644
+--- a/modules/plex/src/platform/platform_ios.mm
++++ b/modules/plex/src/platform/platform_ios.mm
+@@ -244,6 +244,7 @@ const CaptionStyle& getSystemCaptionStyle() {
+ // No deep-link plumbing on this port; nothing ever hands us a URL.
+ std::string takePendingDeepLink() { return {}; }
+ void setDeepLinkHandler(std::function<void()>) {}
++void offerDeepLink(const std::string&) {}
+ 
+ bool init() {
+     if (!::vitaplex::HttpClient::globalInit()) {
+@@ -295,7 +296,8 @@ bool needsHardExit() { return false; }
+ }  // namespace platform
+ }  // namespace vitaplex
+ 
+-// Lives at the top level (matches the declaration in paths.hpp).
++// Lives in the vitaplex namespace, where VitaHub's import wraps paths.hpp.
++namespace vitaplex {
+ // iOS apps are sandboxed; the writable area is the per-app Documents
+ // directory under the container. NSFileManager resolves the absolute
+ // path on first call; cache it for the process lifetime.
+@@ -315,3 +317,5 @@ const std::string& getIosDataDir() {
+     }
+     return s_dir;
+ }
++
++}  // namespace vitaplex
+diff --git a/modules/plex/src/platform/platform_psv.cpp b/modules/plex/src/platform/platform_psv.cpp
+index 38eab11..9bf1509 100644
+--- a/modules/plex/src/platform/platform_psv.cpp
++++ b/modules/plex/src/platform/platform_psv.cpp
+@@ -36,10 +36,12 @@
+ // Reduced from 192 MB to 172 MB - leaves more room for GPU VRAM and system.
+ // With optimized view recycling and image caching, the app uses significantly
+ // less heap, so this headroom is no longer needed.
++#ifndef VITAHUB  // VitaHub sizes the heap once for every module (hub/src/main.cpp)
+ extern "C" {
+ int _newlib_heap_size_user = 172 * 1024 * 1024;          // 172 MB heap
+ unsigned int sceUserMainThreadStackSize = 2 * 1024 * 1024; // 2 MB stack
+ }
++#endif
+ 
+ namespace {
+ 
+diff --git a/modules/plex/src/utils/app_update.cpp b/modules/plex/src/utils/app_update.cpp
+index 33f20a4..baefbd5 100644
+--- a/modules/plex/src/utils/app_update.cpp
++++ b/modules/plex/src/utils/app_update.cpp
+@@ -1873,6 +1873,12 @@ void setSelfPath(const char* argv0) {
+ }
+ 
+ void checkForUpdates(bool manual) {
++#ifdef VITAHUB
++    // Inside VitaHub this service updates with the hub. The standalone app's
++    // updater would download and install the separate app instead.
++    if (manual) brls::Application::notify("This service updates with VitaHub");
++    return;
++#endif
+     bool expected = false;
+     if (!s_busy.compare_exchange_strong(expected, true)) return;
+ 
+diff --git a/modules/plex/src/view/downloads_tab.cpp b/modules/plex/src/view/downloads_tab.cpp
+index 5d0bf53..ea10a2d 100644
+--- a/modules/plex/src/view/downloads_tab.cpp
++++ b/modules/plex/src/view/downloads_tab.cpp
+@@ -29,8 +29,20 @@
+ #include <set>
+ #include <map>
+ 
++#ifdef VITAHUB
++#include "vitahub/bridge.hpp"
++#endif
++
+ namespace vitaplex {
+ 
++// Activities on the stack while MainActivity is on top: just MainActivity
++// standalone, plus the hub's own screen underneath inside VitaHub.
++#ifdef VITAHUB
++static const size_t kMainActivityStackSize = vitahub::hubStackDepth() + 1;
++#else
++static const size_t kMainActivityStackSize = 1;
++#endif
++
+ // Format elapsed seconds as a human-readable string like "1m 23s" or "45s"
+ static std::string formatElapsedTime(int totalSeconds) {
+     if (totalSeconds < 60) {
+@@ -692,7 +704,7 @@ void DownloadsTab::startAutoRefresh() {
+                 // inside its detail view. The detail view runs its own
+                 // 1Hz refresh that auto-pops once the group is empty,
+                 // so this throttle isn't blocking that cleanup.
+-                if (brls::Application::getActivitiesStack().size() > 1) return;
++                if (brls::Application::getActivitiesStack().size() > kMainActivityStackSize) return;
+                 refresh();
+             });
+         }

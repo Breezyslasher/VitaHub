@@ -1,0 +1,387 @@
+/**
+ * VitaPlex - Plex Client for PlayStation Vita
+ * Borealis-based Application
+ */
+
+#pragma once
+
+#include <string>
+#include <functional>
+#include <vector>
+
+// Application version. Two flavours, both injected by the build system
+// (CMakeLists.txt forwards them from -DAPP_VERSION / -DAPP_DISPLAY_VERSION):
+//
+//   VITA_PLEX_VERSION         numeric ("1.0.2" or "1.0.2.455") — embedded
+//                             in Vita SFOs / PS4 pkgs / deb changelogs and
+//                             sent as the X-Plex-Version header to Plex
+//                             servers. Must look like a version number.
+//
+//   VITA_PLEX_DISPLAY_VERSION human-readable ("Beta 1.0.2") — shown in
+//                             the Settings > Version cell. Can include
+//                             labels and spaces.
+//
+// Fallbacks below apply only to ad-hoc builds that bypass CMake so the
+// header still compiles standalone.
+#ifndef VITA_PLEX_VERSION
+#define VITA_PLEX_VERSION "2.0.0"
+#endif
+#ifndef VITA_PLEX_DISPLAY_VERSION
+#define VITA_PLEX_DISPLAY_VERSION VITA_PLEX_VERSION
+#endif
+#define VITA_PLEX_VERSION_NUM 200
+
+// Plex client identification
+#define PLEX_CLIENT_ID "vita-plex-client-001"
+#define PLEX_CLIENT_NAME "VitaPlex"
+#define PLEX_CLIENT_VERSION VITA_PLEX_VERSION
+
+// NOTE: per-platform Plex transcode identification and limits
+// (previously PLEX_PLATFORM / PLEX_DEVICE / PLEX_MAX_VIDEO_* / PLEX_DEFAULT_*)
+// now live in the platform abstraction layer — see
+// include/platform/platform.hpp::VideoConstraints and the per-target
+// implementations in src/platform/platform_<name>.cpp. Callers should read
+// them via vitaplex::platform::getVideoConstraints() instead of using
+// ifdef-guarded #defines.
+
+namespace vitaplex {
+
+// Theme options
+enum class AppTheme {
+    SYSTEM = 0,  // Follow system setting
+    LIGHT = 1,
+    DARK = 2
+};
+
+// Video quality options for transcoding
+// Values are written to the config file, so new tiers are appended rather than
+// inserted in ladder order — the pickers sort them for display instead.
+enum class VideoQuality {
+    ORIGINAL = 0,      // Direct play/stream
+    QUALITY_1080P = 1, // 1080p 20Mbps
+    QUALITY_720P = 2,  // 720p 4Mbps
+    QUALITY_480P = 3,  // 480p 2Mbps (recommended for Vita)
+    QUALITY_360P = 4,  // 360p 1Mbps
+    QUALITY_240P = 5,  // 240p 500kbps
+    QUALITY_4K = 6     // 2160p 40Mbps
+};
+
+// Subtitle size options
+enum class SubtitleSize {
+    SMALL = 0,
+    MEDIUM = 1,
+    LARGE = 2
+};
+
+// Default action when selecting a track in album view
+enum class TrackDefaultAction {
+    PLAY_NEXT = 0,           // Add after current track
+    PLAY_NOW_REPLACE = 1,    // Replace current and play next
+    ADD_TO_BOTTOM = 2,       // Add to end of queue
+    PLAY_NOW_CLEAR = 3,      // Clear queue and play
+    ASK_EACH_TIME = 4        // Show dialog each time
+};
+
+// Which lyrics a track's own streams should be preferred from, when it carries
+// more than one. The distinction is the stream's `provider`:
+//   com.plexapp.agents.localmedia  an .lrc or .txt sitting beside the file,
+//                                  usually timed and usually the better copy
+//   com.plexapp.agents.lyricfind   Plex's licensed provider, nothing on disk
+enum class LyricsProvider {
+    AUTO  = 0,   // whatever the track has; ask when it has several
+    LOCAL = 1,   // prefer the file beside the track
+    PLEX  = 2    // prefer Plex's provider
+};
+
+// Whether unsynced lyrics are wanted at all.
+//
+// A timed file (.lrc) highlights the line being sung; an untimed one (.txt) is
+// a wall of text the sync view cannot follow. Which of those is worth opening
+// is taste, so it is asked rather than assumed.
+enum class LyricsTiming {
+    BOTH       = 0,   // whatever the track has
+    TIMED_ONLY = 1,   // hide unsynced: only lyrics that follow the music
+    PLAIN_ONLY = 2    // hide timed: only the plain text
+};
+
+// Application settings structure
+struct AppSettings {
+    // UI Settings
+    AppTheme theme = AppTheme::DARK;
+    bool debugLogging = true;  // Enable debug logging
+
+    // Layout Settings
+    std::string hiddenLibraries;          // Comma-separated list of library keys to hide
+    std::string sidebarOrder;             // Custom sidebar order. Movable ids between Home and Settings,
+                                          // comma-separated. Built-ins: search,livetv,downloads,library,music;
+                                          // per-library ids are "lib:<sectionKey>".
+    std::string hiddenSidebarItems;       // Comma-separated built-in sidebar ids hidden via the editor
+                                          // (search,livetv,downloads,library,music). Libraries use hiddenLibraries.
+    std::string librarySortPrefs;         // Per-section sort, encoded "key=param|label;key2=..."
+    bool localServerMode = false;         // Connected directly to a server address with no Plex
+                                          // account (server allows this client without auth).
+                                          // isLoggedIn() is token-based, so without this flag a
+                                          // token-less session would bounce back to the login
+                                          // screen on the next launch.
+    // In-app updates: check GitHub on startup, and the release the user
+    // said "Later" to (startup checks stop offering it; manual re-offers).
+    bool autoCheckUpdates = true;
+    std::string skippedUpdateVersion;
+
+    bool lastHadLiveTV = false;           // Server had a Live TV DVR last session. The sidebar is
+                                          // built from this before the async /livetv/dvrs probe
+                                          // lands (the probe no longer blocks app launch), then
+                                          // corrected via rebuild if the server changed.
+
+    // Content Display Settings
+    bool showCollections = true;          // Show collections in library sections
+    bool showPlaylists = true;            // Show playlists
+    bool showGenres = true;               // Show genre categories
+    bool hideTitlesInGrid = false;        // Hide titles under movie/show posters in grid
+    bool skipSingleSeason = false;        // Skip season view for single-season shows
+
+    // Playback Settings
+    bool autoPlayNext = true;
+    bool resumePlayback = true;
+    bool showSubtitles = true;
+    SubtitleSize subtitleSize = SubtitleSize::MEDIUM;
+    int seekInterval = 10;  // seconds
+    int controlsAutoHideSeconds = 5;  // Auto-hide player controls after inactivity (0 = never)
+    bool autoSkipIntro = false;       // Automatically skip intro markers
+    bool autoSkipCredits = false;     // Automatically skip credits markers
+    // Which music player layout to build. Deliberately not hard-gated to
+    // phones: forcing either one anywhere is how the big-art layout gets
+    // tested on a Vita, and some people prefer it on a tablet or a desktop
+    // window. 0 = Auto (phone gets Mobile, everything else Classic),
+    // 1 = Classic (today's player everywhere), 2 = Mobile (big art everywhere).
+    int playerLayout = 0;
+    // Same three choices for the video player, kept separate because the two
+    // layouts answer different questions: the music one is a portrait Now
+    // Playing screen, the video one a landscape OSD over the picture. Wanting
+    // one is no reason to be given the other.
+    int videoPlayerLayout = 0;
+    // ISO 639-1 / -2 code prefilled into the subtitle search dialog and
+    // used as the default when the user opens "Search online for
+    // subtitles…". Empty falls back to "en". User-editable from the
+    // Settings tab.
+    std::string defaultSubtitleLanguage = "en";
+
+    // Transcode Settings — defaults are set by Application::init() from
+    // platform::getVideoConstraints(). 0 means "use the platform default",
+    // and downstream code treats videoQuality == ORIGINAL_UNSET the same.
+    VideoQuality videoQuality = VideoQuality::QUALITY_1080P;
+    int maxBitrate = 0;         // 0 = use platform default bitrate
+    bool forceTranscode = false;
+    // Bitstream Dolby/DTS to the receiver instead of decoding it to PCM.
+    // Only ever acted on where the audio output says it accepts those
+    // encodings, so this is inert on a phone speaker. Off by default: a sink
+    // can advertise a codec its downstream AVR mishandles, and the failure
+    // mode is silence rather than a downmix.
+    bool audioPassthrough = false;
+
+    // Network Settings
+    int connectionTimeout = 180; // seconds (3 minutes for slow connections)
+    bool directPlay = false;     // Try direct play first
+
+    // SyncLounge (watch party) — remembered so the user doesn't retype them
+    // each session. Server defaults to the public instance.
+    std::string syncLoungeServer = "https://server.synclounge.tv";
+    std::string syncLoungeRoom;
+
+    // Windows Settings
+    // Whether the app may write a Start Menu shortcut for itself. Windows will
+    // not show a toast from an unpackaged app unless one exists carrying a
+    // matching AppUserModelID, so this is what decides between a real
+    // notification and a flashing taskbar button when a download finishes.
+    // On by default; a portable install turns it off and leaves nothing behind.
+    // Ignored (and not shown) anywhere but Windows.
+    bool windowsStartMenuShortcut = true;
+
+    // Download Settings
+    bool deleteAfterWatch = false;     // Auto-delete after fully watched
+    // Download quality. ORIGINAL keeps the source as-is on HEVC-capable
+    // platforms (no transcode, full quality); a specific resolution forces a
+    // server-side transcode to that size — smaller files, faster Vita encodes,
+    // and plays everywhere. Maps to videoResolution + videoBitrate on
+    // /downloadQueue/add (and gates the direct-vs-transcode download path).
+    VideoQuality downloadQuality = VideoQuality::ORIGINAL;
+    // Keep the source's surround audio instead of downmixing to 2.0 stereo
+    // (drops the audioChannelCount=2 limit on transcoded downloads).
+    bool downloadKeepOriginalAudio = false;
+    // Embed subtitles into transcoded downloads (otherwise they're stripped
+    // with subtitles=none). Direct (untranscoded) downloads always carry
+    // whatever subs the source file already embeds.
+    bool downloadIncludeSubtitles = false;
+
+    // Music Settings
+    TrackDefaultAction trackDefaultAction = TrackDefaultAction::ASK_EACH_TIME;  // Default action for tracks
+    LyricsProvider lyricsProvider = LyricsProvider::AUTO;   // which lyrics stream to favour
+    LyricsTiming   lyricsTiming   = LyricsTiming::BOTH;     // synced, unsynced, or both
+    // Light each word as it is sung, where the source carries word timing
+    // (Enhanced LRC, or a Plex document with stamped Spans). Off falls back to
+    // lighting the whole line, which is all a plain .lrc can do anyway. It is
+    // a setting because a word-timed line costs one view per word, and a long
+    // song on a handheld is where that shows.
+    bool lyricsWordByWord = true;
+    bool backgroundMusic = true;       // Allow leaving player without stopping music
+    // Turn shuffle on whenever a new music queue starts. Mainly for remote
+    // controllers: the framework MediaSession this app uses has no
+    // onSetShuffleMode callback, so clients like Android Auto head units and
+    // Pebble media browsers cannot toggle shuffle themselves — this lets the
+    // preference be set once here instead.
+    bool musicShuffleDefault = false;
+
+    // Live TV / DVR Settings
+    // Library section the user wants new DVR recordings to land in. When
+    // empty, scheduleRecording falls back to whatever the server-side
+    // /media/subscriptions/template recommended. The title is cached
+    // alongside the ID so the settings cell can render it without an
+    // extra /library/sections fetch every time the tab opens.
+    // Split by recording type: a movie cannot land in a TV library, so
+    // one default could never serve both. Empty = server's recommendation.
+    std::string defaultDvrShowSectionId;
+    std::string defaultDvrShowSectionTitle;
+    std::string defaultDvrMovieSectionId;
+    std::string defaultDvrMovieSectionTitle;
+    // Recording knobs forwarded as /media/subscriptions?prefs[...] on the
+    // POST. Defaults mirror what scheduleRecording used to hardcode.
+    int  dvrStartOffsetMinutes = 2;    // Pad recording start by this many minutes
+    int  dvrEndOffsetMinutes   = 2;    // Pad recording end by this many minutes
+    bool dvrRecordPartials     = true; // Keep recordings that didn't fully complete
+    int  dvrMinVideoQuality    = 0;    // 0 = any; higher demands better source quality
+    // Series (All Episodes) default: record new airings only vs new + repeats.
+    // Posted as prefs[onlyNewAirings] (the Setting the DVR template advertises;
+    // 0 = New and Repeat Airings, 1 = New Airings Only). false = include repeats.
+    bool dvrNewAiringsOnly     = false;
+    // EPG window the Live TV tab fetches and renders. Stays a multiple of
+    // 6 so the time-header slots line up; LiveTVTab clamps it on read.
+    int  liveTvGuideHours      = 12;
+
+    // Plex Home users. When true, restoring a saved session goes straight
+    // into the last-used user (current behaviour). When false, the boot
+    // flow shows the user picker first so the user can switch accounts
+    // without logging out.
+    bool autoLoginAsLastUser = true;
+
+    // HTTP response cache. Lifetime in minutes for the global on-disk
+    // cache used by PlexClient (library sections, Live TV channels,
+    // Home hubs). 0 disables caching entirely; non-zero values let
+    // get() reuse a cached body up to that many minutes old.
+    int cacheLifetimeMinutes = 60;
+
+    // When true, PlayerActivity overlays a small mpv-stats panel at
+    // the top-left of the video so the user can see codec, hwdec,
+    // FPS, frame drops, and cache state in real time. Driven from the
+    // Playback Tuning dialog; off by default.
+    bool showMpvStats = false;
+};
+
+/**
+ * Application singleton - manages app lifecycle and global state
+ */
+class Application {
+public:
+    static Application& getInstance();
+
+    // Initialize and run the application
+    bool init();
+    void run();
+    // Startup without the main loop (restore session, push the first
+    // activity). run() = start() + main loop; VitaHub calls start() and
+    // owns the loop itself.
+    void start();
+    void shutdown();
+
+    // Navigation
+    void pushLoginActivity();
+    void pushMainActivity();
+    void pushPlayerActivity(const std::string& mediaKey, bool isLocalFile = false);
+    void pushLiveTVPlayerActivity(const std::string& streamUrl, const std::string& channelTitle,
+                                  const std::string& liveSessionUuid = "");
+
+    // Authentication state
+    bool isLoggedIn() const { return !m_authToken.empty(); }
+    const std::string& getAuthToken() const { return m_authToken; }
+    void setAuthToken(const std::string& token) { m_authToken = token; }
+    const std::string& getServerUrl() const { return m_serverUrl; }
+    void setServerUrl(const std::string& url) { m_serverUrl = url; }
+
+    // Plex Home user state. The master token is the account-level token
+    // returned by /users/signin or /pins/{id}; it's what fetchHomeUsers
+    // and switchHomeUser need. m_authToken is the *effective* token,
+    // either the master one (no user switched) or the per-user token
+    // from switchHomeUser. When the user hasn't switched away from the
+    // owner, master == authToken and the home-user fields stay empty.
+    const std::string& getMasterAuthToken() const { return m_masterAuthToken; }
+    void setMasterAuthToken(const std::string& token) { m_masterAuthToken = token; }
+    const std::string& getCurrentHomeUserUuid() const { return m_currentHomeUserUuid; }
+    void setCurrentHomeUserUuid(const std::string& uuid) { m_currentHomeUserUuid = uuid; }
+    const std::string& getCurrentHomeUserTitle() const { return m_currentHomeUserTitle; }
+    void setCurrentHomeUserTitle(const std::string& t) { m_currentHomeUserTitle = t; }
+
+    // Settings persistence
+    bool loadSettings();
+    bool saveSettings();
+
+    // Plex Home user picker. Fetches the Home users list using the
+    // master token and presents a Dropdown of names. On pick, prompts
+    // for a PIN if the user is protected, switches via /home/users/{uuid}/
+    // switch, saves the new per-user token to settings, then invokes the
+    // onComplete callback. If the account has no Plex Home, only the
+    // owner, or the master token is missing, onComplete is invoked
+    // immediately with no UI shown — caller proceeds normally.
+    void showHomeUserPicker(std::function<void()> onComplete);
+
+    // User info
+    const std::string& getUsername() const { return m_username; }
+    void setUsername(const std::string& name) { m_username = name; }
+
+    // Offline mode
+    bool isOfflineMode() const { return m_offlineMode; }
+    void setOfflineMode(bool offline) { m_offlineMode = offline; }
+
+    // Application settings access
+    AppSettings& getSettings() { return m_settings; }
+    const AppSettings& getSettings() const { return m_settings; }
+
+    // Apply theme
+    void applyTheme();
+
+    // Apply log level based on settings
+    void applyLogLevel();
+
+    // Get quality string for display
+    static std::string getQualityString(VideoQuality quality);
+    static std::string getThemeString(AppTheme theme);
+    static std::string getSubtitleSizeString(SubtitleSize size);
+
+    // Quality tiers in ladder order (best first) for the settings pickers, filtered to what this platform can decode.
+    static std::vector<VideoQuality> qualityLadder();
+    // Device-level, not port-level — see platform::supports4KDecode().
+    static bool supports4K();
+    // Decode ceiling to advertise to Plex. The platform's, except when the user
+    // has asked for 4K — the server clamps to whatever we claim, so leaving the
+    // 1080p bound in place would make the tier do nothing.
+    static void videoLimitFor(VideoQuality quality, int& outWidth, int& outHeight);
+    // Frame size to ask Plex to transcode to. ORIGINAL, and any tier this
+    // device cannot decode, fall back to the platform default.
+    static const char* resolutionFor(VideoQuality quality);
+
+private:
+    Application() = default;
+    ~Application() = default;
+    Application(const Application&) = delete;
+    Application& operator=(const Application&) = delete;
+
+    bool m_initialized = false;
+    bool m_offlineMode = false;
+    std::string m_authToken;
+    std::string m_masterAuthToken;
+    std::string m_currentHomeUserUuid;
+    std::string m_currentHomeUserTitle;
+    std::string m_serverUrl;
+    std::string m_username;
+    AppSettings m_settings;
+};
+
+} // namespace vitaplex

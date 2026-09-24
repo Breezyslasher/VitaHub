@@ -1,0 +1,81 @@
+diff --git a/modules/suwayomi/include/app/application.hpp b/modules/suwayomi/include/app/application.hpp
+index 2f81f2a..78fa7ff 100644
+--- a/modules/suwayomi/include/app/application.hpp
++++ b/modules/suwayomi/include/app/application.hpp
+@@ -246,6 +246,10 @@ public:
+     // Initialize and run the application
+     bool init();
+     void run();
++    // Startup without the main loop (restore session, push the first
++    // activity). run() = start() + main loop; VitaHub calls start() and
++    // owns the loop itself.
++    void start();
+     void shutdown();
+ 
+     // Navigation
+diff --git a/modules/suwayomi/src/activity/main_activity.cpp b/modules/suwayomi/src/activity/main_activity.cpp
+index 8267237..71975e3 100644
+--- a/modules/suwayomi/src/activity/main_activity.cpp
++++ b/modules/suwayomi/src/activity/main_activity.cpp
+@@ -4,6 +4,10 @@
+  */
+ 
+ #include "activity/main_activity.hpp"
++
++#ifdef VITAHUB
++#include "vitahub/bridge.hpp"
++#endif
+ #include "view/library_section_tab.hpp"
+ #include "view/history_tab.hpp"
+ #include "view/extensions_tab.hpp"
+@@ -76,6 +80,9 @@ void MainActivity::onContentAvailable() {
+         tabFrame->addTab("Settings", []() {
+             return new SettingsTab();
+         });
++#ifdef VITAHUB
++        tabFrame->addTab("VitaHub", []() { return vitahub::createServicesTab("suwayomi"); });
++#endif
+ 
+         // If online, try to load categories for additional library tabs
+         if (isOnline) {
+diff --git a/modules/suwayomi/src/app/application.cpp b/modules/suwayomi/src/app/application.cpp
+index e9136c9..a681113 100644
+--- a/modules/suwayomi/src/app/application.cpp
++++ b/modules/suwayomi/src/app/application.cpp
+@@ -152,7 +152,7 @@ bool Application::init() {
+     return true;
+ }
+ 
+-void Application::run() {
++void Application::start() {
+     brls::Logger::info("Application::run - isConnected={}, serverUrl={}",
+                        isConnected(), m_serverUrl.empty() ? "(empty)" : m_serverUrl);
+ 
+@@ -392,6 +392,10 @@ void Application::run() {
+ 
+     // Sync perf overlay setting
+     PerfOverlay::getInstance().setEnabled(m_settings.showPerfOverlay);
++}
++
++void Application::run() {
++    start();
+ 
+     // Main loop handled by Borealis
+     while (brls::Application::mainLoop()) {
+diff --git a/modules/suwayomi/src/utils/app_update.cpp b/modules/suwayomi/src/utils/app_update.cpp
+index 2ad07a6..0908217 100644
+--- a/modules/suwayomi/src/utils/app_update.cpp
++++ b/modules/suwayomi/src/utils/app_update.cpp
+@@ -2118,6 +2118,12 @@ void setSelfPath(const char* argv0) {
+ }
+ 
+ void checkForUpdates(bool manual) {
++#ifdef VITAHUB
++    // Inside VitaHub this service updates with the hub. The standalone app's
++    // updater would download and install the separate app instead.
++    if (manual) brls::Application::notify("This service updates with VitaHub");
++    return;
++#endif
+     bool expected = false;
+     if (!s_busy.compare_exchange_strong(expected, true)) {
+         if (manual) brls::Application::notify("An update check is already running");

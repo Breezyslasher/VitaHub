@@ -1,0 +1,5 @@
+build*/
+*.log
+__pycache__/
+resources/i18n/en-US/hints.json
+resources/shaders/*.dksh

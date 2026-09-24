@@ -1,0 +1,361 @@
+/**
+ * WebtoonScrollView - Continuous vertical scrolling view for webtoon reading
+ * Displays all pages as one long continuous strip with smooth scrolling
+ */
+
+#pragma once
+
+#include <borealis.hpp>
+#include <vector>
+#include <set>
+#include <map>
+#include <functional>
+#include <memory>
+#include <string>
+#include "view/rotatable_image.hpp"
+#include "view/pinch_gesture.hpp"
+#include "app/suwayomi_client.hpp"
+
+namespace vitasuwayomi {
+
+// Callback when scroll position changes (for progress tracking)
+using ScrollProgressCallback = std::function<void(int currentPage, int totalPages, float scrollPercent)>;
+
+// Callback when user taps (for toggling controls)
+using TapCallback = std::function<void()>;
+
+// Callback when user taps a transition page to navigate chapters
+// Parameter: true = next chapter, false = previous chapter
+using ChapterNavigateCallback = std::function<void(bool next)>;
+
+// Callback to retry loading a specific page
+using RetryPageCallback = std::function<void(int pageIndex)>;
+
+class WebtoonScrollView : public brls::Box {
+public:
+    WebtoonScrollView();
+    ~WebtoonScrollView();
+
+    /**
+     * Set the pages to display
+     * @param pages Vector of page data with image URLs
+     * @param screenWidth Width available for pages
+     */
+    void setPages(const std::vector<Page>& pages, float screenWidth, int startPage = 0);
+
+    /**
+     * Clear all pages and reset scroll
+     */
+    void clearPages();
+
+    /**
+     * Append pages at the end (for seamless next chapter loading).
+     * Keeps the old trailing transition page as a chapter separator,
+     * then appends the new pages after it.
+     * Scroll position stays the same since content is added below the viewport.
+     */
+    void appendPages(const std::vector<Page>& pages);
+
+    /**
+     * Prepend pages at the beginning (for seamless prev chapter loading).
+     * Keeps the old leading transition page as a chapter separator,
+     * then prepends the new pages before it.
+     * Adjusts scroll position so existing content stays at the same screen position.
+     */
+    void prependPages(const std::vector<Page>& pages);
+
+    /**
+     * Remove pages from the start of the page list (for trimming distant chapters).
+     * Adjusts scroll position so visible content doesn't move.
+     * @param count Number of pages to remove from the start
+     */
+    void trimPagesFromStart(int count);
+
+    /**
+     * Remove pages from the end of the page list (for trimming distant chapters).
+     * No scroll adjustment needed since content is removed from below the viewport.
+     * @param count Number of pages to remove from the end
+     */
+    void trimPagesFromEnd(int count);
+
+    /**
+     * Scroll to a specific page index
+     */
+    void scrollToPage(int pageIndex);
+
+    /**
+     * Scroll forward or backward by a fraction of the viewport.
+     * Positive fraction scrolls forward (towards end), negative scrolls backward.
+     * Used for D-pad navigation in webtoon mode.
+     */
+    void scrollByViewport(float fraction);
+
+    /**
+     * Get the currently visible page (topmost page in view)
+     */
+    int getCurrentPage() const { return m_currentPage; }
+
+    /**
+     * Get total page count
+     */
+    int getPageCount() const { return static_cast<int>(m_pages.size()); }
+
+    /**
+     * Get the number of real (non-transition) pages
+     */
+    int getRealPageCount() const;
+
+    /**
+     * Convert an internal page index to a 0-based display page number
+     * (counts only real pages before and including the given index)
+     */
+    int displayPageFromIndex(int pageIndex) const;
+
+    /**
+     * Convert a 0-based display page number to an internal page index
+     * (finds the Nth real page, skipping transition pages)
+     */
+    int pageIndexFromDisplayPage(int displayPage) const;
+
+    /**
+     * Get current scroll position (0.0 to 1.0)
+     */
+    float getScrollProgress() const;
+
+    /**
+     * Set callback for scroll progress updates
+     */
+    void setProgressCallback(ScrollProgressCallback callback) { m_progressCallback = callback; }
+
+    /**
+     * Set callback for tap gesture (to toggle controls)
+     */
+    void setTapCallback(TapCallback callback) { m_tapCallback = callback; }
+
+    /**
+     * Set callback for chapter navigation (transition page tap)
+     */
+    void setChapterNavigateCallback(ChapterNavigateCallback callback) { m_chapterNavigateCallback = callback; }
+
+    /**
+     * Set callback for page retry
+     */
+    void setRetryPageCallback(RetryPageCallback callback) { m_retryPageCallback = callback; }
+
+    /**
+     * Set transition page text (called by reader activity when setting up pages)
+     * @param pageIndex Index of the transition page
+     * @param line1 First line of text (e.g. "End of: Chapter 5")
+     * @param line2 Second line of text (e.g. "Next: Chapter 6")
+     */
+    void setTransitionText(int pageIndex, const std::string& line1, const std::string& line2);
+
+    /**
+     * Set side padding percentage (0-20)
+     */
+    void setSidePadding(int percent);
+
+    /**
+     * Set background color (visible in margins and between pages)
+     */
+    void setBackgroundColor(NVGcolor color);
+
+    /**
+     * Set rotation for all page images (0, 90, 180, 270 degrees)
+     */
+    void setRotation(float degrees);
+
+    /**
+     * Get current rotation
+     */
+    float getRotation() const { return m_rotationDegrees; }
+
+    /**
+     * Handle frame update for progressive loading
+     */
+    void onFrame();
+
+    void draw(NVGcontext* vg, float x, float y, float width, float height,
+              brls::Style style, brls::FrameContext* ctx) override;
+
+    // Check if a page is a transition page (chapter separator)
+    bool isTransitionPage(int pageIndex) const;
+
+    static brls::View* create();
+
+private:
+    // Setup touch gestures for scrolling
+    void setupGestures();
+
+    // Load images that are visible or near visible, unload distant ones
+    void updateVisibleImages();
+
+    // Check if a page is in the visible range
+    bool isPageVisible(int pageIndex) const;
+
+    // Calculate the offset for a page (Y for vertical, X for horizontal)
+    // Uses cached prefix sums for O(1) lookup
+    float getPageOffset(int pageIndex) const;
+
+    // Check if layout should be horizontal (at 90 or 270 rotation)
+    bool isHorizontalLayout() const;
+
+    // Get effective page size for current layout mode (width for horizontal, height for vertical)
+    float getEffectivePageSize(int pageIndex) const;
+
+    // Get total content size for current layout mode
+    float getTotalContentSize() const;
+
+    // Update current page based on scroll position
+    void updateCurrentPage();
+
+    // Rebuild prefix-sum offset cache from m_pageHeights (const: modifies mutable cache)
+    void rebuildOffsetCache() const;
+
+    // Invalidate the offset cache (call when page heights change)
+    void invalidateOffsetCache();
+
+    // Find the first page whose offset is <= the given position (binary search)
+    int findPageAtOffset(float offset) const;
+
+    // Apply momentum scrolling
+    void applyMomentum();
+
+    // Check if a page failed to load
+    bool isFailedPage(int pageIndex) const;
+
+    // Draw a transition page (chapter separator)
+    void drawTransitionPage(NVGcontext* vg, int pageIndex, float x, float y, float width, float height);
+
+    // Draw a failed page with retry prompt
+    void drawFailedPage(NVGcontext* vg, int pageIndex, float x, float y, float width, float height);
+
+    // Find which page a tap landed on (returns -1 if none)
+    int getPageAtPosition(float tapX, float tapY) const;
+
+    // Pages data
+    std::vector<Page> m_pages;
+
+    // Image containers for each page (shared_ptr so async load callbacks keep them alive)
+    std::vector<std::shared_ptr<RotatableImage>> m_pageImages;
+
+    // Content box that holds all images
+    brls::Box* m_contentBox = nullptr;
+
+    // Scroll state
+    float m_scrollY = 0.0f;           // Current scroll position (negative = scrolled down)
+    float m_scrollVelocity = 0.0f;    // Current scroll velocity for momentum
+    float m_totalHeight = 0.0f;       // Total content height
+    float m_viewHeight = 0.0f;        // Visible area height
+    float m_viewWidth = 0.0f;         // Visible area width
+
+    // Touch tracking
+    bool m_isTouching = false;
+    brls::Point m_touchStart;
+    brls::Point m_touchLast;
+    float m_scrollAtTouchStart = 0.0f;
+    std::chrono::steady_clock::time_point m_lastTouchTime;
+
+    // Overscroll tracking (legacy, kept for potential bounce animation)
+    float m_overscrollAmount = 0.0f;      // Accumulated overscroll past boundary
+    bool m_overscrollTriggered = false;    // Prevents repeated triggers
+
+    // Auto-extend: seamlessly load next/prev chapter when approaching transition pages
+    bool m_extendingChapter = false;           // Re-entrancy guard
+    bool m_trailingExtendTriggered = false;    // Prevents repeated trailing triggers
+    bool m_leadingExtendTriggered = false;     // Prevents repeated leading triggers
+    bool m_userHasScrolled = false;            // Prevents auto-extend during initial setup
+
+    // Page tracking
+    int m_currentPage = 0;
+    std::set<int> m_loadedPages;      // Pages that have been loaded
+    std::set<int> m_loadingPages;     // Pages currently being loaded
+    std::set<int> m_failedPages;      // Pages that failed to load
+
+    // Anchor page for scroll compensation after prepend/append.
+    // Only pages with index < m_anchorPage get scroll adjustment when
+    // their image height changes, preventing cascading drift.
+    // -1 means disabled (use legacy position-based check).
+    int m_anchorPage = -1;
+
+    // Transition page data
+    struct TransitionInfo {
+        std::string line1;
+        std::string line2;
+        bool isNext = true;  // true = next chapter, false = previous chapter
+    };
+    std::map<int, TransitionInfo> m_transitionInfo;
+
+    // Layout
+    NVGcolor m_bgColor = nvgRGBA(26, 26, 46, 255);  // Background color (default dark)
+    float m_sidePadding = 0.0f;       // Padding on each side
+    float m_pageGap = 0.0f;           // Gap between pages (0 for seamless webtoon)
+    std::vector<float> m_pageHeights; // Height of each page
+    float m_rotationDegrees = 0.0f;   // Image rotation (0, 90, 180, 270)
+
+    // Prefix-sum offset cache for O(1) page offset lookups and O(log n) searches.
+    // m_offsetCache[i] = sum of effective page sizes for pages 0..i-1 (including gaps).
+    // m_offsetCache[0] = 0, m_offsetCache[n] = total content size.
+    mutable std::vector<float> m_offsetCache;
+    mutable bool m_offsetCacheDirty = true;
+
+    // Callbacks
+    ScrollProgressCallback m_progressCallback;
+    TapCallback m_tapCallback;
+    ChapterNavigateCallback m_chapterNavigateCallback;
+    RetryPageCallback m_retryPageCallback;
+
+    // Alive flag for async callback safety (cleared in clearPages/destructor)
+    std::shared_ptr<bool> m_alive = std::make_shared<bool>(true);
+
+    // Preload buffer - how many pages ahead/behind to load
+    // Higher values mean smoother scrolling but more VRAM usage.
+    // 4 pages gives ~2 screens of lookahead at typical webtoon image heights.
+    static constexpr int PRELOAD_PAGES = 4;
+
+    // Unload buffer - pages beyond this distance from visible area get their images freed
+    // Reduced from 8 to limit VRAM usage when tall images have multiple segment textures
+    static constexpr int UNLOAD_PAGES = 5;
+
+    // Momentum friction (per-frame at 60fps baseline; actual deceleration is time-based)
+    static constexpr float MOMENTUM_FRICTION = 0.95f;
+    static constexpr float MOMENTUM_MIN_VELOCITY = 0.5f;
+
+    // Frame timing for frame-rate independent momentum
+    std::chrono::steady_clock::time_point m_lastFrameTime;
+
+    // Touch thresholds
+    static constexpr float TAP_THRESHOLD = 15.0f;
+    static constexpr int DOUBLE_TAP_THRESHOLD_MS = 300;
+    static constexpr float DOUBLE_TAP_DISTANCE = 50.0f;
+
+    // Zoom state
+    bool m_isZoomed = false;
+    float m_zoomLevel = 1.0f;
+    brls::Point m_zoomOffset = {0, 0};
+
+    // Double-tap tracking
+    std::chrono::steady_clock::time_point m_lastTapTime;
+    brls::Point m_lastTapPosition = {0, 0};
+
+    // Pinch-to-zoom tracking
+    bool m_isPinching = false;
+    float m_initialZoomLevel = 1.0f;
+    brls::Point m_initialZoomOffset = {0, 0};
+    brls::Point m_initialPinchCenter = {0, 0};  // In view coords
+    std::chrono::steady_clock::time_point m_pinchEndTime;  // Cooldown guard
+
+    // Zoom methods
+    void resetZoom();
+
+    // Transition page height (fixed size for chapter separators)
+    static constexpr float TRANSITION_PAGE_HEIGHT = 200.0f;
+
+    // Failed page height (shows error message + retry)
+    static constexpr float FAILED_PAGE_HEIGHT = 150.0f;
+
+    // Overscroll threshold to trigger chapter navigation (in view coords)
+    static constexpr float OVERSCROLL_THRESHOLD = 80.0f;
+};
+
+} // namespace vitasuwayomi

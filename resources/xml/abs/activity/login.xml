@@ -1,0 +1,252 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    Login screen — direction 4a, "Centred column".
+
+    No brand panel, no artwork: one 520px column centred on the screen,
+    three field rows and one primary button. Each of the three focusable
+    labels the activity already binds is now the VALUE half of a
+    caption-over-value row, so a focused row reads as a control rather
+    than as a line of text.
+
+    Colours come from borealis' active theme (applied in
+    LoginActivity::applyThemeColors) so this screen matches the rest of
+    the app in Light and Dark; only the bronze accent is fixed, as a
+    brand colour. The theme is loaded from settings during app init, so
+    it is already correct by the time this screen renders.
+-->
+<brls:Box
+    width="100%"
+    height="100%"
+    axis="column"
+    justifyContent="center"
+    alignItems="center"
+    padding="40">
+
+    <brls:Box
+        id="login/input_container"
+        width="520"
+        axis="column"
+        alignItems="stretch">
+
+        <brls:Label
+            id="login/title"
+            text="Sign in to Audiobookshelf"
+            fontSize="30"
+            marginBottom="6"/>
+
+        <brls:Label
+            id="login/subline"
+            text="Credentials are stored on this device only."
+            fontSize="15"
+            marginBottom="30"/>
+
+        <!-- ── SERVER ───────────────────────────────────────────────── -->
+        <brls:Box
+            id="login/server_row"
+            axis="row"
+            alignItems="center"
+            cornerRadius="6"
+            borderThickness="1"
+            paddingTop="12"
+            paddingBottom="12"
+            paddingLeft="16"
+            paddingRight="16"
+            marginBottom="12"
+            focusable="true">
+            <brls:Box axis="column" grow="1">
+                <brls:Label
+                    id="login/server_caption"
+                    text="SERVER"
+                    fontSize="10"
+                    singleLine="true"/>
+                <brls:Label
+                    id="login/server_label"
+                    text="Not set"
+                    fontSize="17"
+                    marginTop="2"
+                    singleLine="true"/>
+            </brls:Box>
+            <brls:Label
+                id="login/server_edit"
+                text="Edit"
+                fontSize="14"
+                singleLine="true"
+                visibility="invisible"/>
+        </brls:Box>
+
+        <!-- ── USERNAME (hidden in API-token mode) ──────────────────── -->
+        <brls:Box
+            id="login/username_row"
+            axis="row"
+            alignItems="center"
+            cornerRadius="6"
+            borderThickness="1"
+            paddingTop="12"
+            paddingBottom="12"
+            paddingLeft="16"
+            paddingRight="16"
+            marginBottom="12"
+            focusable="true">
+            <brls:Box axis="column" grow="1">
+                <brls:Label
+                    id="login/username_caption"
+                    text="USERNAME"
+                    fontSize="10"
+                    singleLine="true"/>
+                <brls:Label
+                    id="login/username_label"
+                    text="Not set"
+                    fontSize="17"
+                    marginTop="2"
+                    singleLine="true"/>
+            </brls:Box>
+            <brls:Label
+                id="login/username_edit"
+                text="Edit"
+                fontSize="14"
+                singleLine="true"
+                visibility="invisible"/>
+        </brls:Box>
+
+        <!-- ── PASSWORD / API TOKEN ─────────────────────────────────── -->
+        <!-- The Show toggle is a sibling of the field, not a child: a
+             focusable Box returns itself from getDefaultFocus, so a
+             focusable child inside the field row would be unreachable. -->
+        <brls:Box
+            axis="row"
+            alignItems="center"
+            marginBottom="12">
+
+            <brls:Box
+                id="login/password_row"
+                axis="row"
+                alignItems="center"
+                grow="1"
+                cornerRadius="6"
+                borderThickness="1"
+                paddingTop="12"
+                paddingBottom="12"
+                paddingLeft="16"
+                paddingRight="16"
+                focusable="true">
+                <brls:Box axis="column" grow="1">
+                    <brls:Label
+                        id="login/password_caption"
+                        text="PASSWORD"
+                        fontSize="10"
+                        singleLine="true"/>
+                    <brls:Label
+                        id="login/password_label"
+                        text="Not set"
+                        fontSize="17"
+                        marginTop="2"
+                        singleLine="true"/>
+                </brls:Box>
+                <brls:Label
+                    id="login/password_edit"
+                    text="Edit"
+                    fontSize="14"
+                    singleLine="true"
+                    visibility="invisible"/>
+            </brls:Box>
+
+            <brls:Label
+                id="login/password_show"
+                text="Show"
+                fontSize="14"
+                marginLeft="14"
+                singleLine="true"
+                focusable="true"/>
+
+        </brls:Box>
+
+        <!-- ── Primary actions ──────────────────────────────────────── -->
+        <brls:Box
+            axis="row"
+            alignItems="stretch"
+            height="62"
+            marginTop="24">
+
+            <brls:Button
+                id="login/login_button"
+                style="borderless"
+                grow="1"
+                cornerRadius="8">
+                <brls:Label
+                    id="login/login_label"
+                    text="Sign in"
+                    fontSize="17"
+                    horizontalAlign="center"
+                    width="100%"
+                    singleLine="true"/>
+            </brls:Button>
+
+            <brls:Button
+                id="login/test_button"
+                style="borderless"
+                width="120"
+                marginLeft="14"
+                cornerRadius="8"
+                borderThickness="1">
+                <brls:Label
+                    id="login/test_label"
+                    text="Test"
+                    fontSize="15"
+                    horizontalAlign="center"
+                    width="100%"
+                    singleLine="true"/>
+            </brls:Button>
+
+        </brls:Box>
+
+        <!-- ── Footer: neither is a peer of Sign in ─────────────────── -->
+        <brls:Box
+            axis="row"
+            justifyContent="spaceBetween"
+            alignItems="center"
+            marginTop="18">
+
+            <brls:Label
+                id="login/token_toggle"
+                text="Use an API token"
+                fontSize="15"
+                singleLine="true"
+                focusable="true"/>
+
+            <brls:Button
+                id="login/offline_button"
+                style="borderless">
+                <brls:Label
+                    id="login/offline_label"
+                    text="Continue offline"
+                    fontSize="15"
+                    singleLine="true"/>
+            </brls:Button>
+
+        </brls:Box>
+
+        <!-- ── Status / error ───────────────────────────────────────── -->
+        <!-- Plain text while idle; on failure the activity turns the box
+             red-tinted and fills the second line with what to check. -->
+        <brls:Box
+            id="login/status_box"
+            axis="column"
+            alignItems="stretch"
+            cornerRadius="6"
+            marginTop="16"
+            visibility="gone">
+            <brls:Label
+                id="login/status"
+                text=""
+                fontSize="15"/>
+            <brls:Label
+                id="login/status_hint"
+                text=""
+                fontSize="15"
+                marginTop="2"
+                visibility="gone"/>
+        </brls:Box>
+
+    </brls:Box>
+
+</brls:Box>

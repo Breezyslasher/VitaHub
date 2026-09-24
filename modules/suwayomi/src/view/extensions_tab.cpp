@@ -1,0 +1,1602 @@
+/**
+ * VitaSuwayomi - Extensions Tab
+ * Manage Suwayomi extensions (install, update, uninstall)
+ * Uses RecyclerFrame for stable, efficient list rendering with automatic view lifecycle management
+ */
+
+#include "view/extensions_tab.hpp"
+#include "view/options_popover.hpp"
+#include "app/suwayomi_client.hpp"
+#include "app/application.hpp"
+#include "utils/image_loader.hpp"
+#include "utils/button_icons.hpp"
+
+#include <borealis.hpp>
+#include <algorithm>
+#include <cctype>
+#include <thread>
+
+namespace vitasuwayomi {
+
+// Static members for ExtensionCell
+bool ExtensionCell::s_preferSettingsFocus = false;
+brls::RecyclerFrame* ExtensionCell::s_recycler = nullptr;
+ExtensionsDataSource* ExtensionCell::s_dataSource = nullptr;
+
+// ============================================================================
+// ExtensionCell Implementation
+// ============================================================================
+
+ExtensionCell::ExtensionCell() {
+    this->setAxis(brls::Axis::ROW);
+    this->setJustifyContent(brls::JustifyContent::SPACE_BETWEEN);
+    this->setAlignItems(brls::AlignItems::CENTER);
+    this->setPadding(8, 12, 8, 12);
+    this->setFocusable(true);
+
+    // Left side: icon and info
+    auto* leftBox = new brls::Box();
+    leftBox->setAxis(brls::Axis::ROW);
+    leftBox->setAlignItems(brls::AlignItems::CENTER);
+    leftBox->setGrow(1.0f);
+    leftBox->setShrink(1.0f);
+
+    // Icon
+    icon = new brls::Image();
+    icon->setSize(brls::Size(36, 36));
+    icon->setMarginRight(12);
+    leftBox->addView(icon);
+
+    // Info box — grow into the available row width so titles don't wrap
+    // mid-word when there's plenty of space.
+    auto* infoBox = new brls::Box();
+    infoBox->setAxis(brls::Axis::COLUMN);
+    infoBox->setGrow(1.0f);
+    infoBox->setShrink(1.0f);
+
+    nameLabel = new brls::Label();
+    nameLabel->setFontSize(14);
+    nameLabel->setSingleLine(true);
+    infoBox->addView(nameLabel);
+
+    detailLabel = new brls::Label();
+    detailLabel->setFontSize(10);
+    detailLabel->setSingleLine(true);
+    detailLabel->setTextColor(Application::getInstance().getSubtitleColor());
+    infoBox->addView(detailLabel);
+
+    leftBox->addView(infoBox);
+    this->addView(leftBox);
+
+    // Right side
+    auto* rightBox = new brls::Box();
+    rightBox->setAxis(brls::Axis::ROW);
+    rightBox->setAlignItems(brls::AlignItems::CENTER);
+
+    // Settings button (created but may be hidden)
+    settingsBtn = new brls::Box();
+    settingsBtn->setFocusable(true);
+    settingsBtn->setPadding(6, 6, 6, 6);
+    settingsBtn->setCornerRadius(4);
+    settingsBtn->setMarginRight(8);
+    settingsBtn->setVisibility(brls::Visibility::GONE);
+
+    auto* settingsIcon = new brls::Image();
+    settingsIcon->setSize(brls::Size(20, 20));
+    settingsIcon->setImageFromFile(RESOURCE_PREFIX "icons/options.png");
+    settingsBtn->addView(settingsIcon);
+    settingsBtn->addGestureRecognizer(new brls::TapGestureRecognizer(settingsBtn));
+
+    rightBox->addView(settingsBtn);
+
+    // Status label
+    statusLabel = new brls::Label();
+    statusLabel->setFontSize(11);
+    statusLabel->setMarginLeft(8);
+    rightBox->addView(statusLabel);
+
+    this->addView(rightBox);
+    this->addGestureRecognizer(new brls::TapGestureRecognizer(this));
+}
+
+ExtensionCell* ExtensionCell::create() {
+    return new ExtensionCell();
+}
+
+void ExtensionCell::prepareForReuse() {
+    brls::RecyclerCell::prepareForReuse();
+    pkgName.clear();
+    iconLoaded = false;
+    rowIndex = -1;
+    icon->clear();
+    nameLabel->setText("");
+    detailLabel->setText("");
+    statusLabel->setText("");
+    settingsBtn->setVisibility(brls::Visibility::GONE);
+    this->setMarginLeft(0);
+}
+
+brls::View* ExtensionCell::getNextFocus(brls::FocusDirection direction, brls::View* currentView) {
+    bool settingsVisible = settingsBtn->getVisibility() == brls::Visibility::VISIBLE;
+
+    // currentView != this means focus is inside the cell (on the settings button side),
+    // because settingsBtn is the only other focusable child. Borealis passes the
+    // direct child (rightBox) as currentView, not settingsBtn itself.
+    bool focusOnSettings = settingsVisible && (currentView != this);
+
+    // RIGHT on cell: move to settings button
+    if (direction == brls::FocusDirection::RIGHT && settingsVisible && currentView == this) {
+        s_preferSettingsFocus = true;
+        return settingsBtn;
+    }
+
+    // LEFT from settings: go back to extension cell
+    if (direction == brls::FocusDirection::LEFT && focusOnSettings) {
+        s_preferSettingsFocus = false;
+        return this;
+    }
+
+    // UP/DOWN from settings: skip to next/prev row that has a settings icon
+    if ((direction == brls::FocusDirection::UP || direction == brls::FocusDirection::DOWN) &&
+        focusOnSettings) {
+        s_preferSettingsFocus = true;
+
+        if (s_dataSource && s_recycler && rowIndex >= 0) {
+            bool searchDown = (direction == brls::FocusDirection::DOWN);
+            int targetRow = s_dataSource->findNextSettingsRow(rowIndex, searchDown);
+
+            if (targetRow >= 0 && targetRow != rowIndex) {
+                // Scroll to make the target row visible
+                s_recycler->selectRowAt(brls::IndexPath(0, targetRow), false);
+
+                // After layout, getDefaultFocus will return the target cell's
+                // settings button (because s_preferSettingsFocus is true)
+                brls::sync([]() {
+                    if (s_recycler) {
+                        brls::View* target = s_recycler->getDefaultFocus();
+                        if (target) {
+                            brls::Application::giveFocus(target);
+                        }
+                    }
+                });
+
+                // Hold focus on current settings button until sync fires
+                return settingsBtn;
+            }
+        }
+
+        // No next settings row found - stay on current settings button
+        return settingsBtn;
+    }
+
+    // Default behavior
+    return brls::RecyclerCell::getNextFocus(direction, currentView);
+}
+
+brls::View* ExtensionCell::getDefaultFocus() {
+    // If we should prefer settings focus and settings button is visible, return it
+    if (s_preferSettingsFocus && settingsBtn->getVisibility() == brls::Visibility::VISIBLE) {
+        return settingsBtn;
+    }
+    // Otherwise return the cell itself (default behavior)
+    return this;
+}
+
+// ============================================================================
+// ExtensionSectionHeader Implementation
+// ============================================================================
+
+ExtensionSectionHeader::ExtensionSectionHeader() {
+    this->setAxis(brls::Axis::ROW);
+    this->setJustifyContent(brls::JustifyContent::SPACE_BETWEEN);
+    this->setAlignItems(brls::AlignItems::CENTER);
+    this->setPadding(12, 15, 12, 15);
+    this->setBackgroundColor(Application::getInstance().getSectionHeaderBg());  // Vaporwave purple or teal
+    this->setCornerRadius(4);
+    this->setFocusable(true);
+
+    auto* leftBox = new brls::Box();
+    leftBox->setAxis(brls::Axis::ROW);
+    leftBox->setAlignItems(brls::AlignItems::CENTER);
+
+    arrowLabel = new brls::Label();
+    arrowLabel->setFontSize(12);
+    arrowLabel->setMarginRight(8);
+    leftBox->addView(arrowLabel);
+
+    titleLabel = new brls::Label();
+    titleLabel->setFontSize(16);
+    leftBox->addView(titleLabel);
+
+    this->addView(leftBox);
+
+    countLabel = new brls::Label();
+    countLabel->setFontSize(14);
+    countLabel->setTextColor(nvgRGBA(255, 255, 255, 180));
+    this->addView(countLabel);
+
+    this->addGestureRecognizer(new brls::TapGestureRecognizer(this));
+}
+
+ExtensionSectionHeader* ExtensionSectionHeader::create() {
+    return new ExtensionSectionHeader();
+}
+
+// ============================================================================
+// ExtensionsDataSource Implementation
+// ============================================================================
+
+ExtensionsDataSource::ExtensionsDataSource(ExtensionsTab* tab) : m_tab(tab) {
+    rebuildRows();
+}
+
+int ExtensionsDataSource::numberOfSections(brls::RecyclerFrame* recycler) {
+    return 1;
+}
+
+int ExtensionsDataSource::numberOfRows(brls::RecyclerFrame* recycler, int section) {
+    return static_cast<int>(m_rows.size());
+}
+
+float ExtensionsDataSource::heightForRow(brls::RecyclerFrame* recycler, brls::IndexPath index) {
+    if (index.row >= static_cast<int>(m_rows.size())) return 50;
+
+    const auto& row = m_rows[index.row];
+    switch (row.type) {
+        case ExtensionRow::Type::SearchHeader:
+            return 48;
+        case ExtensionRow::Type::SectionHeader:
+            return 48;
+        case ExtensionRow::Type::LanguageHeader:
+            return 40;
+        case ExtensionRow::Type::ExtensionItem:
+            return 56;
+    }
+    return 50;
+}
+
+brls::RecyclerCell* ExtensionsDataSource::cellForRow(brls::RecyclerFrame* recycler, brls::IndexPath index) {
+    if (index.row >= static_cast<int>(m_rows.size())) return nullptr;
+
+    const auto& row = m_rows[index.row];
+
+    switch (row.type) {
+        case ExtensionRow::Type::SearchHeader: {
+            // "Clear Search" header for search results
+            auto* header = dynamic_cast<ExtensionSectionHeader*>(
+                recycler->dequeueReusableCell("Header"));
+            if (!header) {
+                header = ExtensionSectionHeader::create();
+                header->reuseIdentifier = "Header";
+            }
+
+            header->expanded = false;
+            header->arrowLabel->setText("✕");  // X symbol for clear
+            header->titleLabel->setText("Clear Search");
+            header->countLabel->setText("(" + std::to_string(row.count) + " results)");
+            header->setBackgroundColor(nvgRGB(120, 60, 60));  // Red-ish color
+            header->setMarginTop(0);
+            header->setMarginLeft(0);
+
+            return header;
+        }
+
+        case ExtensionRow::Type::SectionHeader:
+        case ExtensionRow::Type::LanguageHeader: {
+            auto* header = dynamic_cast<ExtensionSectionHeader*>(
+                recycler->dequeueReusableCell("Header"));
+            if (!header) {
+                header = ExtensionSectionHeader::create();
+                header->reuseIdentifier = "Header";
+            }
+
+            header->expanded = row.expanded;
+            header->arrowLabel->setText(row.expanded ? "▼" : "▶");
+            header->countLabel->setText("(" + std::to_string(row.count) + ")");
+
+            if (row.type == ExtensionRow::Type::SectionHeader) {
+                // Main section header (teal)
+                if (row.sectionId == "updates") {
+                    header->titleLabel->setText("Updates Available");
+                } else if (row.sectionId == "installed") {
+                    header->titleLabel->setText("Installed");
+                } else {
+                    header->titleLabel->setText("Available to Install");
+                }
+                header->setBackgroundColor(Application::getInstance().getSectionHeaderBg());
+                header->setMarginTop(8);
+                header->setMarginLeft(0);
+            } else {
+                // Language header (dark gray, indented)
+                header->titleLabel->setText(m_tab->getLanguageDisplayName(row.languageCode));
+                header->setBackgroundColor(Application::getInstance().getCardBackground());
+                header->setMarginTop(4);
+                header->setMarginLeft(15);
+            }
+
+            return header;
+        }
+
+        case ExtensionRow::Type::ExtensionItem: {
+            auto* cell = dynamic_cast<ExtensionCell*>(
+                recycler->dequeueReusableCell("Extension"));
+            if (!cell) {
+                cell = ExtensionCell::create();
+                cell->reuseIdentifier = "Extension";
+            }
+
+            const auto& ext = row.extension;
+            cell->pkgName = ext.pkgName;
+            cell->rowIndex = index.row;
+
+            // Set static pointers for settings button navigation
+            ExtensionCell::s_recycler = recycler;
+            ExtensionCell::s_dataSource = this;
+
+            cell->nameLabel->setText(ext.name);
+
+            // Detail text
+            std::string detailText = "v" + ext.versionName;
+            if (!ext.installed) {
+                detailText = m_tab->getLanguageDisplayName(ext.lang) + " • " + detailText;
+            }
+            if (ext.isNsfw) {
+                detailText += " • 18+";
+            }
+            cell->detailLabel->setText(detailText);
+
+            // Status and color
+            if (ext.installed) {
+                if (ext.hasUpdate) {
+                    cell->statusLabel->setText("Update");
+                    cell->statusLabel->setTextColor(nvgRGB(255, 152, 0));
+                } else {
+                    cell->statusLabel->setText("Installed");
+                    cell->statusLabel->setTextColor(Application::getInstance().getDimTextColor());
+                }
+            } else {
+                cell->statusLabel->setText("Install");
+                cell->statusLabel->setTextColor(Application::getInstance().getTealColor());
+            }
+
+            // Settings button visibility
+            if (ext.installed && ext.hasConfigurableSources) {
+                cell->settingsBtn->setVisibility(brls::Visibility::VISIBLE);
+                // Set up click handler for settings
+                cell->settingsBtn->registerClickAction([this, ext](brls::View*) {
+                    brls::sync([this, ext]() {
+                        m_tab->onSettingsClicked(ext);
+                    });
+                    return true;
+                });
+            } else {
+                cell->settingsBtn->setVisibility(brls::Visibility::GONE);
+            }
+
+            // Indent for uninstalled items
+            cell->setMarginLeft(ext.installed ? 0 : 20);
+
+            // Load icon
+            if (!ext.iconUrl.empty() && !cell->iconLoaded) {
+                std::string fullUrl = Application::getInstance().getServerUrl() + ext.iconUrl;
+                cell->iconLoaded = true;
+                ImageLoader::loadAsync(fullUrl, [](brls::Image* img) {}, cell->icon, m_tab->getAlive());
+            }
+
+            return cell;
+        }
+    }
+
+    return nullptr;
+}
+
+void ExtensionsDataSource::didSelectRowAt(brls::RecyclerFrame* recycler, brls::IndexPath indexPath) {
+    if (indexPath.row >= static_cast<int>(m_rows.size())) return;
+
+    const auto& row = m_rows[indexPath.row];
+
+    switch (row.type) {
+        case ExtensionRow::Type::SearchHeader:
+            brls::sync([this, aliveWeak = std::weak_ptr<bool>(m_tab->getAlive())]() {
+                auto a = aliveWeak.lock(); if (!a || !*a) return;
+                m_tab->onSearchHeaderClicked();
+            });
+            break;
+
+        case ExtensionRow::Type::SectionHeader:
+            brls::sync([this, row]() {
+                m_tab->onSectionHeaderClicked(row.sectionId);
+            });
+            break;
+
+        case ExtensionRow::Type::LanguageHeader:
+            brls::sync([this, row]() {
+                m_tab->onLanguageHeaderClicked(row.languageCode);
+            });
+            break;
+
+        case ExtensionRow::Type::ExtensionItem:
+            brls::sync([this, row]() {
+                m_tab->onExtensionClicked(row.extension);
+            });
+            break;
+    }
+}
+
+void ExtensionsDataSource::rebuildRows() {
+    m_rows.clear();
+
+    const auto& updates = m_tab->getUpdates();
+    const auto& installed = m_tab->getInstalled();
+    const auto& grouped = m_tab->getGroupedByLanguage();
+    const auto& sortedLangs = m_tab->getSortedLanguages();
+
+    // Check if search is active
+    if (m_tab->isSearchActive()) {
+        const std::string& query = m_tab->getSearchQuery();
+
+        // Helper lambda to check if extension matches search query
+        auto matchesSearch = [&query](const Extension& ext) {
+            std::string nameLower = ext.name;
+            std::transform(nameLower.begin(), nameLower.end(), nameLower.begin(), ::tolower);
+            return nameLower.find(query) != std::string::npos;
+        };
+
+        // Collect all matching extensions from all categories
+        std::vector<Extension> results;
+
+        for (const auto& ext : updates) {
+            if (matchesSearch(ext)) {
+                results.push_back(ext);
+            }
+        }
+        for (const auto& ext : installed) {
+            if (matchesSearch(ext)) {
+                results.push_back(ext);
+            }
+        }
+        for (const auto& pair : grouped) {
+            for (const auto& ext : pair.second) {
+                if (matchesSearch(ext)) {
+                    results.push_back(ext);
+                }
+            }
+        }
+
+        // Sort results by name
+        std::sort(results.begin(), results.end(),
+            [](const Extension& a, const Extension& b) { return a.name < b.name; });
+
+        // Add "Clear Search" header at the top
+        ExtensionRow searchHeader;
+        searchHeader.type = ExtensionRow::Type::SearchHeader;
+        searchHeader.count = static_cast<int>(results.size());
+        m_rows.push_back(searchHeader);
+
+        // Add all results as a flat list
+        for (const auto& ext : results) {
+            ExtensionRow item;
+            item.type = ExtensionRow::Type::ExtensionItem;
+            item.extension = ext;
+            m_rows.push_back(item);
+        }
+
+        brls::Logger::debug("ExtensionsDataSource: Search found {} results", results.size());
+        return;
+    }
+
+    // Normal view (not searching)
+
+    // Updates section
+    if (!updates.empty()) {
+        ExtensionRow header;
+        header.type = ExtensionRow::Type::SectionHeader;
+        header.sectionId = "updates";
+        header.count = static_cast<int>(updates.size());
+        header.expanded = m_tab->isUpdatesExpanded();
+        m_rows.push_back(header);
+
+        if (m_tab->isUpdatesExpanded()) {
+            for (const auto& ext : updates) {
+                ExtensionRow item;
+                item.type = ExtensionRow::Type::ExtensionItem;
+                item.extension = ext;
+                m_rows.push_back(item);
+            }
+        }
+    }
+
+    // Installed section
+    if (!installed.empty()) {
+        ExtensionRow header;
+        header.type = ExtensionRow::Type::SectionHeader;
+        header.sectionId = "installed";
+        header.count = static_cast<int>(installed.size());
+        header.expanded = m_tab->isInstalledExpanded();
+        m_rows.push_back(header);
+
+        if (m_tab->isInstalledExpanded()) {
+            for (const auto& ext : installed) {
+                ExtensionRow item;
+                item.type = ExtensionRow::Type::ExtensionItem;
+                item.extension = ext;
+                m_rows.push_back(item);
+            }
+        }
+    }
+
+    // Available section with language groups
+    int totalAvailable = 0;
+    for (const auto& pair : grouped) {
+        totalAvailable += static_cast<int>(pair.second.size());
+    }
+
+    if (totalAvailable > 0) {
+        ExtensionRow header;
+        header.type = ExtensionRow::Type::SectionHeader;
+        header.sectionId = "available";
+        header.count = totalAvailable;
+        header.expanded = m_tab->isAvailableExpanded();
+        m_rows.push_back(header);
+
+        if (m_tab->isAvailableExpanded()) {
+            for (const auto& lang : sortedLangs) {
+                auto it = grouped.find(lang);
+                if (it == grouped.end() || it->second.empty()) continue;
+
+                ExtensionRow langHeader;
+                langHeader.type = ExtensionRow::Type::LanguageHeader;
+                langHeader.languageCode = lang;
+                langHeader.count = static_cast<int>(it->second.size());
+                langHeader.expanded = m_tab->isLanguageExpanded(lang);
+                m_rows.push_back(langHeader);
+
+                if (m_tab->isLanguageExpanded(lang)) {
+                    for (const auto& ext : it->second) {
+                        ExtensionRow item;
+                        item.type = ExtensionRow::Type::ExtensionItem;
+                        item.extension = ext;
+                        m_rows.push_back(item);
+                    }
+                }
+            }
+        }
+    }
+
+    brls::Logger::debug("ExtensionsDataSource: Rebuilt with {} rows", m_rows.size());
+}
+
+bool ExtensionsDataSource::rowHasSettingsButton(int row) const {
+    if (row < 0 || row >= static_cast<int>(m_rows.size())) {
+        return false;
+    }
+
+    const auto& rowData = m_rows[row];
+    if (rowData.type != ExtensionRow::Type::ExtensionItem) {
+        return false;
+    }
+
+    // Extension has settings button if installed and has configurable sources
+    return rowData.extension.installed && rowData.extension.hasConfigurableSources;
+}
+
+int ExtensionsDataSource::findNextSettingsRow(int currentRow, bool searchDown) const {
+    if (m_rows.empty()) {
+        return -1;
+    }
+
+    int step = searchDown ? 1 : -1;
+    int row = currentRow + step;
+
+    // Search in the specified direction
+    while (row >= 0 && row < static_cast<int>(m_rows.size())) {
+        if (rowHasSettingsButton(row)) {
+            return row;
+        }
+        row += step;
+    }
+
+    // Not found
+    return -1;
+}
+
+// ============================================================================
+// ExtensionsTab Implementation
+// ============================================================================
+
+// Language code to display name mapping
+std::string ExtensionsTab::getLanguageDisplayName(const std::string& langCode) {
+    static const std::map<std::string, std::string> languageNames = {
+        {"all", "All Languages"},
+        {"en", "English"},
+        {"ja", "Japanese"},
+        {"ko", "Korean"},
+        {"zh", "Chinese"},
+        {"zh-Hans", "Chinese (Simplified)"},
+        {"zh-Hant", "Chinese (Traditional)"},
+        {"es", "Spanish"},
+        {"es-419", "Spanish (Latin America)"},
+        {"pt", "Portuguese"},
+        {"pt-BR", "Portuguese (Brazil)"},
+        {"fr", "French"},
+        {"de", "German"},
+        {"it", "Italian"},
+        {"ru", "Russian"},
+        {"ar", "Arabic"},
+        {"id", "Indonesian"},
+        {"th", "Thai"},
+        {"vi", "Vietnamese"},
+        {"pl", "Polish"},
+        {"tr", "Turkish"},
+        {"nl", "Dutch"},
+        {"uk", "Ukrainian"},
+        {"cs", "Czech"},
+        {"ro", "Romanian"},
+        {"bg", "Bulgarian"},
+        {"hu", "Hungarian"},
+        {"el", "Greek"},
+        {"he", "Hebrew"},
+        {"fa", "Persian"},
+        {"hi", "Hindi"},
+        {"bn", "Bengali"},
+        {"ms", "Malay"},
+        {"fil", "Filipino"},
+        {"my", "Burmese"},
+        {"localsourcelang", "Local Source"},
+        {"other", "Other"},
+        {"multi", "Multi-language"}
+    };
+
+    auto it = languageNames.find(langCode);
+    if (it != languageNames.end()) {
+        return it->second;
+    }
+
+    if (!langCode.empty()) {
+        std::string result = langCode;
+        result[0] = std::toupper(result[0]);
+        return result;
+    }
+
+    return "Unknown";
+}
+
+bool ExtensionsTab::isLanguageExpanded(const std::string& lang) const {
+    auto it = m_languageExpanded.find(lang);
+    return it != m_languageExpanded.end() && it->second;
+}
+
+ExtensionsTab::ExtensionsTab() {
+    m_alive = std::make_shared<bool>(true);
+
+    this->setAxis(brls::Axis::COLUMN);
+    this->setPadding(20, 30, 20, 30);
+
+    // Header
+    auto* headerBox = new brls::Box();
+    headerBox->setAxis(brls::Axis::ROW);
+    headerBox->setJustifyContent(brls::JustifyContent::SPACE_BETWEEN);
+    headerBox->setAlignItems(brls::AlignItems::CENTER);
+    headerBox->setMarginBottom(15);
+
+    m_titleLabel = new brls::Label();
+    m_titleLabel->setText("Extensions");
+    m_titleLabel->setFontSize(24);
+    m_titleLabel->setGrow(1.0f);
+    headerBox->addView(m_titleLabel);
+
+    // Buttons
+    auto* buttonBox = new brls::Box();
+    buttonBox->setAxis(brls::Axis::ROW);
+    buttonBox->setAlignItems(brls::AlignItems::FLEX_END);
+
+    // Add Repository button (Select button)
+    auto* repoContainer = new brls::Box();
+    repoContainer->setAxis(brls::Axis::COLUMN);
+    repoContainer->setAlignItems(brls::AlignItems::CENTER);
+    repoContainer->setMarginRight(10);
+
+    auto* selectButtonIcon = new brls::Image();
+    selectButtonIcon->setWidth(64);
+    selectButtonIcon->setHeight(16);
+    selectButtonIcon->setScalingType(brls::ImageScalingType::FIT);
+    setButtonIcon(selectButtonIcon, BUTTON_IMG("select_button.png"));
+    selectButtonIcon->setMarginBottom(2);
+    repoContainer->addView(selectButtonIcon);
+
+    auto* repoBox = new brls::Box();
+    repoBox->setFocusable(true);
+    repoBox->setPadding(8, 8, 8, 8);
+    repoBox->setCornerRadius(4);
+    repoBox->setBackgroundColor(Application::getInstance().getCardBackground());
+    auto* repoIcon = new brls::Image();
+    repoIcon->setSize(brls::Size(24, 24));
+    repoIcon->setImageFromFile(RESOURCE_PREFIX "icons/import.png");
+    repoBox->addView(repoIcon);
+    repoBox->registerClickAction([this](brls::View*) {
+        brls::sync([this, aliveWeak = std::weak_ptr<bool>(m_alive)]() { auto a = aliveWeak.lock(); if (!a || !*a) return; showAddRepoDialog(); });
+        return true;
+    });
+    repoBox->addGestureRecognizer(new brls::TapGestureRecognizer(repoBox));
+    repoContainer->addView(repoBox);
+    buttonBox->addView(repoContainer);
+
+    // Search button
+    auto* searchContainer = new brls::Box();
+    searchContainer->setAxis(brls::Axis::COLUMN);
+    searchContainer->setAlignItems(brls::AlignItems::CENTER);
+    searchContainer->setMarginRight(10);
+
+    auto* startButtonIcon = new brls::Image();
+    startButtonIcon->setWidth(64);
+    startButtonIcon->setHeight(16);
+    startButtonIcon->setScalingType(brls::ImageScalingType::FIT);
+    setButtonIcon(startButtonIcon, BUTTON_IMG("start_button.png"));
+    startButtonIcon->setMarginBottom(2);
+    searchContainer->addView(startButtonIcon);
+
+    auto* searchBox = new brls::Box();
+    searchBox->setFocusable(true);
+    searchBox->setPadding(8, 8, 8, 8);
+    searchBox->setCornerRadius(4);
+    searchBox->setBackgroundColor(Application::getInstance().getCardBackground());
+    m_searchIcon = new brls::Image();
+    m_searchIcon->setSize(brls::Size(24, 24));
+    m_searchIcon->setImageFromFile(RESOURCE_PREFIX "icons/search.png");
+    searchBox->addView(m_searchIcon);
+    searchBox->registerClickAction([this](brls::View*) {
+        brls::sync([this, aliveWeak = std::weak_ptr<bool>(m_alive)]() { auto a = aliveWeak.lock(); if (!a || !*a) return; showSearchDialog(); });
+        return true;
+    });
+    searchBox->addGestureRecognizer(new brls::TapGestureRecognizer(searchBox));
+    searchContainer->addView(searchBox);
+    buttonBox->addView(searchContainer);
+
+    // Refresh button
+    auto* refreshContainer = new brls::Box();
+    refreshContainer->setAxis(brls::Axis::COLUMN);
+    refreshContainer->setAlignItems(brls::AlignItems::CENTER);
+
+    auto* triangleButtonIcon = new brls::Image();
+    triangleButtonIcon->setWidth(16);
+    triangleButtonIcon->setHeight(16);
+    triangleButtonIcon->setScalingType(brls::ImageScalingType::FIT);
+    setButtonIcon(triangleButtonIcon, BUTTON_IMG(BUTTON_Y_ICON));
+    triangleButtonIcon->setMarginBottom(2);
+    refreshContainer->addView(triangleButtonIcon);
+
+    m_refreshBox = new brls::Box();
+    m_refreshBox->setFocusable(true);
+    m_refreshBox->setPadding(8, 8, 8, 8);
+    m_refreshBox->setCornerRadius(4);
+    m_refreshBox->setBackgroundColor(Application::getInstance().getCardBackground());
+    m_refreshIcon = new brls::Image();
+    m_refreshIcon->setSize(brls::Size(24, 24));
+    m_refreshIcon->setImageFromFile(RESOURCE_PREFIX "icons/refresh.png");
+    m_refreshBox->addView(m_refreshIcon);
+    m_refreshBox->registerClickAction([this](brls::View*) {
+        brls::sync([this, aliveWeak = std::weak_ptr<bool>(m_alive)]() { auto a = aliveWeak.lock(); if (!a || !*a) return; refreshExtensions(); });
+        return true;
+    });
+    m_refreshBox->addGestureRecognizer(new brls::TapGestureRecognizer(m_refreshBox));
+    refreshContainer->addView(m_refreshBox);
+    buttonBox->addView(refreshContainer);
+
+    headerBox->addView(buttonBox);
+    this->addView(headerBox);
+
+    // Register hotkeys
+    this->registerAction("Search", brls::ControllerButton::BUTTON_START, [this](brls::View*) {
+        brls::sync([this, aliveWeak = std::weak_ptr<bool>(m_alive)]() { auto a = aliveWeak.lock(); if (!a || !*a) return; showSearchDialog(); });
+        return true;
+    });
+
+    this->registerAction("Refresh", brls::ControllerButton::BUTTON_Y, [this](brls::View*) {
+        brls::sync([this, aliveWeak = std::weak_ptr<bool>(m_alive)]() { auto a = aliveWeak.lock(); if (!a || !*a) return; refreshExtensions(); });
+        return true;
+    });
+
+    this->registerAction("Add Repo", brls::ControllerButton::BUTTON_BACK, [this](brls::View*) {
+        brls::sync([this, aliveWeak = std::weak_ptr<bool>(m_alive)]() { auto a = aliveWeak.lock(); if (!a || !*a) return; showAddRepoDialog(); });
+        return true;
+    });
+
+    // Circle button (B) - exit search if active, otherwise default behavior
+    this->registerAction("Back", brls::ControllerButton::BUTTON_B, [this](brls::View*) {
+        if (m_isSearchActive) {
+            brls::sync([this, aliveWeak = std::weak_ptr<bool>(m_alive)]() { auto a = aliveWeak.lock(); if (!a || !*a) return; hideSearchResults(); });
+            return true;  // Consume the event
+        }
+        return false;  // Let default behavior handle it (go back)
+    });
+
+    // RecyclerFrame for main list
+    m_recycler = new brls::RecyclerFrame();
+    m_recycler->setGrow(1.0f);
+    m_recycler->estimatedRowHeight = 50;
+    m_recycler->registerCell("Extension", []() { return ExtensionCell::create(); });
+    m_recycler->registerCell("Header", []() { return ExtensionSectionHeader::create(); });
+
+    // Register circle button on recycler to exit search (since focus is on recycler items)
+    m_recycler->registerAction("Back", brls::ControllerButton::BUTTON_B, [this](brls::View*) {
+        if (m_isSearchActive) {
+            brls::sync([this, aliveWeak = std::weak_ptr<bool>(m_alive)]() { auto a = aliveWeak.lock(); if (!a || !*a) return; hideSearchResults(); });
+            return true;  // Consume the event
+        }
+        return false;  // Let default behavior handle it (go back)
+    }, true);  // Hidden action (don't show in hints)
+
+    // Inline error/offline label (hidden by default)
+    m_errorLabel = new brls::Label();
+    m_errorLabel->setFontSize(16);
+    m_errorLabel->setTextColor(Application::getInstance().getSubtitleColor());
+    m_errorLabel->setMarginTop(40);
+    m_errorLabel->setMarginLeft(20);
+    m_errorLabel->setVisibility(brls::Visibility::GONE);
+    this->addView(m_errorLabel);
+
+    this->addView(m_recycler);
+
+    // Load extensions
+    loadExtensionsFast();
+}
+
+ExtensionsTab::~ExtensionsTab() {
+    if (m_alive) *m_alive = false;
+}
+
+void ExtensionsTab::willDisappear(bool resetState) {
+    brls::Box::willDisappear(resetState);
+
+    // Invalidate alive flag BEFORE destruction so pending async callbacks bail out
+    if (m_alive) *m_alive = false;
+
+    // Cancel pending image loads to free up worker threads and network bandwidth
+    ImageLoader::cancelAll();
+}
+
+void ExtensionsTab::onFocusGained() {
+    brls::Box::onFocusGained();
+
+    if (m_needsRefresh) {
+        m_needsRefresh = false;
+        brls::Logger::debug("ExtensionsTab: Refreshing UI after extension operation");
+        refreshUIFromCache();
+    }
+}
+
+void ExtensionsTab::loadExtensionsFast() {
+    brls::Logger::debug("Loading extensions list (fast mode)...");
+
+    // Show offline message if not connected and no cached data
+    if (!Application::getInstance().isConnected() && !m_cacheLoaded) {
+        showError("App is offline - connect to a server to manage extensions");
+        return;
+    }
+
+    showLoading("Loading extensions...");
+
+    // Capture cache state by value for safe background thread access
+    bool cacheLoaded = m_cacheLoaded;
+    std::vector<Extension> cachedCopy = m_cachedExtensions;
+
+    brls::async([this, aliveWeak = std::weak_ptr<bool>(m_alive), cacheLoaded, cachedCopy]() {
+        SuwayomiClient& client = SuwayomiClient::getInstance();
+        const AppSettings& settings = Application::getInstance().getSettings();
+
+        // Work entirely with local variables on the background thread
+        std::vector<Extension> allExtensions;
+        if (cacheLoaded && !cachedCopy.empty()) {
+            allExtensions = cachedCopy;
+            brls::Logger::debug("Using cached extensions ({} total)", allExtensions.size());
+        } else {
+            bool success = client.fetchExtensionList(allExtensions);
+            if (!success) {
+                Application::getInstance().setConnected(false);
+                brls::sync([this, aliveWeak]() {
+                    auto alive = aliveWeak.lock();
+                    if (!alive || !*alive) return;
+                    showError("App is offline - connect to a server to manage extensions");
+                });
+                return;
+            }
+            brls::Logger::debug("Fetched {} extensions", allExtensions.size());
+        }
+
+        std::set<std::string> filterLanguages = settings.enabledSourceLanguages;
+        if (filterLanguages.empty()) {
+            filterLanguages.insert("en");
+        }
+
+        // Use local vectors, not member variables
+        std::vector<Extension> updates;
+        std::vector<Extension> installed;
+        std::vector<Extension> uninstalled;
+
+        for (const auto& ext : allExtensions) {
+            if (ext.installed) {
+                if (ext.hasUpdate) {
+                    updates.push_back(ext);
+                } else {
+                    installed.push_back(ext);
+                }
+            } else {
+                bool languageMatch = false;
+                if (filterLanguages.count(ext.lang) > 0) {
+                    languageMatch = true;
+                } else {
+                    std::string baseLang = ext.lang;
+                    size_t dashPos = baseLang.find('-');
+                    if (dashPos != std::string::npos) {
+                        baseLang = baseLang.substr(0, dashPos);
+                    }
+                    if (filterLanguages.count(baseLang) > 0) {
+                        languageMatch = true;
+                    }
+                }
+                if (ext.lang == "multi" || ext.lang == "all") {
+                    languageMatch = true;
+                }
+                if (languageMatch) {
+                    uninstalled.push_back(ext);
+                }
+            }
+        }
+
+        // Sort lists alphabetically
+        auto sortByName = [](const Extension& a, const Extension& b) {
+            return a.name < b.name;
+        };
+        std::sort(updates.begin(), updates.end(), sortByName);
+        std::sort(installed.begin(), installed.end(), sortByName);
+        std::sort(uninstalled.begin(), uninstalled.end(), sortByName);
+
+        // Group uninstalled by language
+        auto grouped = groupExtensionsByLanguage(uninstalled);
+        auto sortedLangs = getSortedLanguageKeys(grouped);
+
+        brls::Logger::debug("Fast mode: {} updates, {} installed, {} uninstalled",
+            updates.size(), installed.size(), uninstalled.size());
+
+        // Transfer all results to member variables on UI thread only
+        brls::sync([this, aliveWeak, allExtensions = std::move(allExtensions),
+                    updates = std::move(updates), installed = std::move(installed),
+                    uninstalled = std::move(uninstalled), grouped = std::move(grouped),
+                    sortedLangs = std::move(sortedLangs), cacheLoaded]() {
+            auto alive = aliveWeak.lock();
+            if (!alive || !*alive) return;
+            m_cachedExtensions = std::move(allExtensions);
+            m_cacheLoaded = true;
+            m_updates = std::move(updates);
+            m_installed = std::move(installed);
+            m_uninstalled = std::move(uninstalled);
+            m_cachedGrouped = std::move(grouped);
+            m_cachedSortedLanguages = std::move(sortedLangs);
+            reloadRecycler();
+        });
+    });
+}
+
+void ExtensionsTab::refreshExtensions() {
+    brls::Logger::info("Refreshing extensions from server...");
+
+    m_cachedExtensions.clear();
+    m_cacheLoaded = false;
+
+    brls::Application::notify("Refreshing extensions...");
+    loadExtensionsFast();
+}
+
+void ExtensionsTab::refreshUIFromCache() {
+    if (!m_cacheLoaded) {
+        loadExtensionsFast();
+        return;
+    }
+
+    const AppSettings& settings = Application::getInstance().getSettings();
+    std::set<std::string> filterLanguages = settings.enabledSourceLanguages;
+    if (filterLanguages.empty()) {
+        filterLanguages.insert("en");
+    }
+
+    m_updates.clear();
+    m_installed.clear();
+    m_uninstalled.clear();
+
+    for (const auto& ext : m_cachedExtensions) {
+        if (ext.installed) {
+            if (ext.hasUpdate) {
+                m_updates.push_back(ext);
+            } else {
+                m_installed.push_back(ext);
+            }
+        } else {
+            bool languageMatch = false;
+            if (filterLanguages.count(ext.lang) > 0) {
+                languageMatch = true;
+            } else {
+                std::string baseLang = ext.lang;
+                size_t dashPos = baseLang.find('-');
+                if (dashPos != std::string::npos) {
+                    baseLang = baseLang.substr(0, dashPos);
+                }
+                if (filterLanguages.count(baseLang) > 0) {
+                    languageMatch = true;
+                }
+            }
+            if (ext.lang == "multi" || ext.lang == "all") {
+                languageMatch = true;
+            }
+            if (languageMatch) {
+                m_uninstalled.push_back(ext);
+            }
+        }
+    }
+
+    auto sortByName = [](const Extension& a, const Extension& b) {
+        return a.name < b.name;
+    };
+    std::sort(m_updates.begin(), m_updates.end(), sortByName);
+    std::sort(m_installed.begin(), m_installed.end(), sortByName);
+    std::sort(m_uninstalled.begin(), m_uninstalled.end(), sortByName);
+
+    m_cachedGrouped = groupExtensionsByLanguage(m_uninstalled);
+    m_cachedSortedLanguages = getSortedLanguageKeys(m_cachedGrouped);
+
+    reloadRecycler();
+}
+
+void ExtensionsTab::reloadRecycler() {
+    // Hide error label and show recycler when data loads successfully
+    if (m_errorLabel) m_errorLabel->setVisibility(brls::Visibility::GONE);
+    if (m_recycler) m_recycler->setVisibility(brls::Visibility::VISIBLE);
+
+    if (!m_dataSource) {
+        m_dataSource = new ExtensionsDataSource(this);
+        m_recycler->setDataSource(m_dataSource);
+    } else {
+        m_dataSource->rebuildRows();
+        m_recycler->reloadData();
+    }
+}
+
+int ExtensionsTab::getFocusedRowIndex() const {
+    // Get the currently focused view
+    brls::View* focused = brls::Application::getCurrentFocus();
+    if (!focused) return -1;
+
+    // Walk up to find if it's inside our recycler
+    brls::View* current = focused;
+    while (current) {
+        // Check if this is a RecyclerCell in our recycler
+        auto* cell = dynamic_cast<brls::RecyclerCell*>(current);
+        if (cell) {
+            // Get the index from parent user data
+            void* userData = cell->getParentUserData();
+            if (userData) {
+                return static_cast<int>(*reinterpret_cast<size_t*>(userData));
+            }
+        }
+        current = current->getParent();
+    }
+    return -1;
+}
+
+void ExtensionsTab::restoreFocusToRow(int rowIndex) {
+    if (rowIndex < 0) return;
+
+    // Use selectRowAt to scroll to and focus the row
+    // The row index in our flat list corresponds to section 0
+    brls::IndexPath indexPath(0, rowIndex);
+    m_recycler->selectRowAt(indexPath, false);
+}
+
+void ExtensionsTab::showLoading(const std::string& message) {
+    brls::Logger::debug("Loading: {}", message);
+    if (m_errorLabel) {
+        m_errorLabel->setText(message);
+        m_errorLabel->setTextColor(Application::getInstance().getAccentColor());
+        m_errorLabel->setVisibility(brls::Visibility::VISIBLE);
+    }
+}
+
+void ExtensionsTab::showError(const std::string& message) {
+    if (m_errorLabel) {
+        m_errorLabel->setText(message);
+        m_errorLabel->setTextColor(Application::getInstance().getSubtitleColor());
+        m_errorLabel->setVisibility(brls::Visibility::VISIBLE);
+    }
+    if (m_recycler) {
+        m_recycler->setVisibility(brls::Visibility::GONE);
+    }
+}
+
+std::map<std::string, std::vector<Extension>> ExtensionsTab::groupExtensionsByLanguage(
+    const std::vector<Extension>& extensions) {
+    std::map<std::string, std::vector<Extension>> grouped;
+    for (const auto& ext : extensions) {
+        grouped[ext.lang].push_back(ext);
+    }
+    // Sort each group alphabetically
+    for (auto& pair : grouped) {
+        std::sort(pair.second.begin(), pair.second.end(),
+            [](const Extension& a, const Extension& b) { return a.name < b.name; });
+    }
+    return grouped;
+}
+
+std::vector<std::string> ExtensionsTab::getSortedLanguageKeys(
+    const std::map<std::string, std::vector<Extension>>& grouped) {
+    std::vector<std::string> keys;
+    for (const auto& pair : grouped) {
+        keys.push_back(pair.first);
+    }
+    // Sort by display name
+    std::sort(keys.begin(), keys.end(), [this](const std::string& a, const std::string& b) {
+        return getLanguageDisplayName(a) < getLanguageDisplayName(b);
+    });
+    return keys;
+}
+
+// ============================================================================
+// Click Handlers
+// ============================================================================
+
+void ExtensionsTab::onSectionHeaderClicked(const std::string& sectionId) {
+    // Save the focused row index before making changes
+    int focusedRow = getFocusedRowIndex();
+
+    if (sectionId == "updates") {
+        m_updatesExpanded = !m_updatesExpanded;
+    } else if (sectionId == "installed") {
+        m_installedExpanded = !m_installedExpanded;
+    } else if (sectionId == "available") {
+        m_availableExpanded = !m_availableExpanded;
+    }
+
+    reloadRecycler();
+
+    // Restore focus to the same row (the header that was clicked)
+    // The header itself should still be at approximately the same index
+    restoreFocusToRow(focusedRow);
+}
+
+void ExtensionsTab::onLanguageHeaderClicked(const std::string& langCode) {
+    // Save the focused row index before making changes
+    int focusedRow = getFocusedRowIndex();
+
+    m_languageExpanded[langCode] = !isLanguageExpanded(langCode);
+
+    reloadRecycler();
+
+    // Restore focus to the same row (the header that was clicked)
+    restoreFocusToRow(focusedRow);
+}
+
+void ExtensionsTab::onExtensionClicked(const Extension& ext) {
+    if (ext.installed) {
+        if (ext.hasUpdate) {
+            updateExtension(ext);
+        } else {
+            uninstallExtension(ext);
+        }
+    } else {
+        installExtension(ext);
+    }
+}
+
+void ExtensionsTab::onSettingsClicked(const Extension& ext) {
+    showSourceSettings(ext);
+}
+
+void ExtensionsTab::onSearchHeaderClicked() {
+    hideSearchResults();
+}
+
+// ============================================================================
+// Extension Operations
+// ============================================================================
+
+void ExtensionsTab::installExtension(const Extension& ext) {
+    brls::Logger::info("Installing extension: {}", ext.name);
+    brls::Application::notify("Installing " + ext.name + "...");
+
+    brls::async([this, ext, aliveWeak = std::weak_ptr<bool>(m_alive)]() {
+        SuwayomiClient& client = SuwayomiClient::getInstance();
+
+        bool success = false;
+        int maxRetries = 3;
+        for (int attempt = 1; attempt <= maxRetries && !success; attempt++) {
+            brls::Logger::info("Installing extension {} (attempt {}/{})", ext.pkgName, attempt, maxRetries);
+            success = client.installExtension(ext.pkgName);
+            if (!success && attempt < maxRetries) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(500));
+            }
+        }
+
+        if (success) {
+            brls::sync([this, ext, aliveWeak]() {
+                auto alive = aliveWeak.lock();
+                if (!alive || !*alive) return;
+                // Update cache on UI thread only
+                for (auto& cachedExt : m_cachedExtensions) {
+                    if (cachedExt.pkgName == ext.pkgName) {
+                        cachedExt.installed = true;
+                        cachedExt.hasUpdate = false;
+                        break;
+                    }
+                }
+                brls::Application::notify(ext.name + " installed");
+                refreshUIFromCache();
+            });
+        } else {
+            brls::sync([this, ext, aliveWeak]() {
+                auto alive = aliveWeak.lock();
+                if (!alive || !*alive) return;
+                brls::Application::notify("Failed to install " + ext.name);
+            });
+        }
+    });
+}
+
+void ExtensionsTab::updateExtension(const Extension& ext) {
+    brls::Logger::info("Updating extension: {}", ext.name);
+    brls::Application::notify("Updating " + ext.name + "...");
+
+    brls::async([this, ext, aliveWeak = std::weak_ptr<bool>(m_alive)]() {
+        SuwayomiClient& client = SuwayomiClient::getInstance();
+
+        bool success = false;
+        int maxRetries = 3;
+        for (int attempt = 1; attempt <= maxRetries && !success; attempt++) {
+            brls::Logger::info("Updating extension {} (attempt {}/{})", ext.pkgName, attempt, maxRetries);
+            success = client.updateExtension(ext.pkgName);
+            if (!success && attempt < maxRetries) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(500));
+            }
+        }
+
+        if (success) {
+            brls::sync([this, ext, aliveWeak]() {
+                auto alive = aliveWeak.lock();
+                if (!alive || !*alive) return;
+                // Update cache on UI thread only
+                for (auto& cachedExt : m_cachedExtensions) {
+                    if (cachedExt.pkgName == ext.pkgName) {
+                        cachedExt.hasUpdate = false;
+                        break;
+                    }
+                }
+                brls::Application::notify(ext.name + " updated");
+                refreshUIFromCache();
+            });
+        } else {
+            brls::sync([this, ext, aliveWeak]() {
+                auto alive = aliveWeak.lock();
+                if (!alive || !*alive) return;
+                brls::Application::notify("Failed to update " + ext.name);
+            });
+        }
+    });
+}
+
+void ExtensionsTab::uninstallExtension(const Extension& ext) {
+    brls::Logger::info("Requesting uninstall for extension: {}", ext.name);
+
+    // The actual uninstall work, run only if the user confirms.
+    auto doUninstall = [this, ext]() {
+        brls::Logger::info("Uninstalling extension: {}", ext.name);
+        brls::Application::notify("Uninstalling " + ext.name + "...");
+
+        brls::async([this, ext, aliveWeak = std::weak_ptr<bool>(m_alive)]() {
+            SuwayomiClient& client = SuwayomiClient::getInstance();
+
+            bool success = false;
+            int maxRetries = 3;
+            for (int attempt = 1; attempt <= maxRetries && !success; attempt++) {
+                brls::Logger::info("Uninstalling extension {} (attempt {}/{})", ext.pkgName, attempt, maxRetries);
+                success = client.uninstallExtension(ext.pkgName);
+                if (!success && attempt < maxRetries) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+                }
+            }
+
+            if (success) {
+                brls::sync([this, ext, aliveWeak]() {
+                    auto alive = aliveWeak.lock();
+                    if (!alive || !*alive) return;
+                    // Update cache on UI thread only
+                    for (auto& cachedExt : m_cachedExtensions) {
+                        if (cachedExt.pkgName == ext.pkgName) {
+                            cachedExt.installed = false;
+                            cachedExt.hasUpdate = false;
+                            break;
+                        }
+                    }
+                    brls::Application::notify(ext.name + " uninstalled");
+                    refreshUIFromCache();
+                });
+            } else {
+                brls::sync([this, ext, aliveWeak]() {
+                    auto alive = aliveWeak.lock();
+                    if (!alive || !*alive) return;
+                    brls::Application::notify("Failed to uninstall " + ext.name);
+                });
+            }
+        });
+    };
+
+    // Confirm via the shared OptionsPopover, like the rest of the app.
+    std::vector<OptionRow> rows;
+    rows.push_back({ "cross.png", "Uninstall", "Removes all its sources", false, true, doUninstall });
+    rows.push_back({ "back.png", "Cancel", "", false, false, []() {}});
+    OptionsPopover::show("UNINSTALL", ext.name, std::move(rows), nullptr, 5);
+}
+
+void ExtensionsTab::showSourceSettings(const Extension& ext) {
+    brls::Logger::info("Opening settings for extension: {}", ext.name);
+
+    brls::async([this, ext, aliveWeak = std::weak_ptr<bool>(m_alive)]() {
+        SuwayomiClient& client = SuwayomiClient::getInstance();
+
+        std::vector<Source> sources;
+        bool success = client.fetchSourcesForExtension(ext.pkgName, sources);
+
+        if (!success || sources.empty()) {
+            brls::sync([this, aliveWeak]() {
+                auto alive = aliveWeak.lock();
+                if (!alive || !*alive) return;
+                brls::Application::notify("No configurable sources found");
+            });
+            return;
+        }
+
+        brls::sync([this, sources, ext, aliveWeak]() {
+            auto alive = aliveWeak.lock();
+            if (!alive || !*alive) return;
+            if (sources.size() == 1) {
+                showSourcePreferencesDialog(sources[0]);
+            } else {
+                // Source picker as the new popover; picking one opens its settings.
+                std::vector<OptionRow> rows;
+                for (const auto& source : sources) {
+                    Source src = source;
+                    rows.push_back({ "web.png", source.name, "", false, false,
+                        [this, src]() { showSourcePreferencesDialog(src); }});
+                }
+                rows.push_back({ "back.png", "Cancel", "", false, true, []() {}});
+                OptionsPopover::show("EXTENSION", ext.name, std::move(rows), nullptr, 5);
+            }
+        });
+    });
+}
+
+void ExtensionsTab::showSourcePreferencesDialog(const Source& source) {
+    brls::Logger::info("Fetching preferences for source: {}", source.name);
+
+    brls::async([this, source, aliveWeak = std::weak_ptr<bool>(m_alive)]() {
+        SuwayomiClient& client = SuwayomiClient::getInstance();
+
+        std::vector<SourcePreference> prefs;
+        bool success = client.fetchSourcePreferences(source.id, prefs);
+
+        if (!success) {
+            brls::sync([this, aliveWeak]() {
+                auto alive = aliveWeak.lock();
+                if (!alive || !*alive) return;
+                brls::Application::notify("Failed to load source settings");
+            });
+            return;
+        }
+
+        if (prefs.empty()) {
+            brls::sync([this, source, aliveWeak]() {
+                auto alive = aliveWeak.lock();
+                if (!alive || !*alive) return;
+                brls::Application::notify(source.name + " has no configurable settings");
+            });
+            return;
+        }
+
+        auto prefsPtr = std::make_shared<std::vector<SourcePreference>>(prefs);
+        brls::sync([this, source, prefsPtr, aliveWeak]() {
+            auto alive = aliveWeak.lock();
+            if (!alive || !*alive) return;
+            showSourcePreferencesMenu(source, prefsPtr);
+        });
+    });
+}
+
+void ExtensionsTab::showSourcePreferencesMenu(const Source& source,
+                                              std::shared_ptr<std::vector<SourcePreference>> prefs) {
+    std::weak_ptr<bool> aliveWeak = m_alive;
+    Source src = source;
+    // Reopening the menu is both the "back" target for sub-menus and the way
+    // list/edit changes refresh the displayed value.
+    auto reopen = [this, src, prefs]() { showSourcePreferencesMenu(src, prefs); };
+
+    auto applyChange = [this, src, aliveWeak](SourcePreferenceChange change) {
+        brls::async([this, src, change, aliveWeak]() {
+            SuwayomiClient& client = SuwayomiClient::getInstance();
+            bool ok = client.updateSourcePreference(src.id, change);
+            if (!ok) {
+                brls::sync([aliveWeak]() {
+                    auto a = aliveWeak.lock();
+                    if (!a || !*a) return;
+                    brls::Application::notify("Failed to update setting");
+                });
+            }
+        });
+    };
+
+    std::vector<OptionRow> rows;
+    for (int prefIdx = 0; prefIdx < static_cast<int>(prefs->size()); prefIdx++) {
+        const SourcePreference& pref = (*prefs)[prefIdx];
+        if (!pref.visible) continue;
+        const std::string label = pref.title.empty() ? pref.key : pref.title;
+
+        if (pref.type == SourcePreferenceType::SWITCH_TOGGLE ||
+            pref.type == SourcePreferenceType::CHECKBOX) {
+            const bool isSwitch = pref.type == SourcePreferenceType::SWITCH_TOGGLE;
+            auto cur = std::make_shared<bool>(pref.currentValue);
+            OptionRow row;
+            row.label     = label;
+            row.checkable = true;
+            row.checked   = pref.currentValue;
+            row.action    = [applyChange, prefs, prefIdx, isSwitch, cur]() {
+                *cur = !*cur;
+                (*prefs)[prefIdx].currentValue = *cur;   // keep local state in sync
+                SourcePreferenceChange change;
+                change.position = prefIdx;
+                if (isSwitch) { change.switchState = *cur;   change.hasSwitchState = true; }
+                else          { change.checkBoxState = *cur; change.hasCheckBoxState = true; }
+                applyChange(change);
+            };
+            rows.push_back(std::move(row));
+
+        } else if (pref.type == SourcePreferenceType::LIST) {
+            std::string disp = pref.selectedValue;
+            for (size_t i = 0; i < pref.entryValues.size(); i++) {
+                if (pref.entryValues[i] == pref.selectedValue && i < pref.entries.size()) {
+                    disp = pref.entries[i];
+                    break;
+                }
+            }
+            OptionRow row;
+            row.label = label;
+            row.sub   = disp;
+            SourcePreference p = pref;
+            row.action = [applyChange, reopen, prefs, prefIdx, p]() {
+                std::vector<OptionRow> sub;
+                for (size_t i = 0; i < p.entries.size(); i++) {
+                    const bool cur = (i < p.entryValues.size() && p.entryValues[i] == p.selectedValue);
+                    std::string val = (i < p.entryValues.size()) ? p.entryValues[i] : std::string();
+                    sub.push_back({ cur ? "radio_checked.png" : "radio.png", p.entries[i], "", cur, false,
+                        [applyChange, reopen, prefs, prefIdx, val]() {
+                            (*prefs)[prefIdx].selectedValue = val;
+                            SourcePreferenceChange change;
+                            change.position = prefIdx;
+                            change.listState = val;
+                            change.hasListState = true;
+                            applyChange(change);
+                            reopen();
+                        }});
+                }
+                sub.push_back({ "back.png", "Cancel", "", false, true, [reopen]() { reopen(); }});
+                OptionsPopover::show("SETTING", p.title.empty() ? p.key : p.title,
+                                     std::move(sub), reopen, 6);
+            };
+            rows.push_back(std::move(row));
+
+        } else if (pref.type == SourcePreferenceType::EDIT_TEXT) {
+            OptionRow row;
+            row.label = label;
+            row.sub   = pref.currentText.empty() ? "(empty)" : pref.currentText;
+            SourcePreference p = pref;
+            row.action = [applyChange, reopen, prefs, prefIdx, p]() {
+                brls::Application::getImeManager()->openForText(
+                    [applyChange, reopen, prefs, prefIdx](std::string text) {
+                        (*prefs)[prefIdx].currentText = text;
+                        SourcePreferenceChange change;
+                        change.position = prefIdx;
+                        change.editTextState = text;
+                        change.hasEditTextState = true;
+                        applyChange(change);
+                        reopen();
+                    },
+                    p.dialogTitle.empty() ? p.title : p.dialogTitle,
+                    p.dialogMessage, 256, p.currentText);
+            };
+            rows.push_back(std::move(row));
+
+        } else {
+            // MULTI_SELECT_LIST / unknown: show value read-only for now.
+            OptionRow row;
+            row.label  = label;
+            row.action = []() {};
+            rows.push_back(std::move(row));
+        }
+    }
+
+    rows.push_back({ "back.png", "Close", "", false, true, []() {}});
+
+    OptionsPopover::show("SOURCE", source.name, std::move(rows), nullptr, 6);
+}
+
+// ============================================================================
+// Search
+// ============================================================================
+
+void ExtensionsTab::showSearchDialog() {
+    brls::Application::getImeManager()->openForText([this](std::string text) {
+        if (text.empty()) {
+            hideSearchResults();
+            return;
+        }
+
+        m_searchQuery = text;
+        std::transform(m_searchQuery.begin(), m_searchQuery.end(), m_searchQuery.begin(), ::tolower);
+        m_isSearchActive = true;
+
+        // Update title to show search query
+        m_titleLabel->setText("Search: " + text);
+
+        brls::Application::notify("Searching for: " + text);
+        reloadRecycler();
+    }, "Search Extensions", "", 64);
+}
+
+void ExtensionsTab::clearSearch() {
+    m_searchQuery.clear();
+    m_isSearchActive = false;
+    m_titleLabel->setText("Extensions");
+}
+
+void ExtensionsTab::showSearchResults() {
+    reloadRecycler();
+}
+
+void ExtensionsTab::hideSearchResults() {
+    clearSearch();
+    reloadRecycler();
+}
+
+void ExtensionsTab::showAddRepoDialog() {
+    brls::Application::getImeManager()->openForText([this](std::string text) {
+        if (text.empty()) {
+            brls::Application::notify("Repository URL cannot be empty");
+            return;
+        }
+
+        // Validate URL format
+        if (text.find("http://") != 0 && text.find("https://") != 0) {
+            brls::Application::notify("Invalid URL: must start with http:// or https://");
+            return;
+        }
+
+        // Show loading notification
+        brls::Application::notify("Adding extension repository...");
+
+        // Add repository in background
+        brls::async([this, text, aliveWeak = std::weak_ptr<bool>(m_alive)]() {
+            SuwayomiClient& client = SuwayomiClient::getInstance();
+            bool success = client.addExtensionRepo(text);
+
+            brls::sync([this, success, text, aliveWeak]() {
+                auto alive = aliveWeak.lock();
+                if (!alive || !*alive) return;
+                if (success) {
+                    brls::Application::notify("Repository added successfully!");
+                    // Refresh extension list to load from new repository
+                    refreshExtensions();
+                } else {
+                    brls::Application::notify("Failed to add repository");
+                }
+            });
+        });
+    }, "Add Extension Repository",
+       "", 256,
+       "https://raw.githubusercontent.com/yuzono/manga-repo/repo/index.min.json", 0);
+}
+
+} // namespace vitasuwayomi

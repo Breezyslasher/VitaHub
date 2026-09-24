@@ -1,0 +1,324 @@
+/**
+ * VitaSuwayomi - Manga Reader Activity
+ * Displays manga pages for reading with navigation controls
+ * NOBORU-style UI with tap to show/hide controls
+ */
+
+#pragma once
+
+#include <borealis.hpp>
+#include <chrono>
+#include "app/suwayomi_client.hpp"
+#include "app/application.hpp"
+#include "view/rotatable_image.hpp"
+#include "view/rotatable_label.hpp"
+#include "view/rotatable_box.hpp"
+#include "view/webtoon_scroll_view.hpp"
+
+namespace vitasuwayomi {
+
+// Reader scaling modes
+enum class ReaderScaleMode {
+    FIT_SCREEN,      // Fit entire page on screen
+    FIT_WIDTH,       // Fit width, may need vertical scroll
+    FIT_HEIGHT,      // Fit height, may need horizontal scroll
+    ORIGINAL         // Original size
+};
+
+// Image rotation (in degrees)
+enum class ImageRotation {
+    ROTATE_0 = 0,      // No rotation (default)
+    ROTATE_90 = 90,    // 90 degrees clockwise
+    ROTATE_180 = 180,  // 180 degrees (upside down)
+    ROTATE_270 = 270   // 270 degrees clockwise (90 counter-clockwise)
+};
+
+// Reading direction
+enum class ReaderDirection {
+    LEFT_TO_RIGHT,   // Western comics style
+    RIGHT_TO_LEFT,   // Manga style (default)
+    TOP_TO_BOTTOM    // Webtoon/vertical style
+};
+
+// Reader settings
+struct ReaderSettings {
+    ReaderDirection direction = ReaderDirection::RIGHT_TO_LEFT;
+    ImageRotation rotation = ImageRotation::ROTATE_0;
+    ReaderScaleMode scaleMode = ReaderScaleMode::FIT_SCREEN;
+    bool keepScreenOn = true;
+    bool cropBorders = false;       // Auto-crop white/black borders
+    int webtoonSidePadding = 0;     // Side padding percentage (0-20%)
+    bool isWebtoonFormat = false;   // Treat as webtoon (vertical scroll)
+};
+
+class ReaderActivity : public brls::Activity {
+public:
+    // Create reader for a specific chapter
+    ReaderActivity(int mangaId, int chapterIndex, const std::string& mangaTitle);
+
+    // Create reader starting from a specific page
+    ReaderActivity(int mangaId, int chapterIndex, int startPage, const std::string& mangaTitle);
+
+    brls::View* createContentView() override;
+    void onContentAvailable() override;
+    void willDisappear(bool resetState = false) override;
+
+    // Navigation
+    void nextPage();
+    void previousPage();
+    void goToPage(int pageIndex);
+    void nextChapter();
+    void previousChapter();
+
+    // Controls
+    void toggleControls();
+    void showSettings();
+    void hideSettings();
+    void updateSettingsLabels();
+
+    // Get current state
+    int getCurrentPage() const { return m_currentPage; }
+    int getPageCount() const { return static_cast<int>(m_pages.size()); }
+    int getMangaId() const { return m_mangaId; }
+    int getChapterIndex() const { return m_chapterIndex; }
+
+private:
+    void loadPages();
+    void loadPage(int index);
+    void updatePageDisplay();
+    void updateDirectionLabel();
+    void updateProgress();
+    void showControls();
+    void hideControls();
+    void preloadAdjacentPages();
+    void markChapterAsRead();
+    void applySettings();
+    void saveSettingsToApp();  // Persist settings to AppSettings
+
+    // Touch handling (implemented inline in gesture recognizers)
+
+    // Page counter auto-hide
+    void showPageCounter();
+    void hidePageCounter();
+    void schedulePageCounterHide();
+    int m_pageCounterHideGeneration = 0;  // Generation counter to cancel stale auto-hide
+
+    // Update page counter rotation/position
+    void updatePageCounterRotation();
+
+    // UI components - NOBORU style
+    BRLS_BIND(brls::Box, container, "reader/container");
+    BRLS_BIND(RotatableImage, pageImage, "reader/page_image");
+    BRLS_BIND(RotatableImage, previewImage, "reader/preview_image");    // Positive-side preview
+    BRLS_BIND(RotatableImage, previewImageB, "reader/preview_image_b"); // Negative-side preview
+    BRLS_BIND(brls::Box, topBar, "reader/top_bar");
+    BRLS_BIND(brls::Box, bottomBar, "reader/bottom_bar");
+    BRLS_BIND(RotatableLabel, pageCounter, "reader/page_counter");
+    BRLS_BIND(brls::Label, mangaLabel, "reader/manga_label");
+    BRLS_BIND(brls::Label, chapterLabel, "reader/chapter_label");
+    BRLS_BIND(brls::Label, chapterProgress, "reader/chapter_progress");
+    BRLS_BIND(brls::Label, sliderPageLabel, "reader/slider_page_label");
+    BRLS_BIND(brls::Label, directionLabel, "reader/direction_label");
+    BRLS_BIND(brls::Slider, pageSlider, "reader/page_slider");
+    BRLS_BIND(brls::Button, backBtn, "reader/back_btn");
+    BRLS_BIND(brls::Button, prevChapterBtn, "reader/prev_chapter");
+    BRLS_BIND(brls::Button, nextChapterBtn, "reader/next_chapter");
+    BRLS_BIND(brls::Button, settingsBtn, "reader/settings_btn");
+
+    // Settings overlay panel
+    BRLS_BIND(brls::Box, settingsOverlay, "reader/settings_overlay");
+    BRLS_BIND(brls::Box, settingsPanel, "reader/settings_panel");
+    BRLS_BIND(brls::Button, settingsFormatBtn, "reader/settings_format_btn");
+    BRLS_BIND(brls::Button, settingsDirBtn, "reader/settings_dir_btn");
+    BRLS_BIND(brls::Button, settingsRotBtn, "reader/settings_rot_btn");
+    BRLS_BIND(brls::Button, settingsScaleBtn, "reader/settings_scale_btn");
+    BRLS_BIND(brls::Label, settingsFormatLabel, "reader/settings_format_label");
+    BRLS_BIND(brls::Label, settingsDirLabel, "reader/settings_dir_label");
+    BRLS_BIND(brls::Label, settingsRotLabel, "reader/settings_rot_label");
+    BRLS_BIND(brls::Label, settingsScaleLabel, "reader/settings_scale_label");
+    BRLS_BIND(brls::Button, settingsResetBtn, "reader/settings_reset_btn");
+
+    // Webtoon continuous scroll view
+    BRLS_BIND(WebtoonScrollView, webtoonScroll, "reader/webtoon_scroll");
+
+    // Transition page (between chapters)
+    BRLS_BIND(RotatableBox, transitionBox, "reader/transition_box");
+    BRLS_BIND(brls::Label, transitionLine1, "reader/transition_line1");
+    BRLS_BIND(brls::Label, transitionLine2, "reader/transition_line2");
+    BRLS_BIND(brls::Image, transitionPreview, "reader/transition_preview");
+
+    // Manga/Chapter info
+    int m_mangaId = 0;
+    int m_chapterIndex = 0;      // Chapter ID (server ID, NOT sequential number)
+    int m_chapterPosition = -1;  // Position of current chapter in m_chapters list
+    std::string m_mangaTitle;
+    std::string m_chapterName;
+    std::vector<int> m_readChapterIds;  // Chapter IDs marked read during this session
+
+    // Find position of current chapter in m_chapters by matching chapter ID
+    void findChapterPosition();
+    // Get display string for current chapter number
+    std::string getChapterDisplayNumber() const;
+
+    // Pages
+    std::vector<Page> m_pages;
+    int m_currentPage = 0;
+    int m_startPage = 0;
+
+    // Reader settings
+    ReaderSettings m_settings;
+    bool m_controlsVisible = false;
+    bool m_settingsVisible = false;
+    bool m_continuousScrollMode = false;  // True when using WebtoonScrollView
+
+    // Alive flag for async callback safety
+    std::shared_ptr<bool> m_alive = std::make_shared<bool>(true);
+
+    // Switch between single-page and continuous scroll modes
+    void updateReaderMode();
+
+    // Chapter navigation
+    std::vector<Chapter> m_chapters;
+    int m_totalChapters = 0;
+
+    // Next chapter preloading
+    std::vector<Page> m_nextChapterPages;
+    bool m_nextChapterLoaded = false;
+    bool m_goToEndAfterLoad = false;  // When true, jump to last page after chapter loads
+    void preloadNextChapter();
+
+    // Previous chapter preloading (for smooth backward swipe preview)
+    std::vector<Page> m_prevChapterPages;
+    bool m_prevChapterLoaded = false;
+    void preloadPrevChapter();
+
+    // Swipe-to-chapter tracking: when swiping shows a cross-chapter preview,
+    // completing the swipe should trigger chapter navigation instead of page nav
+    bool m_swipeToChapter = false;
+    // When true, the incoming preview is the transitionBox (not previewImage)
+    bool m_previewIsTransition = false;
+
+    // Reader background color support
+    void updateMarginColors();
+
+    // Touch gesture tracking
+    bool m_isPanning = false;
+    brls::Point m_touchStart;
+    brls::Point m_touchCurrent;
+
+    // Swipe velocity tracking for flick-to-turn
+    std::chrono::steady_clock::time_point m_swipeStartTime;
+    brls::Point m_lastVelocityPos;
+    std::chrono::steady_clock::time_point m_lastVelocityTime;
+    float m_swipeVelocity = 0.0f;  // pixels/second at release
+
+    // 3-page carousel swipe: positive side + current + negative side
+    // "Positive" = revealed when swiping positive (right/down on screen)
+    // "Negative" = revealed when swiping negative (left/up on screen)
+    bool m_isSwipeAnimating = false;
+    float m_swipeOffset = 0.0f;           // Current swipe offset in pixels
+    int m_previewPageIndex = -1;          // Active side's page index for page turn
+    bool m_swipingToNext = true;          // true = swiping to next page, false = previous
+    int m_posPreviewIdx = -1;             // Page index loaded in positive-side preview
+    int m_negPreviewIdx = -1;             // Page index loaded in negative-side preview
+    bool m_posIsTransition = false;       // Positive side is a transition page (uses transitionBox)
+    bool m_negIsTransition = false;       // Negative side is a transition page
+    void updateSwipePreview(float offset);
+    void loadPreviewPage(int index);
+    void loadPreviewInto(RotatableImage* target, int index);
+    void preloadAdjacentPreviews();       // Pre-load both sides after page loads
+    std::pair<float, float> getSwipeViewSize(); // View dims for swipe math
+    void completeSwipeAnimation(bool turnPage);
+    void resetSwipeState();
+
+    // Smooth slide completion animation (runs after finger lifts)
+    bool m_completionAnimating = false;   // true while slide-to-finish is running
+    float m_completionOffset = 0.0f;      // current animated offset
+    float m_completionTarget = 0.0f;      // target offset (screen width or 0 for snap-back)
+    bool m_completionTurnPage = false;    // whether to finalize page turn at end
+    bool m_completionNavChapter = false;  // whether to navigate chapters after animation
+    bool m_completionNavNext = false;     // true = next chapter, false = previous
+    std::chrono::steady_clock::time_point m_completionStartTime;  // For time-based easing
+    float m_completionStartOffset = 0.0f; // Offset when animation started
+    void animateSwipeCompletion();        // per-frame step, called via brls::sync
+    void finalizePageTurn();              // called when animation reaches target
+
+    // NOBORU-style touch controls
+    // Double-tap detection
+    std::chrono::steady_clock::time_point m_lastTapTime;
+    brls::Point m_lastTapPosition;
+    static constexpr int DOUBLE_TAP_THRESHOLD_MS = 300;  // Max time between taps
+    static constexpr float DOUBLE_TAP_DISTANCE = 50.0f;  // Max distance between taps
+
+    // Zoom state
+    bool m_isZoomed = false;
+    float m_zoomLevel = 1.0f;
+    brls::Point m_zoomOffset = {0, 0};
+
+    // Multi-touch tracking for pinch-to-zoom
+    bool m_isPinching = false;
+    float m_initialPinchDistance = 0.0f;
+    float m_initialZoomLevel = 1.0f;
+    brls::Point m_pinchStartCenter = {0, 0};   // Pinch center at gesture start
+    brls::Point m_pinchStartOffset = {0, 0};   // Zoom offset at gesture start
+    std::chrono::steady_clock::time_point m_pinchEndTime;  // When pinch ended (cooldown guard)
+
+    // Touch control methods
+    void handleDoubleTap(brls::Point position);
+    void handlePinchZoom(float scaleFactor);
+    void resetZoom();
+
+    // Returns -1 for user's left zone, 0 for center, +1 for user's right zone
+    // accounting for rotation (user's left/right depends on how device is held)
+    int getTapZone(brls::Point position) const;
+    void zoomTo(float level, brls::Point center);
+
+    // Error overlay for failed page loads
+    brls::Box* m_errorOverlay = nullptr;
+    brls::Label* m_errorLabel = nullptr;
+    brls::Button* m_retryButton = nullptr;
+    int m_pageLoadGeneration = 0;   // Track current load to detect stale timeouts
+    bool m_pageLoadSucceeded = false; // Set true when current page loads successfully
+    std::shared_ptr<bool> m_pageLoadAlive; // Per-load alive flag to cancel stale async loads
+    std::shared_ptr<bool> m_previewLoadAlive; // Per-preview-cycle alive flag to cancel stale preview loads
+    std::shared_ptr<bool> m_crossChapterPreloadAlive; // Survives preloadAdjacentPreviews() re-invocation
+    bool m_loadedFromLocal = false;  // True when current chapter was loaded from local downloads
+    void showPageError(const std::string& message);
+    void hidePageError();
+
+    // Fake transition pages inserted into m_pages at chapter boundaries
+    // They use special imageUrl markers and are rendered as text pages
+    static constexpr const char* TRANSITION_NEXT = "__transition:next";
+    static constexpr const char* TRANSITION_PREV = "__transition:prev";
+    static constexpr const char* TRANSITION_END  = "__transition:end";
+    bool isTransitionPage(int index) const;
+    void insertTransitionPages();
+    void renderTransitionPage(int index);
+    void setupWebtoonTransitionText();  // Set transition text on webtoon scroll view
+    void webtoonExtendChapter(bool next);  // Smoothly append/prepend chapter in webtoon mode
+    int m_realPageCount = 0;  // Actual page count excluding transition pages
+
+    // Webtoon chapter-boundary tracking: maps ranges of webtoon page indices
+    // to the chapter they belong to, so progress is saved for the correct chapter.
+    struct WebtoonChapterSegment {
+        int firstPage;     // First real (non-transition) page index in webtoon view
+        int pageCount;     // Number of real pages in this segment
+        int chapterId;     // Server chapter ID
+        int chapterPos;    // Index into m_chapters
+    };
+    std::vector<WebtoonChapterSegment> m_webtoonSegments;
+    void initWebtoonSegments();   // Build initial segment from setPages
+    void getWebtoonProgress(int rawPageIndex, int& outChapterId, int& outChapterPos,
+                            int& outPageInChapter, int& outChapterPageCount) const;
+
+    // Guard flag: prevents slider callback from firing during programmatic setProgress
+    bool m_updatingSlider = false;
+
+    // Progress save throttling: prevent server spam during fast scrolling/swiping
+    std::chrono::steady_clock::time_point m_lastProgressSaveTime;
+    int m_pendingProgressChapterId = -1;
+    int m_pendingProgressPage = -1;
+    void flushPendingProgress();
+};
+
+} // namespace vitasuwayomi

@@ -1,0 +1,88 @@
+/**
+ * VitaPlex - Music Tab
+ * Displays music libraries with playlists and collections
+ */
+
+#pragma once
+
+#include <borealis.hpp>
+#include <memory>
+#include "app/plex_client.hpp"
+#include "view/recycling_grid.hpp"
+
+namespace vitaplex {
+
+class MusicTab : public brls::Box {
+public:
+    MusicTab();
+    ~MusicTab() override;
+
+    void onFocusGained() override;
+    void willDisappear(bool resetState) override;
+
+private:
+    void loadSections();
+    void loadContent(const std::string& sectionKey);
+    void loadAlbumsByType(const std::string& sectionKey);
+    void loadPlaylists();
+    void loadCollections(const std::string& sectionKey);
+    void onItemSelected(const MediaItem& item);
+    void onPlaylistSelected(const Playlist& playlist);
+    void onCollectionSelected(const MediaItem& collection);
+    brls::Box* createHorizontalRow(const std::string& title);
+    brls::Box* createAlbumScrollRow(const std::string& title, const std::vector<MediaItem>& items);
+
+    // Playlist management
+    void showCreatePlaylistDialog();
+    void showPlaylistOptionsDialog(const Playlist& playlist);
+    void showAlbumContextMenu(const MediaItem& album);
+    // userPickedTrack says whether startIndex is a track the user chose or just
+    // the top of the list. It decides which shuffle the player applies when
+    // "Shuffle New Queues" is on, and has no default on purpose: defaulting it
+    // is what made "Play All" on a playlist open on track 1 every time.
+    void playPlaylistWithQueue(const std::string& playlistId, int startIndex,
+                               bool userPickedTrack);
+    void refreshPlaylists();
+
+    // Button styling helpers
+    void styleButton(brls::Button* btn, bool active = false);
+    void updateSectionButtonStyles();
+    brls::Button* m_activeSectionBtn = nullptr;
+
+    brls::ScrollingFrame* m_scrollView = nullptr;
+    brls::Box* m_mainContainer = nullptr;
+    brls::Label* m_titleLabel = nullptr;
+
+    // Section selector
+    brls::HScrollingFrame* m_sectionsScroll = nullptr;
+    brls::Box* m_sectionsBox = nullptr;
+
+    // Playlists row
+    brls::Box* m_playlistsRow = nullptr;
+    brls::Box* m_playlistsContainer = nullptr;
+
+    // Collections row
+    brls::Box* m_collectionsRow = nullptr;
+    brls::Box* m_collectionsContainer = nullptr;
+
+    // Album categories (scrolling rows by type)
+    brls::ScrollingFrame* m_albumCategoriesScroll = nullptr;
+    brls::Box* m_albumCategoriesBox = nullptr;
+
+    // Main content grid
+    RecyclingGrid* m_contentGrid = nullptr;
+
+    std::vector<LibrarySection> m_sections;  // Music sections only
+    std::vector<MediaItem> m_items;
+    std::vector<Playlist> m_playlists;        // Using new Playlist struct
+    std::vector<MediaItem> m_collections;
+    std::string m_currentSection;
+    std::string m_currentPlaylistId;          // Currently viewing playlist
+    bool m_loaded = false;
+    bool m_viewingPlaylist = false;           // True if viewing playlist contents
+
+    // Shared pointer to track if this object is still alive
+    std::shared_ptr<bool> m_alive;
+};
+
+} // namespace vitaplex

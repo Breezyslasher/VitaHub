@@ -1,0 +1,168 @@
+/**
+ * VitaSuwayomi - Search/Browse Tab
+ * Search manga across sources and browse source catalogs
+ */
+
+#pragma once
+
+#include <borealis.hpp>
+#include <map>
+#include "app/suwayomi_client.hpp"
+#include "view/recycling_grid.hpp"
+
+namespace vitasuwayomi {
+
+// Browse mode
+enum class BrowseMode {
+    SOURCES,        // Show list of available sources
+    POPULAR,        // Browse popular manga from selected source
+    LATEST,         // Browse latest manga from selected source
+    SEARCH_RESULTS  // Show search results
+};
+
+class SearchTab : public brls::Box {
+public:
+    SearchTab();
+    ~SearchTab();
+
+    void onFocusGained() override;
+    void willAppear(bool resetState) override;
+    void willDisappear(bool resetState) override;
+    brls::View* getNextFocus(brls::FocusDirection direction, brls::View* currentView) override;
+
+private:
+    void loadSources();
+    void loadPopularManga(int64_t sourceId);
+    void loadLatestManga(int64_t sourceId);
+    void performSearch(const std::string& query);
+    void performSourceSearch(int64_t sourceId, const std::string& query);
+    void onSourceSelected(const Source& source);
+    void onMangaSelected(const Manga& manga);
+    void showSources();
+    void showSourceBrowser(const Source& source);
+    void loadNextPage();
+    void updateModeButtons();
+
+    brls::Label* m_titleLabel = nullptr;
+    brls::Label* m_searchLabel = nullptr;
+    brls::Label* m_resultsLabel = nullptr;
+    brls::Label* m_loadingLabel = nullptr;  // Animated loading indicator
+
+    // Loading indicator animation
+    bool m_isLoading = false;
+    float m_loadingTimer = 0.0f;
+    int m_loadingDotCount = 0;
+    void showLoadingIndicator(const std::string& message = "Loading");
+    void hideLoadingIndicator();
+
+    // Header row with title and search icon
+    brls::Box* m_headerBox = nullptr;
+    brls::Box* m_buttonContainer = nullptr;  // Container for history + search buttons
+    brls::Button* m_historyBtn = nullptr;
+    brls::Button* m_globalSearchBtn = nullptr;
+
+    // Mode selector buttons
+    brls::Box* m_modeBox = nullptr;
+    brls::Button* m_popularBtn = nullptr;
+    brls::Button* m_latestBtn = nullptr;
+    brls::Button* m_backBtn = nullptr;
+
+    // Source list (scrollable)
+    brls::ScrollingFrame* m_sourceScrollView = nullptr;
+    brls::Box* m_sourceListBox = nullptr;
+
+    // Filtered sources (based on language setting)
+    std::vector<Source> m_filteredSources;
+    void filterSourcesByLanguage();
+    void showGlobalSearchDialog();
+    void showSourceSearchDialog();
+    void showFilterDialog();
+    void loadSourceFilters();
+    void applyFilters();
+    void resetFilters();
+    void showSearchHistoryDialog();
+    void showTagFilterDialog();
+    void showTagManageDialog(const Source& source);
+    void collectAllTags(std::set<std::string>& allTags);
+
+    // Tag/filter button (header) - context-aware: tag filter on source list, source filter when browsing
+    brls::Box* m_filterBtnContainer = nullptr;  // Container for tag button + triangle hint (hidden on sources page)
+    brls::Button* m_tagFilterBtn = nullptr;
+    brls::Image* m_tagFilterIcon = nullptr;  // Icon swapped based on context
+    void addToSearchHistory(const std::string& query);
+    void clearSearchHistory();
+
+    // Main content grid (for single source browsing)
+    RecyclingGrid* m_contentGrid = nullptr;
+
+    bool m_isLoadingPage = false;  // Guard against concurrent page loads
+
+    // Search results by source (grouped horizontal rows)
+    brls::ScrollingFrame* m_searchResultsScrollView = nullptr;
+    brls::Box* m_searchResultsBox = nullptr;
+    std::map<std::string, std::vector<Manga>> m_resultsBySource;
+    void populateSearchResultsBySource();
+    brls::View* createSourceRow(const std::string& sourceName, const std::vector<Manga>& manga);
+
+    // Content wrapper: ROW layout with main content (left) and filter panel (right)
+    brls::Box* m_contentWrapper = nullptr;
+    brls::Box* m_mainContent = nullptr;
+
+    // Inline filter panel (appears on right side instead of opening a dialog)
+    brls::Box* m_filterPanel = nullptr;
+    enum class FilterPanelType { NONE, SOURCE_FILTER, TAG_FILTER, TAG_MANAGE };
+    FilterPanelType m_filterPanelType = FilterPanelType::NONE;
+    brls::View* m_prePanelFocusView = nullptr;  // View that had focus before panel opened
+    brls::Box* m_lastHighlightedRow = nullptr;   // Currently highlighted row in filter panel
+    void hideFilterPanel();
+    bool isFocusInPanel(brls::View* view) const;  // Check if view is inside m_filterPanel
+    void buildFilterPanel();       // Build source filter content into m_filterPanel
+    void buildTagFilterPanel();    // Build tag filter content into m_filterPanel
+    void buildTagManagePanel(const Source& source);  // Build tag manage content into m_filterPanel
+
+    // Source filter state
+    std::vector<SourceFilter> m_sourceFilters;
+    bool m_filtersLoaded = false;
+    bool m_filtersActive = false;  // True when user has applied filters
+    std::set<int> m_collapsedGroups;  // Indices of collapsed groups in filter dialog
+
+    // Browse chrome: a rail of the currently-selected genre chips (2b).
+    brls::Box* m_genreRail = nullptr;        // horizontal chip rail (HScrollingFrame host)
+    brls::Box* m_genreChipsBox = nullptr;    // ROW box of genre chips
+    void buildGenreChipRail();
+    void updateBrowseChrome();               // show/hide + rebuild the rail
+    // Locate the genre-like GROUP filter (Genre/Tags/…); -1 if none.
+    int findGenreGroupIndex() const;
+
+    // State
+    BrowseMode m_browseMode = BrowseMode::SOURCES;
+    int64_t m_currentSourceId = 0;
+    std::string m_currentSourceName;
+    std::string m_searchQuery;
+    int m_currentPage = 1;
+    bool m_hasNextPage = false;
+    bool m_isGlobalSearch = false;  // Track if current search is global or source-specific
+    BrowseMode m_previousBrowseMode = BrowseMode::POPULAR;  // Mode before source-specific search
+    int m_loadGeneration = 0;       // Incremented on navigation; stale async callbacks check this
+
+    // Navigation helper
+    void handleBackNavigation();
+    bool m_isNavigatingBack = false;  // Guard against double back-press
+
+    // Returns true if focus is currently inside this SearchTab's view hierarchy
+    bool hasFocusInside() const;
+
+    // Data
+    std::vector<Source> m_sources;
+    std::vector<Manga> m_mangaList;
+
+    // Async lifetime guard
+    std::shared_ptr<bool> m_alive;
+
+    // Separate lifetime guard for source icon image loads.
+    // Invalidated before clearing the source list so that pending
+    // ImageLoader callbacks don't write to freed brls::Image pointers.
+    std::shared_ptr<bool> m_sourceIconsAlive;
+};
+
+} // namespace vitasuwayomi

@@ -1,0 +1,82 @@
+diff --git a/modules/music/include/app/application.hpp b/modules/music/include/app/application.hpp
+index 76e1386..4d41609 100644
+--- a/modules/music/include/app/application.hpp
++++ b/modules/music/include/app/application.hpp
+@@ -26,6 +26,10 @@ public:
+     // Initialize and run the application
+     bool init();
+     void run();
++    // Startup without the main loop (restore session, push the first
++    // activity). run() = start() + main loop; VitaHub calls start() and
++    // owns the loop itself.
++    void start();
+     void shutdown();
+ 
+     // Navigation
+diff --git a/modules/music/src/activity/main_activity.cpp b/modules/music/src/activity/main_activity.cpp
+index 44c61b3..cf8846f 100644
+--- a/modules/music/src/activity/main_activity.cpp
++++ b/modules/music/src/activity/main_activity.cpp
+@@ -3,6 +3,10 @@
+  */
+ 
+ #include "activity/main_activity.hpp"
++
++#ifdef VITAHUB
++#include "vitahub/bridge.hpp"
++#endif
+ #include "view/home_tab.hpp"
+ #include "view/library_tab.hpp"
+ #include "view/search_tab.hpp"
+@@ -138,6 +142,9 @@ void MainActivity::buildSidebar(bool hasPodcasts, bool hasAudiobooks, bool hasRa
+         tabFrame->addTab("Debug", []() { return new DebugTab(); });
+     }
+     tabFrame->addTab("Settings", []() { return new SettingsTab(); });
++#ifdef VITAHUB
++    tabFrame->addTab("VitaHub", []() { return vitahub::createServicesTab("music"); });
++#endif
+ 
+     tabFrame->focusTab(0);
+ 
+diff --git a/modules/music/src/activity/player_activity.cpp b/modules/music/src/activity/player_activity.cpp
+index 2d1ccf2..f5451f5 100644
+--- a/modules/music/src/activity/player_activity.cpp
++++ b/modules/music/src/activity/player_activity.cpp
+@@ -1926,10 +1926,10 @@ void PlayerActivity::animateGrabLift(bool lifted) {
+         row->setShadowType(brls::ShadowType::GENERIC);
+         row->setShadowVisibility(true);
+         // Overshoot past the seated-out position, then settle: a tactile "pop".
+-        m_grabLift.addStep(1.18f, 110, brls::EasingFunction::quadraticOut);
+-        m_grabLift.addStep(1.0f, 90, brls::EasingFunction::quadraticOut);
++        m_grabLift.addStep(1.18f, 110, tweeny::easing::quadraticOut);
++        m_grabLift.addStep(1.0f, 90, tweeny::easing::quadraticOut);
+     } else {
+-        m_grabLift.addStep(0.0f, 140, brls::EasingFunction::quadraticOut);
++        m_grabLift.addStep(0.0f, 140, tweeny::easing::quadraticOut);
+         // Drop the shadow and zero the offset only once fully seated again.
+         m_grabLift.setEndCallback([this, row](bool) {
+             if (m_queueRowData.count(row)) {
+diff --git a/modules/music/src/app/application.cpp b/modules/music/src/app/application.cpp
+index f94d111..6d810d7 100644
+--- a/modules/music/src/app/application.cpp
++++ b/modules/music/src/app/application.cpp
+@@ -78,7 +78,7 @@ bool Application::init() {
+     return true;
+ }
+ 
+-void Application::run() {
++void Application::start() {
+     brls::Logger::info("Application::run - isLoggedIn={}, serverUrl={}",
+                        isLoggedIn(), m_serverUrl.empty() ? "(empty)" : m_serverUrl);
+ 
+@@ -115,6 +115,10 @@ void Application::run() {
+         // Show login screen
+         pushLoginActivity();
+     }
++}
++
++void Application::run() {
++    start();
+ 
+     // Main loop handled by Borealis
+     while (brls::Application::mainLoop()) {

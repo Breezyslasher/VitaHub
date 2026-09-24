@@ -1,0 +1,754 @@
+/**
+ * VitaPlex - Plex API Client
+ * Handles all communication with Plex servers
+ */
+
+#pragma once
+
+#include <string>
+#include <string_view>
+#include <vector>
+#include <functional>
+#include <memory>
+#include <cstdint>
+
+namespace vitaplex {
+
+// Media types
+enum class MediaType {
+    UNKNOWN,
+    MOVIE,
+    SHOW,
+    SEASON,
+    EPISODE,
+    MUSIC_ARTIST,
+    MUSIC_ALBUM,
+    MUSIC_TRACK,
+    CLIP,
+    PHOTO,
+    LIVE_TV_CHANNEL,
+    LIVE_TV_PROGRAM
+};
+
+// Media item info
+struct MediaItem {
+    std::string ratingKey;
+    std::string key;
+    std::string title;
+    std::string summary;
+    std::string thumb;
+    std::string art;
+    std::string type;
+    MediaType mediaType = MediaType::UNKNOWN;
+    int year = 0;
+    int duration = 0;
+    int viewOffset = 0;
+    float rating = 0.0f;
+    float audienceRating = 0.0f;   // Plex audienceRating (RT popcorn / audience score, 0-10)
+    // The viewer's own rating, 0-10, 0 when unrated. Distinct from `rating`,
+    // which is the critic score. Read so the Android media session's heart can
+    // show what is already set instead of always starting empty.
+    float userRating = 0.0f;
+    std::string contentRating;
+    std::string studio;
+    std::vector<std::string> genres;  // populated by fetchMediaDetails (detail view only)
+    bool watched = false;
+    std::string librarySectionKey;  // numeric library section id (detail view; for "more by this person")
+    std::string character;          // poster role badge text ("as Luke Skywalker" / "Director"); set for person-results only
+
+    // For episodes
+    std::string grandparentTitle;
+    std::string parentTitle;
+    std::string grandparentThumb;  // Series/show poster for episodes
+    std::string parentThumb;       // Season poster for episodes
+    std::string parentRatingKey;   // Season ratingKey (for auto-play-next)
+    std::string grandparentRatingKey;  // Show ratingKey (for cross-season auto-play-next)
+    int parentIndex = 0;
+    int index = 0;
+    int seasonNumber = 0;
+    int episodeNumber = 0;
+
+    // Live TV programmes: the airing window from Media[].beginsAt/endsAt,
+    // in unix seconds. Zero when the item is not a live broadcast. Kept
+    // apart from duration/viewOffset so a rail can show how far through a
+    // broadcast is without those being mistaken for playback progress.
+    int64_t airStartAt = 0;
+    int64_t airEndAt = 0;
+    // The channel this programme is on, from Media[].channelIdentifier —
+    // the same value tuneLiveTVChannel() resolves. An EPG programme's
+    // ratingKey is not a library key, so /library/metadata 404s on it:
+    // anything carrying this must be tuned, never played.
+    std::string liveChannelKey;
+    std::string liveChannelTitle;
+    // Set for anything that came from the EPG provider. Not every live
+    // result has a channel — the provider's search returns series too —
+    // but none of them have a library ratingKey, so this is what decides
+    // whether an item may be opened as library content.
+    bool isLiveTV = false;
+
+    // For seasons/albums
+    int leafCount = 0;
+    int viewedLeafCount = 0;
+
+    // Album subtype (album, single, ep, compilation, soundtrack, live, etc.)
+    std::string subtype;
+
+    // Stream info
+    std::string streamUrl;
+    std::string videoCodec;
+    std::string audioCodec;
+    int videoWidth = 0;
+    int videoHeight = 0;
+
+    // For downloads - media part path on server
+    std::string partPath;
+    int64_t partSize = 0;
+
+    // Markers (intro/credits) - times in milliseconds
+    struct Marker {
+        std::string type;   // "intro" or "credits"
+        int startTimeMs = 0;
+        int endTimeMs = 0;
+    };
+    std::vector<Marker> markers;
+
+    // Cast & crew — populated by fetchMediaDetails for the detail view only
+    // (left empty for grid/list items; cleared by trimForGrid).
+    struct Person {
+        std::string tag;     // person's name
+        std::string role;    // character (actors) or job ("Director" / "Writer")
+        std::string thumb;   // headshot url / path
+        std::string filter;  // library-section filter, e.g. "actor=12345"
+    };
+    std::vector<Person> cast;
+
+    // Trim heavy fields not needed for grid/list display. Call this on items stored in bulk lists to reduce memory.
+    void trimForGrid() {
+        // Keep first 60 chars of summary (only used in focus tooltip)
+        if (summary.length() > 60) {
+            summary = summary.substr(0, 57) + "...";
+        }
+        // Art is only used for detail view backgrounds
+        art.clear();
+        art.shrink_to_fit();
+        // Stream info not needed for grid cells
+        streamUrl.clear();
+        streamUrl.shrink_to_fit();
+        videoCodec.clear();
+        videoCodec.shrink_to_fit();
+        audioCodec.clear();
+        audioCodec.shrink_to_fit();
+        // Part info not needed for grid
+        partPath.clear();
+        partPath.shrink_to_fit();
+        // Markers not needed for grid
+        markers.clear();
+        markers.shrink_to_fit();
+        // Cast/crew only used by the detail view
+        cast.clear();
+        cast.shrink_to_fit();
+    }
+};
+
+// Library section info
+struct LibrarySection {
+    std::string key;
+    std::string title;
+    std::string type;
+    std::string art;
+    std::string thumb;
+    int count = 0;
+};
+
+// Server connection info
+struct ServerConnection {
+    std::string uri;
+    bool local = false;
+    bool relay = false;
+};
+
+// Plex server info
+struct PlexServer {
+    std::string name;
+    std::string address;  // Primary address (local preferred)
+    int port = 32400;
+    std::string machineIdentifier;
+    std::string accessToken;
+    std::vector<ServerConnection> connections;  // All available connections
+    // Plex resource metadata — owned reflects whether this Plex account
+    // owns the server (vs. it being shared in via Plex Home / friends);
+    // sourceTitle is the owner's display name on shared servers
+    // ("Shared by Dad"); version is the productVersion string. All
+    // three are parsed from /api/v2/resources at fetchServers time.
+    bool owned = false;
+    std::string sourceTitle;
+    std::string version;
+};
+
+// PIN authentication info
+struct PinAuth {
+    int id = 0;
+    std::string code;
+    std::string authToken;
+    bool expired = false;
+    int expiresIn = 0;
+    bool useJwt = false;  // Whether this PIN uses JWT authentication
+    // True when the last request to plex.tv got no HTTP response at all (DNS,
+    // timeout, no route). Distinct from "the code is not confirmed yet", which
+    // is also a false return — without it the login screen cannot tell a link
+    // that is simply still pending from one it can no longer poll.
+    bool offline = false;
+};
+
+// Plex Home managed user. plex.tv/api/v2/home/users returns the list
+// of users sharing one Plex Home — owner + family members. Each has a
+// uuid (used to /switch) and an optional 4-digit PIN.
+struct HomeUser {
+    std::string uuid;        // For POST /home/users/{uuid}/switch
+    std::string id;          // Plex numeric account ID
+    std::string title;       // Display name shown in the picker
+    std::string username;    // Account username if present (managed users may not have one)
+    std::string thumb;       // Avatar URL
+    bool hasPin = false;     // True when "protected" / "restricted" in the API
+    bool admin  = false;     // True for the Home owner
+};
+
+// Hub (for home screen)
+struct Hub {
+    std::string title;
+    std::string type;
+    std::string hubIdentifier;
+    std::string key;
+    std::vector<MediaItem> items;
+    bool more = false;
+};
+
+// A single EPG program entry
+struct ChannelProgram {
+    std::string title;
+    std::string summary;
+    int64_t startTime = 0;
+    int64_t endTime = 0;
+    std::string ratingKey;   // EPG rating key (e.g., "plex://episode/...")
+    std::string metadataKey; // EPG metadata path (e.g., "/tv.plex.providers.epg.cloud:40/metadata/...")
+    std::string thumb;       // Show/episode artwork URL (gracenote, etc.) — used by the
+                             // Live TV hero so it can show the show's poster instead of the channel's station logo.
+};
+
+// DVR ChannelMapping entry (from official /livetv/dvrs API)
+struct ChannelMapping {
+    std::string channelKey;         // EPG channel key (e.g., "5cc83d73af4a72001e9b16d7-...")
+    std::string deviceIdentifier;   // Device channel number (e.g., "48.1") - used for tuning
+    std::string lineupIdentifier;   // Lineup channel identifier (e.g., "002")
+};
+
+// Live TV Channel
+struct LiveTVChannel {
+    std::string ratingKey;
+    std::string key;                    // EPG channel key
+    std::string title;
+    std::string thumb;
+    std::string callSign;
+    int channelNumber = 0;
+    std::string channelIdentifier;      // Device channel ID for DVR tuning (e.g., "2.1")
+    std::string currentProgram;
+    std::string nextProgram;
+    int64_t programStart = 0;
+    int64_t programEnd = 0;
+    std::vector<ChannelProgram> programs;  // All programs in EPG window, sorted by start time
+};
+
+// A Live TV discovery rail advertised by the server, rather than one we
+// synthesise client-side. Two sources, both documented in openapi.json:
+//   * /{epgProviderKey}/watchnow  — "All Channels", "Movies on Now",
+//     "Shows on Now", "Sports on Now"
+//   * the EPG provider's own hubKey (found via /media/providers) — the
+//     provider's discovery hubs, which is where "Recent Channels" and its
+//     per-channel resume progress come from
+// `key` is a ready-to-fetch path; the section ids inside it differ per
+// server, so it must be used as given and never reconstructed.
+struct LiveTVHub {
+    std::string title;
+    std::string key;
+    std::string type;   // "mixed", "movie", "episode", …
+};
+
+// Genre/Category item with key for filtering
+struct GenreItem {
+    std::string title;      // Display name
+    std::string key;        // Filter key (ID) for API calls
+    std::string fastKey;    // Fast filter URL path
+};
+
+// Playlist info (from Plex API)
+struct Playlist {
+    std::string ratingKey;      // Playlist ID
+    std::string key;            // Items endpoint (e.g., /playlists/{id}/items)
+    std::string title;
+    std::string summary;
+    std::string thumb;
+    std::string composite;      // Composite thumbnail
+    std::string playlistType;   // "audio", "video", "photo"
+    bool smart = false;         // Smart playlist vs. dumb playlist
+    int leafCount = 0;          // Number of items
+    int duration = 0;           // Total duration in ms
+    int64_t addedAt = 0;
+    int64_t updatedAt = 0;
+};
+
+// Playlist item (track with playlist-specific info)
+struct PlaylistItem {
+    std::string playlistItemId;  // Used for remove/move operations
+    MediaItem media;             // The actual media item (track)
+};
+
+// Stream info from Plex metadata (audio/video/subtitle streams within a Part)
+// One line of a track's lyrics. timeMs is -1 for an unsynced file (a plain .txt
+// stream), in which case the lines are still in order but carry no timing.
+// One word — or syllable — of a line, with the moment it is sung.
+//
+// Syllable is not a figure of speech: files stamp inside a word, writing
+// "<00:09.93>Tum<00:10.18>ble" so the highlight can cross it as it is sung.
+// The two halves must still render as "Tumble", so each piece records whether
+// a space actually separated it from the next. Defaults to true, which is the
+// plain word-per-stamp case.
+struct LyricWord {
+    int timeMs = -1;
+    std::string text;
+    bool spaceAfter = true;
+};
+
+struct LyricLine {
+    int timeMs = -1;
+    std::string text;
+    // Filled only when the source carries per-word timing: Enhanced LRC's
+    // angle-bracket tags, or a Plex document whose Spans are stamped. `text`
+    // is always the whole line either way, so anything that only wants to
+    // read or show the line never has to know which kind it got.
+    std::vector<LyricWord> words;
+};
+
+struct PlexStream {
+    int id = 0;              // Stream ID (for Plex API stream selection)
+    int streamType = 0;      // 1=video, 2=audio, 3=subtitle
+    std::string codec;       // e.g., "h264", "aac", "srt"
+    std::string displayTitle; // Human-readable title (e.g., "English (AAC Stereo)")
+    std::string language;     // Language name (e.g., "English")
+    std::string languageCode; // Language code (e.g., "eng")
+    bool selected = false;    // Currently selected stream
+    int channels = 0;         // Audio channels
+    std::string title;        // Track title if any
+    bool forced = false;          // Forced subtitle (signs/songs)
+    bool hearingImpaired = false; // SDH / hearing-impaired subtitle
+    bool external = false;        // Sidecar subtitle (has a key) vs embedded
+    // Server path to fetch the stream itself, for the ones that are a separate
+    // file rather than muxed in — sidecar subtitles and track lyrics. Empty for
+    // embedded streams, which is also what `external` is derived from.
+    std::string key;
+    // The stream object exactly as the server sent it. The parser keeps a
+    // handful of fields, and for lyrics the one that addresses the file is not
+    // among them — this is kept so it can be shown rather than guessed at.
+    std::string rawJson;
+};
+
+/**
+ * Plex API Client singleton
+ */
+class PlexClient {
+public:
+    static PlexClient& getInstance();
+
+    // Authentication
+    bool login(const std::string& username, const std::string& password);
+    bool requestPin(PinAuth& pinAuth);
+    bool checkPin(PinAuth& pinAuth);
+    bool refreshToken();  // JWT token refresh (call before 7-day expiry)
+    // `offline`, when given, reports that plex.tv gave no HTTP response at all
+    // (DNS, timeout, no route) as opposed to answering with an empty list.
+    // Both come back as a failure here, but they mean opposite things to the
+    // user: one is a broken connection, the other an account with no server.
+    bool fetchServers(std::vector<PlexServer>& servers, bool* offline = nullptr);
+    bool connectToServer(const std::string& url);
+    bool connectToServer(const std::string& url, int timeoutSeconds);
+    void logout();
+
+    // Plex Home / managed users
+    // fetchHomeUsers needs the *account-level* (master) token because the
+    // per-user token returned by /switch can't list siblings. Pass the
+    // master token explicitly so the caller stays in control of which
+    // token is in flight.
+    bool fetchHomeUsers(const std::string& masterToken,
+                        std::vector<HomeUser>& users);
+    // POST /api/v2/home/users/{uuid}/switch . pin is optional; pass empty
+    // string for unprotected users. On success outToken holds the per-user
+    // plex.tv *account* token. NOTE: this is NOT a valid media-server token
+    // for a managed/shared user — pass it to useHomeUserTokens() to resolve
+    // the per-server access token before making any server requests.
+    bool switchHomeUser(const std::string& masterToken,
+                        const std::string& userUuid,
+                        const std::string& pin,
+                        std::string& outToken);
+    // Adopt the tokens for a just-switched Plex Home user. `accountToken` is
+    // the plex.tv token from switchHomeUser; the media server rejects it for a
+    // managed/shared user (401, authenticates as "guest"). This fetches that
+    // user's /api/v2/resources, finds the currently-connected server by machine
+    // id, and adopts its per-user access token for all server requests — only
+    // that token is registered with the server. Falls back to `accountToken`
+    // (the owner / own-server case, where the two are the same).
+    void useHomeUserTokens(const std::string& accountToken);
+
+    // Library operations
+    bool fetchLibrarySections(std::vector<LibrarySection>& sections);
+    // extraParams: optional pre-encoded query fragment appended verbatim, each
+    // token starting with '&' (e.g. "&sort=titleSort:asc&unwatched=1"). Lets the
+    // library grid thread Plex sort/filter params through without a wide
+    // positional signature.
+    bool fetchLibraryContent(const std::string& sectionKey, std::vector<MediaItem>& items, int metadataType = 0, int limit = 0, int offset = 0, int* totalCount = nullptr, const std::string& extraParams = "");
+    bool fetchSectionRecentlyAdded(const std::string& sectionKey, std::vector<MediaItem>& items);
+    bool fetchChildren(const std::string& ratingKey, std::vector<MediaItem>& items);
+    bool fetchMediaDetails(const std::string& ratingKey, MediaItem& item);
+
+    // Music artist hubs (albums grouped by type: Albums, Singles, EPs, etc.)
+    bool fetchArtistHubs(const std::string& ratingKey, std::vector<Hub>& hubs);
+
+    // Fetch an artist's albums matching a Plex release-type filter, the way the
+    // official client splits releases. `filter` is a single field=value token,
+    // e.g. "album.format=Single" / "album.format=EP" (MusicBrainz primary types)
+    // or "album.subformat=Compilation" / "album.subformat=Live" (secondary
+    // types). One value per call — Plex's comma/IN form is unreliable. Pass an
+    // EMPTY filter to get every release type the artist owns (regular albums plus
+    // all typed releases) in a single query. Needs the artist's library section
+    // id and numeric id (the artist ratingKey).
+    bool fetchArtistAlbumsByFilter(const std::string& sectionKey,
+                                   const std::string& artistRatingKey,
+                                   const std::string& filter,
+                                   std::vector<MediaItem>& items);
+
+    // Extras (trailers, deleted scenes, featurettes, etc.)
+    bool fetchExtras(const std::string& ratingKey, std::vector<MediaItem>& items);
+    // Related / recommended items — the server's "Related" hubs, flattened
+    // into a single de-duplicated list of playable movies/shows.
+    bool fetchRelated(const std::string& ratingKey, std::vector<MediaItem>& items);
+    // All titles in a library section matching a person filter (e.g.
+    // "actor=12345") — used to browse a cast member's other titles.
+    bool fetchByPersonFilter(const std::string& sectionKey, const std::string& filter,
+                             std::vector<MediaItem>& items);
+
+    // Home screen
+    bool fetchHubs(std::vector<Hub>& hubs);
+    bool fetchContinueWatching(std::vector<MediaItem>& items);
+    bool fetchRecentlyAdded(std::vector<MediaItem>& items);
+    bool fetchRecentlyAddedByType(MediaType type, std::vector<MediaItem>& items);
+
+    // Search
+    bool search(const std::string& query, std::vector<MediaItem>& results);
+
+    // Collections, Genres
+    bool fetchCollections(const std::string& sectionKey, std::vector<MediaItem>& collections);
+    bool fetchGenres(const std::string& sectionKey, std::vector<std::string>& genres);
+    bool fetchGenreItems(const std::string& sectionKey, std::vector<GenreItem>& genres);
+    // Generic filter-choice fetch: returns the available values for any Plex
+    // library filter field (genre, year, decade, contentRating, resolution,
+    // studio, country, …) as title/key pairs. Each key feeds the matching
+    // ?{field}={key} query. fetchGenreItems is just this with field="genre".
+    bool fetchFilterValues(const std::string& sectionKey, const std::string& field, std::vector<GenreItem>& values);
+    bool fetchByGenre(const std::string& sectionKey, const std::string& genre, std::vector<MediaItem>& items, int metadataType = 0);
+    bool fetchByGenreKey(const std::string& sectionKey, const std::string& genreKey, std::vector<MediaItem>& items, int metadataType = 0);
+
+    // Playlists (using official Plex API from developer.plex.tv)
+    bool fetchPlaylists(std::vector<MediaItem>& playlists);  // Legacy - returns as MediaItem
+    bool fetchMusicPlaylists(std::vector<Playlist>& playlists);  // Get audio playlists
+    bool fetchPlaylistItems(const std::string& playlistId, std::vector<PlaylistItem>& items);
+    bool createPlaylist(const std::string& title, const std::string& playlistType, Playlist& result);
+    bool createPlaylistWithItems(const std::string& title, const std::vector<std::string>& ratingKeys, Playlist& result);
+    bool deletePlaylist(const std::string& playlistId);
+    bool renamePlaylist(const std::string& playlistId, const std::string& newTitle);
+    bool addToPlaylist(const std::string& playlistId, const std::vector<std::string>& ratingKeys);
+    bool removeFromPlaylist(const std::string& playlistId, const std::string& playlistItemId);
+    bool clearPlaylist(const std::string& playlistId);
+    bool movePlaylistItem(const std::string& playlistId, const std::string& playlistItemId, const std::string& afterItemId);
+
+    // Get machine identifier for playlist URIs
+    const std::string& getMachineIdentifier() const { return m_currentServer.machineIdentifier; }
+
+    // Playback
+    bool getPlaybackUrl(const std::string& ratingKey, std::string& url);
+    bool getTranscodeUrl(const std::string& ratingKey, std::string& url, int offsetMs = 0);
+    // Same, but for a track we are only *speculatively* resolving (the next one
+    // in the music queue, fetched while the current one still plays). It costs
+    // two blocking round-trips — /library/metadata then /decision — which is why
+    // it is worth doing off the play path. outSessionId hands back the session it
+    // negotiated instead of storing it in m_lastSessionId: a background resolve
+    // must not overwrite the session belonging to the track that is playing.
+    // Call adoptTranscodeSession() when the URL is actually handed to the player.
+    bool getTranscodeUrlSpeculative(const std::string& ratingKey, std::string& url,
+                                    std::string& outSessionId);
+    // Make a speculatively-resolved session the current one (see above).
+    void adoptTranscodeSession(const std::string& sessionId) { m_lastSessionId = sessionId; }
+    void stopTranscode();  // Stop the current transcode session
+    bool updatePlayProgress(const std::string& ratingKey, int timeMs);
+    bool reportTimeline(const std::string& ratingKey, const std::string& key,
+                        const std::string& state, int timeMs, int durationMs,
+                        int playQueueItemID = 0);
+    // Keep-alive ping for a live-TV rolling subscription. The server's grab
+    // has a hard 300-second stop-timer; each /:/timeline call with
+    // key=/livetv/sessions/{uuid} resets it. The official Plex app fires one
+    // every ~1 sec while playing; we ping less often (every 5 sec) which is
+    // still well inside the timer's window.
+    bool reportLiveTimeline(const std::string& liveSessionUuid, int playbackTimeMs,
+                            const std::string& state = "playing");
+    bool markAsWatched(const std::string& ratingKey);
+    bool markAsUnwatched(const std::string& ratingKey);
+
+    // Set the user rating (Plex's 0-10 scale; 0 clears it). Used by the Android
+    // media session's "like this track", which is the only place the app rates
+    // anything today.
+    bool rateItem(const std::string& ratingKey, float rating);
+
+    // Stream selection (Plex API: PUT /library/parts/{partId})
+    bool fetchStreams(const std::string& ratingKey, std::vector<PlexStream>& streams, int& partId);
+
+    /**
+     * Download and parse a lyrics stream (PlexStream::key, e.g.
+     * "/library/streams/39070").
+     *
+     * The app renders lyrics itself rather than handing the URL to mpv: music
+     * plays with vo=null and no render context, so mpv has no surface to draw
+     * a subtitle on and the load silently does nothing.
+     *
+     * Handles LRC ("[mm:ss.xx]text", possibly several stamps per line) and
+     * plain text, which comes back as ordered lines with no timing.
+     *
+     * Two documented routes, tried in order:
+     *
+     *  1. GET /library/streams/{streamId}.{ext} — the sidecar file. `codec`
+     *     supplies the extension, which is a required path segment; the key the
+     *     stream object hands out carries none. Some servers answer 200 with an
+     *     empty body here, which is why there is a second route.
+     *  2. GET /music/:/transcode/universal/subtitles — the transcoder. Lyrics
+     *     are a subtitle stream of a music transcode, which is why servers
+     *     advertise transcoderLyrics separately from transcoderSubtitles. The
+     *     stream has to be selected on the part first, and the transcoder may
+     *     hand back SRT rather than the original LRC.
+     *
+     * `status` carries a human-readable reason when both fail, for the UI.
+     */
+    bool fetchLyrics(const std::string& ratingKey, const PlexStream& stream, int partId,
+                     std::vector<LyricLine>& lines, std::string& status);
+    bool setStreamSelection(int partId, int audioStreamID = -1, int subtitleStreamID = -1);
+
+    // Subtitle search (Plex API: GET /library/metadata/{id}/subtitles)
+    struct SubtitleResult {
+        int id = 0;
+        std::string key;          // URL key to select this subtitle
+        std::string codec;        // e.g., "srt"
+        std::string displayTitle; // Human-readable title
+        std::string language;     // Language name
+        std::string languageCode; // Language code (e.g., "eng")
+        std::string provider;     // e.g., "opensubtitles"
+        int score = 0;            // Provider match score (0-100)
+        bool hearingImpaired = false; // SDH
+        bool forced = false;          // Forced (signs/songs)
+    };
+    bool searchSubtitles(const std::string& ratingKey, const std::string& language,
+                         std::vector<SubtitleResult>& results);
+    bool selectSearchedSubtitle(const std::string& ratingKey, int partId,
+                                const std::string& subtitleKey);
+
+    // Play Queues (server-side queue management for music + video)
+    struct PlayQueueItem {
+        int playQueueItemID = 0;       // Unique ID within the queue (for move/delete)
+        std::string ratingKey;
+        std::string title;
+        std::string grandparentTitle;  // Artist/show name
+        std::string parentTitle;       // Album/season name
+        std::string thumb;
+        std::string parentThumb;
+        std::string grandparentThumb;
+        int duration = 0;              // Duration in ms
+        int index = 0;                 // Track/episode number
+        std::string type;              // "track", "episode", "movie", etc.
+        MediaType mediaType = MediaType::UNKNOWN;
+        float userRating = 0.0f;       // viewer's own 0-10 rating, 0 when unrated
+    };
+
+    struct PlayQueueContainer {
+        int playQueueID = 0;
+        int playQueueSelectedItemID = 0;
+        int playQueueSelectedItemOffset = 0;
+        int playQueueSelectedMetadataItemID = 0;
+        bool playQueueShuffled = false;
+        std::string playQueueSourceURI;
+        int playQueueTotalCount = 0;
+        int playQueueVersion = 0;
+        std::vector<PlayQueueItem> items;
+    };
+
+    // Create a play queue from a library URI (album, show, season, playlist, single item)
+    // type: "audio", "video", "photo"
+    // key: ratingKey of the item to start playing (optional, defaults to first)
+    // shuffle/repeat/continuous: 0 or 1
+    bool createPlayQueue(const std::string& uri, const std::string& type,
+                         PlayQueueContainer& result,
+                         const std::string& key = "",
+                         int shuffle = 0, int repeat = 0, int continuous = 0);
+    // Create a play queue from a playlist ID. This is the documented source for
+    // a playlist — POST /playQueues takes "either a URI, or a playlist", and
+    // playlistID is the playlist half. `key` is the ratingKey to open on, which
+    // the spec calls "the key of the first item to play".
+    bool createPlayQueueFromPlaylist(int playlistID, const std::string& type,
+                                     PlayQueueContainer& result, int shuffle = 0,
+                                     const std::string& key = "");
+    // Retrieve an existing play queue
+    bool getPlayQueue(int playQueueID, PlayQueueContainer& result);
+    // Add items to an existing play queue (party mode / play next)
+    bool addToPlayQueue(int playQueueID, const std::string& uri, bool playNext = false);
+    // Clear all items from a play queue
+    bool clearPlayQueue(int playQueueID);
+    // Remove a single item from a play queue
+    bool removeFromPlayQueue(int playQueueID, int playQueueItemID);
+    // Move an item in the play queue (after=0 means move to beginning)
+    bool movePlayQueueItem(int playQueueID, int playQueueItemID, int afterItemID = 0);
+    // Shuffle the play queue
+    bool shufflePlayQueue(int playQueueID, PlayQueueContainer& result);
+    // Unshuffle (restore natural order)
+    bool unshufflePlayQueue(int playQueueID, PlayQueueContainer& result);
+
+    // Helper: build a library URI for play queue creation
+    // e.g., "library://{machineId}/item/%2Flibrary%2Fmetadata%2F{ratingKey}"
+    std::string buildPlayQueueURI(const std::string& ratingKey);
+    // Build a library URI for a directory (album, season, show)
+    // e.g., "library://{machineId}/directory/%2Flibrary%2Fmetadata%2F{ratingKey}%2Fchildren"
+    std::string buildPlayQueueDirectoryURI(const std::string& ratingKey);
+
+    // Live TV
+    bool fetchLiveTVChannels(std::vector<LiveTVChannel>& channels);
+    bool fetchEPGGrid(std::vector<LiveTVChannel>& channelsWithPrograms, int hoursAhead = 4);
+
+    // Live TV discovery rails served by the provider (see LiveTVHub).
+    // watchNow covers the "… on Now" family; providerHubs covers the DVR
+    // provider's own hubs, including "Recent Channels". Both return false
+    // when the server doesn't advertise them, so callers can fall back.
+    bool fetchLiveTVWatchNowHubs(std::vector<LiveTVHub>& hubs);
+    bool fetchLiveTVProviderHubs(std::vector<LiveTVHub>& hubs);
+    // Every Live TV rail Home shows, from one /{epgProviderKey}/hubs/discover
+    // request — that response carries all three with their items inline.
+    // recentChannels comes back as channels so the existing rail cells and
+    // tuneChannel() work unchanged. Returns false when the provider serves
+    // none of them.
+    struct LiveTVHomeRails {
+        std::vector<LiveTVChannel> recentChannels;
+        std::vector<MediaItem>     showsOnNow;
+        std::vector<MediaItem>     moviesOnNow;
+        std::vector<MediaItem>     sportsOnNow;
+    };
+    bool fetchLiveTVHomeRails(LiveTVHomeRails& rails);
+    // Search the EPG provider. /media/providers advertises this as a
+    // second feature of type "search", separate from the server's
+    // /hubs/search, so library results never include Live TV. Returns
+    // false when nothing has established the provider key yet -- search
+    // runs per keystroke and must not trigger the DVR probe itself.
+    bool searchLiveTV(const std::string& query, std::vector<MediaItem>& results);
+    // Fetch one rail's contents. `key` comes from a LiveTVHub verbatim.
+    bool fetchLiveTVHubItems(const std::string& key, std::vector<MediaItem>& items);
+    bool tuneLiveTVChannel(const std::string& channelKey, std::string& streamUrl,
+                           std::string& liveSessionUuid,
+                           const std::string& programMetadataKey = "");
+    bool hasLiveTV() const { return m_hasLiveTV; }
+    // Blocking availability probe for worker threads: runs the (cached)
+    // /livetv/dvrs check if it hasn't happened yet and returns the result.
+    // Connect no longer probes eagerly, so callers that need a definitive
+    // answer (e.g. the sidebar's Live TV tab) call this off the UI thread.
+    bool probeLiveTV();
+
+    // Build a playable HLS URL for a live tune session by routing it through
+    // the transcode/universal pipeline (the raw HDHomeRun feed is mpeg2video
+    // and must be transcoded to h264).  liveSessionId is the Media uuid from
+    // the tune response; the resulting start.m3u8 URL is played like any other
+    // transcoded video.
+    bool buildLiveSessionStreamUrl(const std::string& liveSessionId, std::string& url);
+    std::string getEpgProviderKey() const { return m_epgProviderKey; }
+
+    // Thumbnail URL
+    std::string getThumbnailUrl(const std::string& thumb, int width = 300, int height = 450);
+
+    // Re-authentication: check token validity with plex.tv
+    bool validateToken();
+
+    // Handle 401/unauthorized - clears auth state and triggers login redirect
+    void handleUnauthorized();
+
+    // Configuration
+    void setAuthToken(const std::string& token) { m_authToken = token; }
+    const std::string& getAuthToken() const { return m_authToken; }
+    void setServerUrl(const std::string& url) { m_serverUrl = url; }
+    const std::string& getServerUrl() const { return m_serverUrl; }
+
+    // Public JSON helpers (used by play queue parsing helper)
+    std::string extractJsonValuePublic(const std::string& json, const std::string& key) { return extractJsonValue(json, key); }
+    int extractJsonIntPublic(const std::string& json, const std::string& key) { return extractJsonInt(json, key); }
+
+    // Public API URL builder (used by Live TV tab for DVR operations)
+    std::string buildApiUrlPublic(const std::string& endpoint) { return buildApiUrl(endpoint); }
+    // Same, for the play-queue parser: it lives outside the class and needs the
+    // "track"/"episode"/"movie" string turned into a MediaType.
+    MediaType parseMediaTypePublic(const std::string& typeStr) { return parseMediaType(typeStr); }
+
+private:
+    PlexClient() = default;
+    ~PlexClient() = default;
+
+    std::string buildApiUrl(const std::string& endpoint);
+    MediaType parseMediaType(const std::string& typeStr);
+    // One Metadata entry of a Live TV hub -> MediaItem. Shared by the
+    // inline hubs of /hubs/discover and the standalone hub fetch.
+    MediaItem parseLiveTVHubItem(std::string_view obj);
+    std::string extractJsonValue(const std::string& json, const std::string& key);
+    int extractJsonInt(const std::string& json, const std::string& key);
+    float extractJsonFloat(const std::string& json, const std::string& key);
+    bool extractJsonBool(const std::string& json, const std::string& key);
+
+    // In-place extraction: works on a range [start, end) of a string without creating a substring.
+    // Saves CPU and memory for large JSON responses.
+    std::string extractJsonValueRange(const std::string& json, size_t start, size_t end, const std::string& key);
+    int extractJsonIntRange(const std::string& json, size_t start, size_t end, const std::string& key);
+    float extractJsonFloatRange(const std::string& json, size_t start, size_t end, const std::string& key);
+    std::string base64Encode(const std::string& input);
+    int extractXmlAttr(const std::string& xml, const std::string& attr);
+    std::string extractXmlAttrStr(const std::string& xml, const std::string& attr);
+    void checkLiveTVAvailability();
+
+    // Returns true if status code is an auth error (401)
+    bool isAuthError(int statusCode) const { return statusCode == 401; }
+
+    // Track whether we already triggered reauth to avoid loops
+    bool m_reauthTriggered = false;
+
+    std::string m_authToken;
+    std::string m_serverUrl;
+    std::string m_lastSessionId;  // Last transcode session ID for stop/restart
+    // Session ids used to be the wall-clock second alone, so two resolves inside
+    // the same second produced the same id — which now actually happens, because
+    // the next track is resolved while the current one is still playing. This
+    // makes them distinct.
+    unsigned m_sessionSeq = 0;
+    // Shared implementation behind getTranscodeUrl / getTranscodeUrlSpeculative.
+    // Hands the negotiated session back rather than storing it, so the caller
+    // decides whether it becomes the current one.
+    bool resolveTranscodeUrl(const std::string& ratingKey, std::string& url,
+                             int offsetMs, std::string& outSessionId);
+    // Live-TV bookkeeping for the rolling subscription keep-alive. Both are
+    // pulled out of the tune response and consumed by reportLiveTimeline so
+    // the /:/timeline ping uses the same ratingKey the server's parser is
+    // expecting (a stock ratingKey=0 makes it 404 and the keep-alive fails).
+    std::string m_lastLiveRatingKey;
+    PlexServer m_currentServer;
+    bool m_hasLiveTV = false;
+    std::string m_dvrId;  // DVR ID (key) from GET /livetv/dvrs
+    std::vector<std::string> m_deviceIds;  // Device UUIDs from DVR (e.g., "device://tv.plex.grabbers.hdhomerun/...")
+    std::string m_lineupUri;  // Lineup URI from DVR (e.g., "lineup://tv.plex.providers.epg.onconnect/...")
+    std::vector<ChannelMapping> m_channelMappings;  // Channel mappings from DVR response
+    std::string m_epgProviderKey;  // EPG provider key for grid queries (extracted from lineup URI)
+};
+
+} // namespace vitaplex
