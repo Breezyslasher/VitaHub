@@ -13,13 +13,13 @@
 #include <string>
 #include <vector>
 
-namespace vitaplex {
 #include <borealis/core/logger.hpp>
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
+namespace vitaplex {
 static AAssetManager* getAssetManager() {
     JNIEnv* env = static_cast<JNIEnv*>(SDL_AndroidGetJNIEnv());
     jobject activity = static_cast<jobject>(SDL_AndroidGetActivity());

@@ -66,7 +66,7 @@ MODULES = {
             # file: regex of the first line to wrap from
             "include/platform/paths.hpp": r"^#if defined\(__vita__\)",
             "include/platform/android_assets.hpp": r"^#if defined\(__ANDROID__\)",
-            "src/platform/android_assets.cpp": r"^#include <borealis/core/logger.hpp>",
+            "src/platform/android_assets.cpp": r"^static AAssetManager\* getAssetManager\(\)",
         },
     },
     "abs": {
@@ -82,7 +82,7 @@ MODULES = {
         "wrap_headers": {
             "include/platform/paths.hpp": r"^// Legacy constant",
             "include/platform/android_assets.hpp": r"^#if defined\(__ANDROID__\)",
-            "src/platform/android_assets.cpp": r"^#include <borealis/core/logger.hpp>",
+            "src/platform/android_assets.cpp": r"^static AAssetManager\* getAssetManager\(\)",
         },
     },
     "suwayomi": {
@@ -97,7 +97,7 @@ MODULES = {
         "wrap_headers": {
             "include/platform/paths.hpp": r"^// Legacy constant",
             "include/platform/android_assets.hpp": r"^#if defined\(__ANDROID__\)",
-            "src/platform/android_assets.cpp": r"^#include <borealis/core/logger.hpp>",
+            "src/platform/android_assets.cpp": r"^static AAssetManager\* getAssetManager\(\)",
             "include/utils/button_icons.hpp": r"^#if defined\(ANDROID\)",
         },
     },
@@ -389,7 +389,7 @@ def import_core(plex_repo, apply_patch=True):
         elif rel in ("include/platform/android_assets.hpp",):
             text = wrap_header(text, "vitaplex", r"^#if defined\(__ANDROID__\)")
         elif rel == "src/platform/android_assets.cpp":
-            text = wrap_header(text, "vitaplex", r"^#include <borealis/core/logger.hpp>")
+            text = wrap_header(text, "vitaplex", r"^static AAssetManager\* getAssetManager\(\)")
         if rel.endswith((".cpp", ".hpp", ".h", ".mm")) and "updater_" not in rel:
             text, _ = nest_global_namespaces(text, "vitaplex", GLOBAL_NAMESPACES)
         text = rename_for_core(text)
