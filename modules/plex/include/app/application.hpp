@@ -286,6 +286,10 @@ public:
     // Initialize and run the application
     bool init();
     void run();
+    // Startup without the main loop (restore session, push the first
+    // activity). run() = start() + main loop; VitaHub calls start() and
+    // owns the loop itself.
+    void start();
     void shutdown();
 
     // Navigation

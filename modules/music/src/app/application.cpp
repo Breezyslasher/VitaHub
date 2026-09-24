@@ -78,7 +78,7 @@ bool Application::init() {
     return true;
 }
 
-void Application::run() {
+void Application::start() {
     brls::Logger::info("Application::run - isLoggedIn={}, serverUrl={}",
                        isLoggedIn(), m_serverUrl.empty() ? "(empty)" : m_serverUrl);
 
@@ -115,6 +115,10 @@ void Application::run() {
         // Show login screen
         pushLoginActivity();
     }
+}
+
+void Application::run() {
+    start();
 
     // Main loop handled by Borealis
     while (brls::Application::mainLoop()) {

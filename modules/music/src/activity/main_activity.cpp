@@ -3,6 +3,10 @@
  */
 
 #include "activity/main_activity.hpp"
+
+#ifdef VITAHUB
+#include "vitahub/bridge.hpp"
+#endif
 #include "view/home_tab.hpp"
 #include "view/library_tab.hpp"
 #include "view/search_tab.hpp"
@@ -138,6 +142,9 @@ void MainActivity::buildSidebar(bool hasPodcasts, bool hasAudiobooks, bool hasRa
         tabFrame->addTab("Debug", []() { return new DebugTab(); });
     }
     tabFrame->addTab("Settings", []() { return new SettingsTab(); });
+#ifdef VITAHUB
+    tabFrame->addTab("VitaHub", []() { return vitahub::createServicesTab("music"); });
+#endif
 
     tabFrame->focusTab(0);
 

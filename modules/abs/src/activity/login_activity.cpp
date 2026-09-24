@@ -4,6 +4,10 @@
  */
 
 #include "activity/login_activity.hpp"
+
+#ifdef VITAHUB
+#include "vitahub/bridge.hpp"
+#endif
 #include "app/application.hpp"
 #include "app/audiobookshelf_client.hpp"
 #include "view/progress_dialog.hpp"
@@ -298,10 +302,18 @@ void LoginActivity::onContentAvailable() {
 
     // Circle quits the app rather than popping to nothing — this is the
     // root activity when signed out.
+#ifdef VITAHUB
+    // Inside VitaHub, Circle leaves the service instead of the whole hub.
+    this->registerAction("VitaHub", brls::ControllerButton::BUTTON_B, [](brls::View*) {
+        vitahub::returnToHub();
+        return true;
+    });
+#else
     this->registerAction("Quit", brls::ControllerButton::BUTTON_B, [](brls::View*) {
         brls::Application::quit();
         return true;
     });
+#endif
 
     // Land on the first thing the user still has to do.
     bool complete = !m_serverUrl.empty() && !m_password.empty() &&

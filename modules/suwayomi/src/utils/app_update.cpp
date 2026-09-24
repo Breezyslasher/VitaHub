@@ -2118,6 +2118,12 @@ void setSelfPath(const char* argv0) {
 }
 
 void checkForUpdates(bool manual) {
+#ifdef VITAHUB
+    // Inside VitaHub this service updates with the hub. The standalone app's
+    // updater would download and install the separate app instead.
+    if (manual) brls::Application::notify("This service updates with VitaHub");
+    return;
+#endif
     bool expected = false;
     if (!s_busy.compare_exchange_strong(expected, true)) {
         if (manual) brls::Application::notify("An update check is already running");

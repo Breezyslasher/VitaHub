@@ -3,6 +3,10 @@
  */
 
 #include "activity/main_activity.hpp"
+
+#ifdef VITAHUB
+#include "vitahub/bridge.hpp"
+#endif
 #include "utils/app_update.hpp"
 #include "view/home_tab.hpp"
 #include "view/library_section_tab.hpp"
@@ -429,6 +433,9 @@ void MainActivity::buildSidebarTabs() {
         tabFrame->addTab("Downloads", []() { return new DownloadsTab(); });
         tabFrame->addSeparator();
         tabFrame->addTab("Settings", []() { return new SettingsTab(); });
+#ifdef VITAHUB
+        tabFrame->addTab("VitaHub", []() { return vitahub::createServicesTab("plex"); });
+#endif
         return;
     }
 
@@ -502,6 +509,9 @@ void MainActivity::buildSidebarTabs() {
     // Settings is always pinned to the bottom.
     tabFrame->addSeparator();
     tabFrame->addTab("Settings", []() { return new SettingsTab(); });
+#ifdef VITAHUB
+    tabFrame->addTab("VitaHub", []() { return vitahub::createServicesTab("plex"); });
+#endif
 
     // Hold any sidebar item to open the editor (touch equivalent of START), and
     // show a focus-only START hint so the shortcut is discoverable.

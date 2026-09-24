@@ -36,10 +36,12 @@
 // Reduced from 192 MB to 172 MB - leaves more room for GPU VRAM and system.
 // With optimized view recycling and image caching, the app uses significantly
 // less heap, so this headroom is no longer needed.
+#ifndef VITAHUB  // VitaHub sizes the heap once for every module (hub/src/main.cpp)
 extern "C" {
 int _newlib_heap_size_user = 172 * 1024 * 1024;          // 172 MB heap
 unsigned int sceUserMainThreadStackSize = 2 * 1024 * 1024; // 2 MB stack
 }
+#endif
 
 namespace {
 

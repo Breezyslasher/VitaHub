@@ -29,7 +29,19 @@
 #include <set>
 #include <map>
 
+#ifdef VITAHUB
+#include "vitahub/bridge.hpp"
+#endif
+
 namespace vitaplex {
+
+// Activities on the stack while MainActivity is on top: just MainActivity
+// standalone, plus the hub's own screen underneath inside VitaHub.
+#ifdef VITAHUB
+static const size_t kMainActivityStackSize = vitahub::hubStackDepth() + 1;
+#else
+static const size_t kMainActivityStackSize = 1;
+#endif
 
 // Format elapsed seconds as a human-readable string like "1m 23s" or "45s"
 static std::string formatElapsedTime(int totalSeconds) {
@@ -692,7 +704,7 @@ void DownloadsTab::startAutoRefresh() {
                 // inside its detail view. The detail view runs its own
                 // 1Hz refresh that auto-pops once the group is empty,
                 // so this throttle isn't blocking that cleanup.
-                if (brls::Application::getActivitiesStack().size() > 1) return;
+                if (brls::Application::getActivitiesStack().size() > kMainActivityStackSize) return;
                 refresh();
             });
         }

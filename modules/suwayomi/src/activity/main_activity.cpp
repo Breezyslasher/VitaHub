@@ -4,6 +4,10 @@
  */
 
 #include "activity/main_activity.hpp"
+
+#ifdef VITAHUB
+#include "vitahub/bridge.hpp"
+#endif
 #include "view/library_section_tab.hpp"
 #include "view/history_tab.hpp"
 #include "view/extensions_tab.hpp"
@@ -76,6 +80,9 @@ void MainActivity::onContentAvailable() {
         tabFrame->addTab("Settings", []() {
             return new SettingsTab();
         });
+#ifdef VITAHUB
+        tabFrame->addTab("VitaHub", []() { return vitahub::createServicesTab("suwayomi"); });
+#endif
 
         // If online, try to load categories for additional library tabs
         if (isOnline) {

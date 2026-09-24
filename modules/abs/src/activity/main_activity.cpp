@@ -3,6 +3,10 @@
  */
 
 #include "activity/main_activity.hpp"
+
+#ifdef VITAHUB
+#include "vitahub/bridge.hpp"
+#endif
 #include "view/home_tab.hpp"
 #include "view/library_section_tab.hpp"
 #include "view/search_tab.hpp"
@@ -118,6 +122,9 @@ void MainActivity::onContentAvailable() {
             }
 
             tabFrame->addTab("Settings", []() { return new SettingsTab(); });
+#ifdef VITAHUB
+            tabFrame->addTab("VitaHub", []() { return vitahub::createServicesTab("abs"); });
+#endif
 
             // Focus first content tab
             tabFrame->focusTab(0);
@@ -192,6 +199,9 @@ void MainActivity::onContentAvailable() {
         tabFrame->addTab("Search", []() { return new SearchTab(); });
         tabFrame->addTab("Downloads", []() { return new DownloadsTab(); });
         tabFrame->addTab("Settings", []() { return new SettingsTab(); });
+#ifdef VITAHUB
+        tabFrame->addTab("VitaHub", []() { return vitahub::createServicesTab("abs"); });
+#endif
 
         // Focus first tab
         tabFrame->focusTab(0);

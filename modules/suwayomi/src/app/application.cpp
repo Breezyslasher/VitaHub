@@ -152,7 +152,7 @@ bool Application::init() {
     return true;
 }
 
-void Application::run() {
+void Application::start() {
     brls::Logger::info("Application::run - isConnected={}, serverUrl={}",
                        isConnected(), m_serverUrl.empty() ? "(empty)" : m_serverUrl);
 
@@ -392,6 +392,10 @@ void Application::run() {
 
     // Sync perf overlay setting
     PerfOverlay::getInstance().setEnabled(m_settings.showPerfOverlay);
+}
+
+void Application::run() {
+    start();
 
     // Main loop handled by Borealis
     while (brls::Application::mainLoop()) {

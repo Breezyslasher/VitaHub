@@ -272,6 +272,11 @@ def import_module(name, src_repo, apply_patch=True):
                     f.write(text)
     print("[%s] imported, %d global namespace blocks nested into %s::" % (name, nested_total, ns))
 
+    # Upstream version (Settings > About, API user agents).
+    version = os.path.join(src_repo, "VERSION")
+    if os.path.exists(version):
+        shutil.copy2(version, os.path.join(dst, "VERSION"))
+
     # XML layouts -> resources/xml/<module>/
     xml_dst = os.path.join(ROOT, "resources", "xml", name)
     if os.path.isdir(xml_dst):
@@ -280,7 +285,10 @@ def import_module(name, src_repo, apply_patch=True):
 
     patch = os.path.join(ROOT, "tools", "patches", name + ".patch")
     if apply_patch and os.path.exists(patch) and os.path.getsize(patch) > 0:
-        subprocess.check_call(["git", "apply", "--3way", "--whitespace=nowarn", patch], cwd=ROOT)
+        # Plain apply first; --3way (needs the pre-patch files in git's index)
+        # only as the fallback for an upstream change near a hunk.
+        if subprocess.call(["git", "apply", "--whitespace=nowarn", patch], cwd=ROOT) != 0:
+            subprocess.check_call(["git", "apply", "--3way", "--whitespace=nowarn", patch], cwd=ROOT)
         print("[%s] applied %s" % (name, os.path.relpath(patch, ROOT)))
 
 
