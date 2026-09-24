@@ -268,6 +268,8 @@ target_link_libraries(${PROJECT_NAME}
     ass freetype fribidi png bz2 webp z zstd harfbuzz mp3lame)
 
 if(PLATFORM_PSV)
+    set(VITAHUB_HEAP_MB 172 CACHE STRING "newlib heap size in MB (Vita)")
+    target_compile_definitions(${PROJECT_NAME} PRIVATE VITAHUB_HEAP_MB=${VITAHUB_HEAP_MB})
     target_link_options(${PROJECT_NAME} PRIVATE
         "-Wl,--wrap=pthread_create"
         # See Vita_plex: keeps room at the end of segment 0 for vita-elf-create.

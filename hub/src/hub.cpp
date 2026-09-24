@@ -357,7 +357,15 @@ void openModule(Module* module) {
     // (inside open()) and paintModuleTheme() layers the unified look on top.
     theme::restoreDefaults();
     s_current = module;
+    const size_t depthBefore = brls::Application::getActivitiesStack().size();
     module->open();
+    if (brls::Application::getActivitiesStack().size() == depthBefore) {
+        // The module didn't push anything (it failed to start): stay on the hub.
+        s_current = nullptr;
+        theme::restoreDefaults();
+        theme::applyUnified(theme::hubAccent);
+        return;
+    }
     addBackToHub();
 
     hubSettings().lastModule = module->info().id;

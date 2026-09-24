@@ -1,0 +1,118 @@
+name: Build
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  # ───────────────────────────────────────────────
+  # PS Vita — VitaHub.vpk
+  # Same SDK image and portlibs as Vita_plex's CI.
+  # ───────────────────────────────────────────────
+  build-vita:
+    name: PS Vita
+    runs-on: ubuntu-latest
+    container:
+      image: vitasdk/vitasdk:2026.08
+
+    steps:
+      - name: Install build requirements
+        run: |
+          set -eu
+          # python3 + patch: the private WebRTC mbedTLS (modules/music) is
+          # patched and configured with mbedTLS' own scripts/config.py.
+          if command -v apt-get >/dev/null 2>&1; then
+            apt-get update
+            DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+              cmake ninja-build git zstd tar pkg-config wget curl xz-utils python3 patch bzip2
+          elif command -v apk >/dev/null 2>&1; then
+            apk update && apk add cmake ninja git zstd tar pkgconf wget curl xz python3 patch bzip2
+          fi
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Cache Vita portlibs
+        uses: actions/cache@v4
+        with:
+          path: portlib-cache
+          key: vita-portlibs-mbedtls-3.6.7-1_curl-8.16.0-3_ffmpeg-n6.0-3_mpv-0.36.0-3
+
+      - name: Install Vita dependencies
+        env:
+          BASE_URL: https://github.com/dragonflylee/switchfin/releases/download/vita-packages
+        run: |
+          set -eu
+          mkdir -p portlib-cache
+          for pkg in mbedtls-3.6.7-1 curl-8.16.0-3 ffmpeg-n6.0-3 mpv-0.36.0-3; do
+            f="portlib-cache/${pkg}-vita.pkg.tar.xz"
+            [ -s "$f" ] || curl -fL --retry 4 --retry-all-errors \
+              --speed-limit 102400 --speed-time 30 -o "$f" "$BASE_URL/${pkg}-vita.pkg.tar.xz"
+          done
+          VDPM_NONINTERACTIVE=1 vdpm libass harfbuzz fribidi freetype libpng libwebp || true
+          # Plain tar.xz rooted like the SDK; unpacking them is what
+          # pacman --upgrade would do minus the package database.
+          for f in portlib-cache/*-vita.pkg.tar.xz; do
+            tar -xJf "$f" -C "$VITASDK" \
+                --exclude=.PKGINFO --exclude=.MTREE --exclude=.BUILDINFO --exclude=.INSTALL
+          done
+          find "$VITASDK" -name libmpv.a -print -quit | grep -q . || { echo "libmpv.a missing"; exit 1; }
+          git config --system --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Build
+        run: |
+          cmake -B build -G Ninja -DPLATFORM_PSV=ON
+          cmake --build build
+
+      - name: Upload VPK
+        uses: actions/upload-artifact@v4
+        with:
+          name: VitaHub-vita-${{ github.run_number }}
+          path: build/VitaHub.vpk
+
+      - name: Upload ELF (crash symbolication)
+        uses: actions/upload-artifact@v4
+        with:
+          name: VitaHub-elf-${{ github.run_number }}
+          path: build/VitaHub
+
+  # ───────────────────────────────────────────────
+  # Linux desktop — development build
+  # ───────────────────────────────────────────────
+  build-linux:
+    name: Linux desktop
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            ninja-build pkg-config \
+            libmpv-dev libavformat-dev libavfilter-dev libavcodec-dev libswscale-dev \
+            libswresample-dev libavutil-dev libmp3lame-dev \
+            libcurl4-openssl-dev libmbedtls-dev libssl-dev \
+            libass-dev libfreetype-dev libfribidi-dev libharfbuzz-dev libpng-dev \
+            libwebp-dev libbz2-dev libzstd-dev zlib1g-dev libdbus-1-dev \
+            libx11-dev libxrandr-dev libxinerama-dev libxcursor-dev libxi-dev \
+            libxkbcommon-dev libwayland-dev wayland-protocols libgl-dev
+
+      - name: Build
+        run: |
+          cmake -B build -G Ninja -DPLATFORM_DESKTOP=ON -DCMAKE_BUILD_TYPE=Release
+          cmake --build build
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: VitaHub-linux-${{ github.run_number }}
+          path: build/VitaHub
