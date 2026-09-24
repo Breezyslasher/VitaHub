@@ -1,0 +1,265 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Replace com.test.game with the identifier of your game below, e.g.
+     com.gamemaker.game
+-->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="org.VitaPlex.app"
+    android:versionCode="2"
+    android:versionName="0.6.3"
+    android:installLocation="auto">
+
+    <!-- OpenGL ES 2.0 -->
+    <uses-feature android:glEsVersion="0x00020000" />
+
+    <!-- Touchscreen support -->
+    <uses-feature
+        android:name="android.hardware.touchscreen"
+        android:required="false" />
+
+    <!-- Android TV support -->
+    <uses-feature
+        android:name="android.software.leanback"
+        android:required="false" />
+
+    <!-- Game controller support -->
+    <uses-feature
+        android:name="android.hardware.bluetooth"
+        android:required="false" />
+    <uses-feature
+        android:name="android.hardware.gamepad"
+        android:required="false" />
+    <uses-feature
+        android:name="android.hardware.usb.host"
+        android:required="false" />
+
+    <!-- External mouse input events -->
+    <uses-feature
+        android:name="android.hardware.type.pc"
+        android:required="false" />
+
+    <!-- Audio recording support -->
+    <!-- if you want to capture audio, uncomment this. -->
+    <!-- <uses-feature
+        android:name="android.hardware.microphone"
+        android:required="false" /> -->
+
+    <!-- Allow downloading to the external storage on Android 5.1 and older -->
+    <!-- <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" android:maxSdkVersion="22" /> -->
+
+    <!-- Allow access to Bluetooth devices -->
+    <!-- Currently this is just for Steam Controller support and requires setting SDL_HINT_JOYSTICK_HIDAPI_STEAM -->
+    <!-- <uses-permission android:name="android.permission.BLUETOOTH" android:maxSdkVersion="30" /> -->
+    <!-- <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" /> -->
+
+    <!-- Allow access to the vibrator -->
+    <uses-permission android:name="android.permission.VIBRATE" />
+
+    <uses-permission android:name="android.permission.INTERNET" />
+    <!-- In-app updates: hand the downloaded APK to the system installer. -->
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+
+    <!-- Post the music media-session notification (runtime grant on Android 13+) -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+    <!-- Keep music + its notification alive in the background via a media
+         foreground service (FOREGROUND_SERVICE_MEDIA_PLAYBACK required at targetSdk 34) -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />
+
+    <!-- Keep offline downloads running once the app is backgrounded. Downloads
+         run on a thread in the app process, so without a foreground slot the
+         system is free to reclaim that process mid-album. dataSync is the type
+         Android defines for exactly this, and from targetSdk 34 its own
+         permission is required alongside FOREGROUND_SERVICE. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+
+    <!-- Hold the CPU (and Wi-Fi radio, via ACCESS_WIFI_STATE above) awake while
+         streaming music in the background, so the screen-off device can't suspend
+         the CPU / park the Wi-Fi radio and stall the transcode stream. -->
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+
+    <!-- if you want to capture audio, uncomment this. -->
+    <!-- <uses-permission android:name="android.permission.RECORD_AUDIO" /> -->
+
+    <!-- Create a Java class extending SDLActivity and place it in a
+         directory under app/src/main/java matching the package, e.g. app/src/main/java/com/gamemaker/game/MyGame.java
+ 
+         then replace "SDLActivity" with the name of your class (e.g. "MyGame")
+         in the XML below.
+
+         An example Java class can be found in README-android.md
+    -->
+    <application android:label="@string/app_name"
+        android:icon="@mipmap/ic_launcher"
+        android:banner="@drawable/banner"
+        android:allowBackup="true"
+        android:theme="@android:style/Theme.NoTitleBar.Fullscreen"
+        android:hardwareAccelerated="true" >
+
+        <!-- Serves the downloaded update APK to the package installer
+             (content:// is mandatory on API 24+; see ApkProvider). -->
+        <provider
+            android:name="org.libsdl.app.ApkProvider"
+            android:authorities="${applicationId}.apkprovider"
+            android:exported="false"
+            android:grantUriPermissions="true" />
+
+        <!-- Example of setting SDL hints from AndroidManifest.xml:
+        <meta-data android:name="SDL_ENV.SDL_ACCELEROMETER_AS_JOYSTICK" android:value="0"/>
+         -->
+        <meta-data android:name="SDL_ENV.SDL_ANDROID_TRAP_BACK_BUTTON" android:value="1" />
+
+        <!-- Keep the borealis/SDL main loop running while the app is backgrounded.
+             SDL's default blocks the main thread on pause, which freezes the loop
+             that services the media-notification transport (play/pause/next/prev
+             arrive via brls::sync onto this loop) and the music auto-advance /
+             timeline poll. With the media foreground service keeping the process
+             alive, 0 here lets those run with the screen off / app in background. -->
+        <meta-data android:name="SDL_ENV.SDL_ANDROID_BLOCK_ON_PAUSE" android:value="0" />
+
+        <activity android:name="org.VitaPlex.app.VitaPlexActivity"
+            android:label="@string/app_name"
+            android:alwaysRetainTaskState="true"
+            android:launchMode="singleInstance"
+            android:screenOrientation="fullSensor"
+            android:resizeableActivity="true"
+            android:supportsPictureInPicture="true"
+            android:configChanges="layoutDirection|locale|orientation|uiMode|screenLayout|screenSize|smallestScreenSize|keyboard|keyboardHidden|navigation"
+            android:preferMinimalPostProcessing="true"
+            android:exported="true"
+            >
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+                <category android:name="android.intent.category.LEANBACK_LAUNCHER" />
+            </intent-filter>
+            <!-- Let Android know that we can handle some USB devices and should receive this event -->
+            <intent-filter>
+                <action android:name="android.hardware.usb.action.USB_DEVICE_ATTACHED" />
+            </intent-filter>
+            <!-- Deep links. plex:// and vitaplex:// are ours to claim outright;
+                 app.plex.tv links are offered in the chooser rather than
+                 verified, since verification needs an assetlinks.json we do not
+                 control on that domain. Anything carrying a
+                 /library/metadata/<key> opens that item's detail page. -->
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="vitaplex" />
+                <data android:scheme="plex" />
+            </intent-filter>
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="https" android:host="app.plex.tv" />
+            </intent-filter>
+            <!-- Declares the app searchable, which is what puts it in the TV
+                 home screen's global search and the remote's microphone. -->
+            <meta-data
+                android:name="android.app.searchable"
+                android:resource="@xml/searchable" />
+            <!-- Drop file event -->
+            <!--
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="*/*" />
+            </intent-filter>
+            -->
+        </activity>
+
+        <!-- Media foreground service: keeps music + its notification alive in
+             the background. mediaPlayback type pairs with the
+             FOREGROUND_SERVICE_MEDIA_PLAYBACK permission above. -->
+        <service
+            android:name="org.VitaPlex.app.MusicService"
+            android:exported="false"
+            android:foregroundServiceType="mediaPlayback">
+            <!-- MediaButtonReceiver forwards media keys to the one service in
+                 the package that declares this action. -->
+            <intent-filter>
+                <action android:name="android.intent.action.MEDIA_BUTTON" />
+            </intent-filter>
+        </service>
+
+        <!-- Holds a foreground slot while offline downloads run, so the process
+             survives being backgrounded. Started by DownloadNotification on the
+             first progress report and stopped when the queue drains; never
+             bound, and no intent-filter — nothing outside the app starts it. -->
+        <service
+            android:name="org.VitaPlex.app.DownloadService"
+            android:exported="false"
+            android:foregroundServiceType="dataSync" />
+
+        <!-- Headset, Bluetooth and keyboard media keys. Declaring the receiver
+             is what lets MediaSessionCompat register a media-button component:
+             without one the session only sees keys while the app is in the
+             foreground. Keys land here as a broadcast, get forwarded to
+             MusicService, and are decoded by the session there. -->
+        <receiver
+            android:name="androidx.media.session.MediaButtonReceiver"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MEDIA_BUTTON" />
+            </intent-filter>
+        </receiver>
+
+        <!-- Quick-settings tile: one tap to pause music from anywhere, without
+             hunting for the media notification in the shade. API 24+; older
+             devices simply never see it. -->
+        <service
+            android:name="org.VitaPlex.app.MusicTileService"
+            android:label="@string/tile_music_label"
+            android:icon="@drawable/ic_tile_music"
+            android:exported="true"
+            android:permission="android.permission.BIND_QUICK_SETTINGS_TILE">
+            <intent-filter>
+                <action android:name="android.service.quicksettings.action.QS_TILE" />
+            </intent-filter>
+        </service>
+
+        <!-- Home-screen now-playing widget. Updated by MediaNotification rather
+             than on a timer, so it costs nothing while nothing is playing. -->
+        <receiver
+            android:name="org.VitaPlex.app.NowPlayingWidget"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />
+            </intent-filter>
+            <meta-data
+                android:name="android.appwidget.provider"
+                android:resource="@xml/widget_now_playing_info" />
+        </receiver>
+
+        <!-- Answers the TV global-search suggestion queries. Exported because
+             the system search app binds it from its own process, and gated on
+             GLOBAL_SEARCH so only that app can. -->
+        <provider
+            android:name="org.VitaPlex.app.SearchSuggestionProvider"
+            android:authorities="org.VitaPlex.app.search"
+            android:exported="true"
+            android:readPermission="android.permission.GLOBAL_SEARCH" />
+
+        <!-- Media browsing: lets Android Auto, Google Assistant, Wear and the
+             Android TV media surfaces browse and play the Plex music library.
+             Must be exported with the MediaBrowserService intent-filter, since
+             those clients live in other processes and bind us by action. -->
+        <service
+            android:name="org.VitaPlex.app.LibraryBrowserService"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.media.browse.MediaBrowserService" />
+            </intent-filter>
+        </service>
+
+        <!-- Declares the app as an Android Auto media app. -->
+        <meta-data
+            android:name="com.google.android.gms.car.application"
+            android:resource="@xml/automotive_app_desc" />
+    </application>
+
+</manifest>

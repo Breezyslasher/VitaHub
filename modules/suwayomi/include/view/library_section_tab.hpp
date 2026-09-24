@@ -1,0 +1,195 @@
+/**
+ * VitaSuwayomi - Library Section Tab
+ * Shows manga library content organized by categories
+ * Displays user's categories as tabs at the top for easy navigation
+ */
+
+#pragma once
+
+#include <borealis.hpp>
+#include <memory>
+#include <functional>
+#include "app/application.hpp"
+#include "app/suwayomi_client.hpp"
+#include "view/recycling_grid.hpp"
+
+namespace vitasuwayomi {
+
+// Sort modes for library manga
+// Note: DEFAULT (-1) uses the default sort mode from settings
+// Other values are 0-10 for specific sort modes
+enum class LibrarySortMode {
+    DEFAULT = -1,           // Use default sort mode from settings
+    TITLE_ASC = 0,          // A-Z
+    TITLE_DESC = 1,         // Z-A
+    UNREAD_DESC = 2,        // Most unread first
+    UNREAD_ASC = 3,         // Least unread first
+    RECENTLY_ADDED_DESC = 4,// Recently added (newest first)
+    RECENTLY_ADDED_ASC = 5, // Recently added (oldest first)
+    LAST_READ = 6,          // Last read (most recent first)
+    DATE_UPDATED_DESC = 7,  // Latest chapter upload (newest first)
+    DATE_UPDATED_ASC = 8,   // Latest chapter upload (oldest first)
+    TOTAL_CHAPTERS = 9,     // Most chapters first
+    DOWNLOADED_ONLY = 10,   // Local downloaded count, hiding books with no local downloads
+};
+
+class LibrarySectionTab : public brls::Box {
+public:
+    LibrarySectionTab();
+
+    ~LibrarySectionTab() override;
+
+    void onFocusGained() override;
+    void willAppear(bool resetState) override;
+    void willDisappear(bool resetState) override;
+    void draw(NVGcontext* vg, float x, float y, float width, float height, brls::Style style, brls::FrameContext* ctx) override;
+    void refresh();
+
+private:
+    void loadCategories();
+    void createCategoryTabs();
+    void loadCategoryManga(int categoryId);
+    void selectCategory(int categoryId);
+    void onMangaSelected(const Manga& manga);
+    void triggerLibraryUpdate();
+    void pollUpdateProgress(int generation);
+    void updateCategoryButtonStyles();
+    void sortMangaList();
+    void cycleSortMode();
+    void showSortMenu();
+    void updateSortButtonText();
+    void navigateToPreviousCategory();
+    void navigateToNextCategory();
+    void scrollToCategoryIndex(int index);
+    void updateCategoryButtonTexts();
+
+    // Grouping methods
+    void setGroupMode(LibraryGroupMode mode);
+    void loadAllManga();
+    void loadBySource();
+    void createSourceTabs();
+    void selectSource(const std::string& sourceName);
+    void showGroupModeMenu();
+
+    // Context menu (Start button / long-press)
+    void showMangaContextMenu(const Manga& manga, int index);
+    void showDownloadSubmenu(const std::vector<Manga>& mangaList);
+    void showChangeCategoryDialog(const std::vector<Manga>& mangaList, int focusedIndex = -1);
+    // New-design sub-popovers opened from the Options popover (replace the old
+    // inline panels that showDownloadSubmenu / showChangeCategoryDialog raise).
+    void showDownloadPopover(const std::vector<Manga>& mangaList, std::function<void()> onBack = nullptr);
+    void showCategoriesPopover(const std::vector<Manga>& mangaList, std::function<void()> onBack = nullptr);
+    void hideCategoryPanel();
+    bool isFocusInCategoryPanel(brls::View* view) const;
+    void showMigrateSourceMenu(const Manga& manga);
+
+    // Selection mode
+    void enterSelectionMode(int initialIndex);
+    void exitSelectionMode();
+    void updateSelectionTitle();
+
+    // Batch actions
+    void downloadChapters(const std::vector<Manga>& mangaList, const std::string& mode);
+    void downloadNextChapters(const std::vector<Manga>& mangaList, int count);
+    void markMangaRead(const std::vector<Manga>& mangaList);
+    void markMangaUnread(const std::vector<Manga>& mangaList);
+    void removeFromLibrary(const std::vector<Manga>& mangaList);
+    void openTracking(const Manga& manga);
+
+    bool m_selectionMode = false;
+    int m_selectionExitGeneration = 0;  // Generation counter to cancel pending auto-exit
+
+    // Check if this tab is still valid (not destroyed)
+    bool isValid() const { return m_alive && *m_alive; }
+
+    // Check if the current focus is within this tab's view hierarchy.
+    // Returns false when a dropdown/overlay is on top (focus is outside this tab).
+    bool hasFocusWithin() const;
+
+    // Currently selected category
+    int m_currentCategoryId = 0;
+    std::string m_currentCategoryName = "Library";
+
+    // Sort mode
+    LibrarySortMode m_sortMode = LibrarySortMode::TITLE_ASC;
+
+    // Group mode
+    LibraryGroupMode m_groupMode = LibraryGroupMode::BY_CATEGORY;
+
+    // UI Components
+    brls::Label* m_titleLabel = nullptr;
+    brls::Label* m_updateStatusLabel = nullptr;  // "Updating X%" beside title
+
+    // Update progress tracking
+    bool m_isUpdating = false;
+    int m_updateTotalJobs = 0;        // Total jobs when update started
+    int m_updatePollGeneration = 0;   // Generation counter to cancel stale polls
+
+    // Category tabs row
+    brls::Box* m_categoryTabsBox = nullptr;        // Outer container (clips)
+    brls::Box* m_categoryScrollContainer = nullptr; // Inner container (scrolls)
+    brls::Image* m_lHintIcon = nullptr;             // L bumper hint
+    brls::Image* m_rHintIcon = nullptr;             // R bumper hint
+    std::vector<brls::Button*> m_categoryButtons;
+    int m_selectedCategoryIndex = 0;               // Index in m_categories
+    float m_categoryScrollOffset = 0.0f;           // Current scroll offset
+    float m_tabPanStartOffset = 0.0f;              // Pan gesture start offset
+
+    // Action buttons
+    brls::Box* m_updateContainer = nullptr;
+    brls::Button* m_updateBtn = nullptr;
+    brls::Button* m_sortBtn = nullptr;
+    brls::Image* m_sortIcon = nullptr;
+
+    // Pull-to-refresh indicator (shown during swipe-down gesture on category tabs)
+    brls::Label* m_pullIndicatorLabel = nullptr;
+
+    // Main content grid
+    RecyclingGrid* m_contentGrid = nullptr;
+
+    // Data
+    std::vector<Manga> m_mangaList;           // Working list (may be filtered)
+    std::vector<Manga> m_fullMangaList;       // Complete list (never filtered)
+    std::vector<Category> m_categories;       // Visible categories
+
+    // BY_SOURCE grouping data
+    std::vector<std::string> m_sourceNames;                          // Ordered source names
+    std::map<std::string, std::vector<Manga>> m_mangaBySource;       // Source -> manga mapping
+    std::string m_currentSourceName;                                 // Currently selected source
+
+    // Cached manga state for incremental updates (like downloads tab)
+    struct CachedMangaItem {
+        int id;
+        int unreadCount;
+        int64_t lastReadAt;
+        int64_t latestChapterUploadDate;
+        int chapterCount;
+    };
+    std::vector<CachedMangaItem> m_cachedMangaList;  // Cached state for comparison
+    int m_cachedCategoryId = -1;                     // Category ID for cached data
+
+    // Helper to update manga cells incrementally without full rebuild
+    void updateMangaCellsIncrementally(const std::vector<Manga>& newManga);
+
+    // Process any pending library removals/additions tracked via Application
+    void processPendingLibraryChanges();
+
+    bool m_loaded = false;
+    bool m_categoriesLoaded = false;
+    bool m_focusGridAfterLoad = false;  // Focus first grid item after loading new category
+    bool m_thumbnailsInvalidated = false;  // Set in willDisappear after cancelAll, cleared on reload
+    bool m_pendingLibraryChangeScheduled = false;  // Guard to prevent duplicate brls::sync scheduling
+    int m_combinedQueryCategoryId = -1; // Category being fetched by combined query (skip redundant fetch)
+
+    // Inline category panel (centered overlay, shown/hidden on same page)
+    brls::Box* m_categoryOverlay = nullptr;
+    brls::Box* m_categoryPanel = nullptr;
+    brls::Box* m_lastHighlightedCatRow = nullptr;
+    brls::View* m_preCategoryPanelFocus = nullptr;
+    bool m_categoryPanelVisible = false;
+
+    // Shared pointer to track if this object is still alive
+    std::shared_ptr<bool> m_alive;
+};
+
+} // namespace vitasuwayomi

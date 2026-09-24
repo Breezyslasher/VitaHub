@@ -1,0 +1,197 @@
+package org.libsdl.app;
+
+import android.app.Activity;
+import android.content.ContentResolver;
+import android.content.Context;
+import android.content.Intent;
+import android.content.IntentFilter;
+import android.net.ConnectivityManager;
+import android.net.Network;
+import android.net.NetworkCapabilities;
+import android.net.NetworkInfo;
+import android.net.Uri;
+import android.net.wifi.WifiInfo;
+import android.net.wifi.WifiManager;
+import android.os.BatteryManager;
+import android.os.Message;
+import android.provider.Settings;
+import android.view.Window;
+import android.view.WindowManager;
+
+public class PlatformUtils {
+    public static boolean isBatterySupported() {
+        Context context = SDLActivity.getContext();
+        Intent batteryIntent = context.registerReceiver(null, new IntentFilter(Intent.ACTION_BATTERY_CHANGED));
+        return batteryIntent != null;
+    }
+
+    public static int getBatteryLevel() {
+        Context context = SDLActivity.getContext();
+
+        Intent batteryIntent = context.registerReceiver(null, new IntentFilter(Intent.ACTION_BATTERY_CHANGED));
+        if (batteryIntent == null) {
+            return 0;
+        }
+        int level = batteryIntent.getIntExtra(BatteryManager.EXTRA_LEVEL, -1);
+        int scale = batteryIntent.getIntExtra(BatteryManager.EXTRA_SCALE, -1);
+
+        if (level >= 0 && scale > 0) {
+            return (level * 100) / scale;
+        }
+
+        return 0;
+    }
+
+    public static boolean isBatteryCharging() {
+        Context context = SDLActivity.getContext();
+
+        IntentFilter filter = new IntentFilter(Intent.ACTION_BATTERY_CHANGED);
+        Intent batteryStatus = context.registerReceiver(null, filter);
+
+        int status = batteryStatus.getIntExtra(BatteryManager.EXTRA_STATUS, -1);
+        return status == BatteryManager.BATTERY_STATUS_CHARGING ||
+                status == BatteryManager.BATTERY_STATUS_FULL;
+    }
+
+    public static boolean isEthernetConnected() {
+        Context context = SDLActivity.getContext();
+
+        ConnectivityManager connectivityManager = (ConnectivityManager) context.getSystemService(Context.CONNECTIVITY_SERVICE);
+        Network[] networks = connectivityManager.getAllNetworks();
+        for (Network network : networks) {
+            NetworkCapabilities capabilities = connectivityManager.getNetworkCapabilities(network);
+            if (capabilities != null && capabilities.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    public static boolean isWifiSupported() {
+        Context context = SDLActivity.getContext();
+
+        WifiManager wifiManager = (WifiManager) context.getApplicationContext().getSystemService(Context.WIFI_SERVICE);
+        return wifiManager != null && wifiManager.isWifiEnabled();
+    }
+
+    public static boolean isWifiConnected() {
+        Context context = SDLActivity.getContext();
+
+        ConnectivityManager connectivityManager = (ConnectivityManager) context.getSystemService(Context.CONNECTIVITY_SERVICE);
+        NetworkInfo wifiInfo = connectivityManager.getNetworkInfo(ConnectivityManager.TYPE_WIFI);
+        return wifiInfo != null && wifiInfo.isConnected();
+    }
+
+    public static int getWifiSignalStrength() {
+        Context context = SDLActivity.getContext();
+
+        WifiManager wifiManager = (WifiManager) context.getApplicationContext().getSystemService(Context.WIFI_SERVICE);
+        WifiInfo wifiInfo = wifiManager.getConnectionInfo();
+        return wifiInfo.getRssi();
+    }
+
+    /**
+     * Hand a downloaded update APK to the system package installer.
+     * Works on Android TV as well as mobile: TVs usually ship no browser,
+     * so opening the release page there does nothing, but the installer
+     * (and its unknown-sources consent flow) exists everywhere. The
+     * content:// URI is served by ApkProvider, which only ever exposes
+     * this one file.
+     */
+    public static void installApk(String path) {
+        Context context = SDLActivity.getContext();
+        try {
+            // Android 8+ (API 26): installing an APK from outside the store
+            // needs the per-app "install unknown apps" grant. Declaring
+            // REQUEST_INSTALL_PACKAGES in the manifest is necessary but NOT
+            // sufficient — the user must enable this app as a source. On phones
+            // the install intent often auto-prompts; on Android TV it does not,
+            // so without routing the user there they are never asked and the
+            // installer just stages and vanishes. Send them to enable it, then
+            // they press Update again (canRequestPackageInstalls() is true on
+            // the retry and the install proceeds).
+            if (android.os.Build.VERSION.SDK_INT >= 26 &&
+                    !context.getPackageManager().canRequestPackageInstalls()) {
+                Intent grant = new Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES,
+                        Uri.parse("package:" + context.getPackageName()));
+                grant.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                // Some Android TV builds don't expose the per-app source screen;
+                // fall back to the global unknown-sources, then security, screen.
+                if (grant.resolveActivity(context.getPackageManager()) == null) {
+                    grant = new Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES)
+                            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                }
+                if (grant.resolveActivity(context.getPackageManager()) == null) {
+                    grant = new Intent(Settings.ACTION_SECURITY_SETTINGS)
+                            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                }
+                try {
+                    context.startActivity(grant);
+                } catch (Exception e) {
+                    android.util.Log.e("VitaPlex", "cannot open install-permission settings", e);
+                }
+                return;
+            }
+
+            Intent intent = new Intent(Intent.ACTION_VIEW);
+            Uri uri;
+            if (android.os.Build.VERSION.SDK_INT >= 24) {
+                uri = Uri.parse("content://" + context.getPackageName() + ".apkprovider/update.apk");
+                intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+            } else {
+                uri = Uri.fromFile(new java.io.File(path));
+            }
+            intent.setDataAndType(uri, "application/vnd.android.package-archive");
+            intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+            context.startActivity(intent);
+
+            // Do NOT kill our own process here. The installer streams the APK
+            // from ApkProvider — a ContentProvider hosted in THIS process —
+            // during "Staging app…"; killing mid-stage tears the provider down
+            // and the install silently aborts (worse on slower Android TV
+            // installers, where staging takes longer than any fixed delay). On
+            // a successful update Android stops the old process itself, so no
+            // manual kill is needed.
+        } catch (Exception e) {
+            android.util.Log.e("VitaPlex", "installApk failed", e);
+        }
+    }
+
+    public static void openBrowser(String url) {
+        Context context = SDLActivity.getContext();
+
+        Uri webpage = Uri.parse(url);
+        Intent intent = new Intent(Intent.ACTION_VIEW, webpage);
+        if (intent.resolveActivity(context.getPackageManager()) != null) {
+            context.startActivity(intent);
+        }
+    }
+
+    public static float getSystemScreenBrightness(Context context) {
+        ContentResolver contentResolver = context.getContentResolver();
+        return Settings.System.getInt(contentResolver,
+                Settings.System.SCREEN_BRIGHTNESS, 125) * 1.0f / 255.0f;
+    }
+
+    public static BorealisHandler borealisHandler = null;
+
+    public static void setAppScreenBrightness(Activity activity, float value) {
+        Message message = Message.obtain();
+        message.obj = activity;
+        message.arg1 = (int)(value * 255);
+        message.what = 0;
+        if(borealisHandler != null) borealisHandler.sendMessage(message);
+    }
+
+    public static float getAppScreenBrightness(Activity activity) {
+        Window window = activity.getWindow();
+        WindowManager.LayoutParams lp = window.getAttributes();
+        if (lp.screenBrightness < 0) return getSystemScreenBrightness(activity);
+        return lp.screenBrightness;
+    }
+
+    public static String getAndroidId() {
+        Context context = SDLActivity.getContext();
+        return Settings.Secure.getString(context.getContentResolver(), Settings.Secure.ANDROID_ID);
+    }
+}

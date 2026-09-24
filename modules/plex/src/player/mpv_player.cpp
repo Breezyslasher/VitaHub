@@ -1,0 +1,2420 @@
+/**
+ * VitaPlex - MPV Video Player Implementation
+ * Based on switchfin's MPV implementation for PS Vita
+ * Using software rendering with NanoVG display
+ */
+
+#include <algorithm>   // std::max in seekRelative
+#include "player/mpv_player.hpp"
+#include "app/application.hpp"
+#include "platform/platform.hpp"
+#include "utils/http_client.hpp"
+#ifdef __ANDROID__
+#include "platform/android_mpv_surface.hpp"
+#endif
+#ifdef __PS4__
+#include "utils/https_proxy.h"
+#endif
+#include <borealis.hpp>
+
+
+#ifdef __vita__
+#include <psp2/kernel/clib.h>
+#include <psp2/kernel/threadmgr.h>
+#include <psp2/power.h>
+#include <psp2/gxm.h>
+#include <nanovg.h>
+#include <nanovg_gxm.h>
+#include <nanovg_gxm_utils.h>
+#include <borealis/platforms/psv/psv_video.hpp>
+#endif
+
+#ifdef __ANDROID__
+#include <nanovg.h>
+#include <GLES3/gl3.h>
+#include <SDL2/SDL.h>
+// nanovg's GLES3 texture accessor is declared inside nanovg_gl.h only when
+// NANOVG_GLES3 is defined, and that header pulls in the whole GL shader
+// implementation chain. Forward-declare it directly — the symbol is compiled
+// into borealis via lib/platforms/sdl/sdl_video.cpp.
+extern "C" GLuint nvglImageHandleGLES3(NVGcontext* ctx, int image);
+
+static void* mpvGlGetProcAddress(void* ctx, const char* name) {
+    (void)ctx;
+    return SDL_GL_GetProcAddress(name);
+}
+
+#include <jni.h>
+
+namespace {
+// Audio session plumbing for system equalizers.
+//
+// An AudioEffect host (the stock equalizer, Wavelet, Poweramp EQ) attaches to
+// an audio session id, so it can only touch our output if AudioTrack and the
+// broadcast agree on one. Java mints the id; we hand it to mpv's audiotrack AO
+// and, only if that option was accepted, tell Java it may advertise the session.
+// A libmpv without the option leaves the session unadvertised rather than
+// pointing an equalizer at audio nobody is playing.
+int androidAudioSessionId() {
+    JNIEnv* env = (JNIEnv*)SDL_AndroidGetJNIEnv();
+    if (!env) return 0;
+    jclass cls = env->FindClass("org/VitaPlex/app/VitaPlexActivity");
+    if (!cls) {
+        if (env->ExceptionCheck()) env->ExceptionClear();
+        return 0;
+    }
+    int id = 0;
+    jmethodID mid = env->GetStaticMethodID(cls, "audioSessionId", "()I");
+    if (mid) {
+        id = (int)env->CallStaticIntMethod(cls, mid);
+        if (env->ExceptionCheck()) { env->ExceptionClear(); id = 0; }
+    } else if (env->ExceptionCheck()) {
+        env->ExceptionClear();
+    }
+    env->DeleteLocalRef(cls);
+    return id;
+}
+
+void androidMarkAudioSessionUsable() {
+    JNIEnv* env = (JNIEnv*)SDL_AndroidGetJNIEnv();
+    if (!env) return;
+    jclass cls = env->FindClass("org/VitaPlex/app/MediaNotification");
+    if (!cls) {
+        if (env->ExceptionCheck()) env->ExceptionClear();
+        return;
+    }
+    jmethodID mid = env->GetStaticMethodID(cls, "setAudioSessionUsable", "()V");
+    if (mid) {
+        env->CallStaticVoidMethod(cls, mid);
+        if (env->ExceptionCheck()) env->ExceptionClear();
+    } else if (env->ExceptionCheck()) {
+        env->ExceptionClear();
+    }
+    env->DeleteLocalRef(cls);
+}
+}  // namespace
+#endif
+
+#if defined(__SWITCH__) && defined(BOREALIS_USE_OPENGL)
+#include <glad/glad.h>
+#include <nanovg.h>
+// Same rationale as the Android forward-declaration above: pull only the symbol,
+// not nanovg_gl.h's whole GL3 implementation chain. It's compiled into borealis
+// via lib/platforms/glfw/glfw_video.cpp (NANOVG_GL3_IMPLEMENTATION).
+extern "C" GLuint nvglImageHandleGL3(NVGcontext* ctx, int image);
+
+// Forward-declare GLFW's proc loader instead of including <GLFW/glfw3.h>, which
+// would drag in GL headers with their own ordering constraints relative to
+// glad. GLFW is C; GLFWglproc is void(*)(void). glad's GL function pointers are
+// already loaded by borealis (gladLoadGLLoader) before any video plays, and mpv
+// loads its own copies through this callback.
+extern "C" {
+typedef void (*VitaplexGLFWproc)(void);
+VitaplexGLFWproc glfwGetProcAddress(const char* procname);
+}
+
+static void* mpvSwitchGlGetProcAddress(void* ctx, const char* name) {
+    (void)ctx;
+    return reinterpret_cast<void*>(glfwGetProcAddress(name));
+}
+#endif
+
+#include <cstring>
+#include <chrono>
+#include <thread>
+#include <cstdlib>
+#include <clocale>
+#include <mutex>
+#include <vector>
+
+#ifdef __vita__
+// Defined in patches/psv_platform.cpp - throttles the borealis main loop
+// to ~30fps during audio-only playback so the ao_vita thread gets more CPU.
+extern "C" void vitaplex_set_audio_playback_active(bool active);
+#endif
+
+namespace vitaplex {
+
+#ifdef __vita__
+// Flush the GXM GPU pipeline to ensure it's idle before mpv uses the shared
+// GXM context. GXM is NOT thread-safe, so mpv's decoder threads and the main
+// thread's NanoVG rendering must not use the GPU concurrently.
+static void flushGxmPipeline() {
+    brls::PsvVideoContext* videoContext = dynamic_cast<brls::PsvVideoContext*>(
+        brls::Application::getPlatform()->getVideoContext());
+    if (videoContext) {
+        NVGXMwindow* gxm = videoContext->getWindow();
+        if (gxm && gxm->context) {
+            sceGxmFinish(gxm->context);
+        }
+    }
+}
+
+void MpvPlayer::flushGpu() {
+    flushGxmPipeline();
+}
+#endif
+
+// Command IDs for async operations
+static const uint64_t CMD_LOADFILE = 1;
+static const uint64_t CMD_STOP = 2;
+static const uint64_t CMD_SEEK = 3;
+
+MpvPlayer& MpvPlayer::getInstance() {
+    static MpvPlayer instance;
+    return instance;
+}
+
+MpvPlayer::~MpvPlayer() {
+    shutdown();
+}
+
+bool MpvPlayer::init() {
+    if (m_mpv) {
+        brls::Logger::debug("MpvPlayer: Already initialized");
+        return true;
+    }
+
+    brls::Logger::debug("MpvPlayer: Initializing libmpv...");
+
+    // Set locale for consistent number formatting (important for mpv)
+    setlocale(LC_NUMERIC, "C");
+
+#ifdef __vita__
+    // Ensure CPU is at max speed for video decoding
+    scePowerSetArmClockFrequency(444);
+    scePowerSetBusClockFrequency(222);
+    scePowerSetGpuClockFrequency(222);
+    scePowerSetGpuXbarClockFrequency(166);
+#endif
+
+    // Create mpv instance
+    m_mpv = mpv_create();
+    if (!m_mpv) {
+        m_errorMessage = "Failed to create mpv instance";
+        brls::Logger::error("MpvPlayer: {}", m_errorMessage);
+        m_state = MpvPlayerState::ERROR;
+        return false;
+    }
+
+    brls::Logger::debug("MpvPlayer: mpv context created");
+
+    // ========================================
+    // Core configuration (matching switchfin)
+    // ========================================
+
+    mpv_set_option_string(m_mpv, "osd-level", "0");
+    mpv_set_option_string(m_mpv, "video-timing-offset", "0");
+    mpv_set_option_string(m_mpv, "keep-open", "yes");
+    mpv_set_option_string(m_mpv, "idle", "yes");
+    mpv_set_option_string(m_mpv, "input-default-bindings", "no");
+    mpv_set_option_string(m_mpv, "input-vo-keyboard", "no");
+    mpv_set_option_string(m_mpv, "terminal", "no");
+    mpv_set_option_string(m_mpv, "ytdl", "no");  // Disable youtube-dl (like switchfin)
+    mpv_set_option_string(m_mpv, "reset-on-next-file", "speed,pause");  // Reset state between files
+
+    // HDR. Every port renders HDR down to SDR — Android through vo=gpu, the
+    // rest through the libmpv FBO composite — so the tone-mapping curve is
+    // shared. Without an explicit one, an HDR source falls back to a flat clip
+    // and bright scenes come out grey; that is worst on Android, where
+    // profile=fast also turns off peak detection, but it is not Android-only.
+    // bt.2446a is the ITU curve for HDR->SDR and is a fixed analytic function,
+    // so it costs nothing extra on the weak SoCs profile=fast exists for. On
+    // Vita it is inert: that decoder never sees 10-bit HDR in the first place.
+    mpv_set_option_string(m_mpv, "tone-mapping", "bt.2446a");
+    // Passing HDR through instead of mapping it down needs the port to hand the
+    // display an HDR signal, which only the Android vo=gpu path can do today —
+    // the FBO composite the other ports share is 8-bit SDR, so the panel never
+    // sees HDR whatever it supports. displaySupportsHdr() is the per-platform
+    // capability query, so a port that later gains HDR output gets this by
+    // returning true rather than by editing here.
+    if (platform::displaySupportsHdr()) {
+        mpv_set_option_string(m_mpv, "target-colorspace-hint", "yes");
+    }
+
+    // Subtitles follow the platform's accessibility caption settings where it
+    // has any. Someone who set large high-contrast captions system-wide was
+    // still getting small white text here. valid is false on every port that
+    // exposes nothing, so their subtitle styling is untouched.
+    {
+        const auto& cs = platform::getSystemCaptionStyle();
+        if (cs.valid) {
+            auto argbToMpv = [](unsigned argb) {
+                // mpv wants #AARRGGBB, and its alpha is opacity, same as ARGB's.
+                char buf[16];
+                snprintf(buf, sizeof(buf), "#%08X", argb);
+                return std::string(buf);
+            };
+            if (cs.fontScale > 0.01f && cs.fontScale != 1.0f) {
+                mpv_set_option_string(m_mpv, "sub-scale",
+                                      std::to_string(cs.fontScale).c_str());
+            }
+            if (cs.hasForeground) {
+                mpv_set_option_string(m_mpv, "sub-color",
+                                      argbToMpv(cs.foreground).c_str());
+            }
+            if (cs.hasBackground) {
+                // mpv paints sub-back-color behind the glyphs only, which is
+                // what Android's "background" means too (the window colour is
+                // the box behind the whole line, and mpv has no equivalent).
+                mpv_set_option_string(m_mpv, "sub-back-color",
+                                      argbToMpv(cs.background).c_str());
+            }
+            switch (cs.edgeType) {
+                case 1:   // outline
+                    mpv_set_option_string(m_mpv, "sub-border-size", "3");
+                    if (cs.hasEdgeColor) {
+                        mpv_set_option_string(m_mpv, "sub-border-color",
+                                              argbToMpv(cs.edgeColor).c_str());
+                    }
+                    break;
+                case 2:   // drop shadow
+                case 3:   // raised
+                case 4:   // depressed
+                    // mpv has one shadow, with no direction, so raised and
+                    // depressed both land here rather than being faked.
+                    mpv_set_option_string(m_mpv, "sub-shadow-offset", "2");
+                    if (cs.hasEdgeColor) {
+                        mpv_set_option_string(m_mpv, "sub-shadow-color",
+                                              argbToMpv(cs.edgeColor).c_str());
+                    }
+                    break;
+                case 0:
+                default:
+                    break;
+            }
+        }
+    }
+
+    // Audio passthrough. Without it mpv decodes Dolby/DTS to PCM and downmixes
+    // it, so a receiver that could have rendered 5.1 gets stereo. The list is
+    // the intersection of what the user asked for and what the audio output
+    // says it accepts, so an unsupported codec still decodes normally instead
+    // of going silent. Ports with no way to ask report nothing and are
+    // unaffected.
+    if (Application::getInstance().getSettings().audioPassthrough) {
+        const int caps = platform::passthroughCodecs();
+        std::string spdif;
+        auto add = [&spdif](const char* name) {
+            if (!spdif.empty()) spdif += ",";
+            spdif += name;
+        };
+        if (caps & platform::PASSTHROUGH_AC3)    add("ac3");
+        if (caps & platform::PASSTHROUGH_EAC3)   add("eac3");
+        if (caps & platform::PASSTHROUGH_DTS)    add("dts");
+        if (caps & platform::PASSTHROUGH_DTSHD)  add("dts-hd");
+        if (caps & platform::PASSTHROUGH_TRUEHD) add("truehd");
+        if (!spdif.empty()) {
+            mpv_set_option_string(m_mpv, "audio-spdif", spdif.c_str());
+            brls::Logger::info("MpvPlayer: audio passthrough enabled for {}", spdif);
+        } else {
+            brls::Logger::info("MpvPlayer: audio passthrough requested but the "
+                               "output accepts no compressed formats");
+        }
+    }
+
+#ifdef __SWITCH__
+    // libmpv resolves its config / cache / watch-later / font directories from
+    // $HOME / $XDG_* during mpv_initialize. On Switch (libnx) those env vars are
+    // unset, and mpv's path code dereferences the null result *inside*
+    // mpv_initialize — the deterministic "crash the instant a video or track
+    // starts" seen only on Switch (Vita's mpv platform-path provider tolerates a
+    // missing HOME; Switch's does not). switchfin sidesteps this by pointing
+    // every writable dir at an explicit path before init; mirror that, rooted at
+    // the sdmc folder we already own (settings.json / downloads live there).
+    mpv_set_option_string(m_mpv, "config-dir", "sdmc:/VitaPlex");
+    mpv_set_option_string(m_mpv, "sub-fonts-dir", "sdmc:/VitaPlex");
+    mpv_set_option_string(m_mpv, "watch-later-dir", "sdmc:/VitaPlex/watch-later");
+    mpv_set_option_string(m_mpv, "gpu-shader-cache-dir", "sdmc:/VitaPlex/cache");
+#endif
+
+    // ========================================
+    // Video output configuration
+    // ========================================
+
+    if (m_audioOnly) {
+        // Audio-only mode: disable video rendering but keep subtitle support for lyrics
+        brls::Logger::info("MpvPlayer: Initializing in audio-only mode");
+        mpv_set_option_string(m_mpv, "vo", "null");
+        mpv_set_option_string(m_mpv, "vid", "no");
+        mpv_set_option_string(m_mpv, "audio-display", "no");  // Don't try to show album art
+        mpv_set_option_string(m_mpv, "hwdec", "no");
+        // Keep subtitle/lyrics support active (don't set video=no which disables sub rendering)
+        mpv_set_option_string(m_mpv, "sub-visibility", "yes");
+    } else {
+        // Video mode
+        brls::Logger::info("MpvPlayer: Initializing in video mode");
+
+#ifdef __ANDROID__
+        // Stage 4 direct-surface playback (see
+        // docs/android-direct-surface-playback.md). mpv renders straight
+        // to MpvSurface via vo=gpu — no libmpv/FBO/NanoVG composite,
+        // which is the whole point of the rework. Mirrors mpv-android's
+        // BaseMPVView startup sequence.
+        //
+        // profile=fast: in mpv >= 0.36 this preset flips a bundle of
+        // low-end-friendly internals in one go (skip loop filter, fast
+        // decode, lower buffer thresholds, …). Mpv-android uses it as
+        // a baseline for every device and it's the single biggest win
+        // for weak TV SoCs like the Bravia A1's MediaTek MT5891. Set
+        // first so the explicit options below can still override.
+        mpv_set_option_string(m_mpv, "profile", "fast");
+        mpv_set_option_string(m_mpv, "vo", "gpu");
+        mpv_set_option_string(m_mpv, "gpu-context", "android");
+        mpv_set_option_string(m_mpv, "opengl-es", "yes");
+        // hwdec as a list lets mpv fall back from zero-copy to copy
+        // when the vendor color format trips up the zero-copy path
+        // (Sony's OMX.MTK.VIDEO.DECODER.AVC reports format 0x7f000103
+        // which mediacodec-only refused). With the list, mpv tries
+        // mediacodec first, then mediacodec-copy.
+        mpv_set_option_string(m_mpv, "hwdec", "mediacodec,mediacodec-copy");
+        // Whitelist mediacodec to codecs we know work on Android so
+        // mpv doesn't try hardware paths for exotic streams and silently
+        // fall back to software. Matches mpv-android exactly.
+        mpv_set_option_string(m_mpv, "hwdec-codecs",
+                              "h264,hevc,mpeg4,mpeg2video,vp8,vp9,av1");
+        // Explicit AO list — defaulting let mpv pick OpenSL ES on
+        // some firmwares, which caused the audio underruns visible in
+        // the TV log. Prefer AudioTrack (modern, low-latency) with
+        // OpenSL ES as fallback.
+        mpv_set_option_string(m_mpv, "ao", "audiotrack,opensles");
+        // Give AudioTrack a session id a system equalizer can attach to. Only
+        // advertise it if this libmpv actually took the option — see
+        // androidAudioSessionId() above.
+        if (const int audioSession = androidAudioSessionId()) {
+            if (mpv_set_option_string(m_mpv, "audiotrack-session-id",
+                                      std::to_string(audioSession).c_str()) >= 0) {
+                androidMarkAudioSessionUsable();
+            } else {
+                brls::Logger::info("MpvPlayer: libmpv has no audiotrack-session-id; "
+                                   "system equalizer will not attach");
+            }
+        }
+        // force-window stays no until the surface is attached so mpv
+        // doesn't try to create a window before we hand it one.
+        mpv_set_option_string(m_mpv, "force-window", "no");
+        // NOT idle=once. "once" idles only until the FIRST file ends and
+        // then terminates the core — so stopping video 1 killed mpv, and
+        // every later loadfile queued into a dead handle (accepted,
+        // COMMAND_REPLY error=0, no START_FILE, video never starts). This
+        // block is Android-only, which is why the second-video stall never
+        // reproduced on desktop. idle=yes keeps the core alive between
+        // files, matching the global default set above.
+        mpv_set_option_string(m_mpv, "idle", "yes");
+#else
+        // libmpv VO + FBO/NanoVG composite — Vita / PS4 / Switch /
+        // desktop. The Android FBO path is intentionally retired:
+        // libmpv composite was the bottleneck that drove this whole
+        // rework on TV SoCs (Bravia A1, CCwGTV).
+        mpv_set_option_string(m_mpv, "vo", "libmpv");
+
+#ifdef __vita__
+        // Vita-specific settings from switchfin
+        // Use 2 decoder threads for software decode. More threads require
+        // more stack memory (each pthread gets 512KB via our wrapper).
+        mpv_set_option_string(m_mpv, "vd-lavc-threads", "2");
+        mpv_set_option_string(m_mpv, "vd-lavc-skiploopfilter", "all");
+        mpv_set_option_string(m_mpv, "vd-lavc-fast", "yes");
+
+        // Disable hardware decoding. vita-copy uses the shared GXM immediate
+        // context from its decoder thread, which races with NanoVG on the main
+        // thread and causes a deterministic crash at eboot+0x161b0. Software
+        // decoding keeps all GXM usage on the main thread (via the render
+        // callback + brls::sync), eliminating the threading conflict.
+        mpv_set_option_string(m_mpv, "hwdec", "no");
+
+        // GXM-specific settings from switchfin
+        mpv_set_option_string(m_mpv, "fbo-format", "rgba8");
+        mpv_set_option_string(m_mpv, "video-latency-hacks", "yes");
+#elif defined(__SWITCH__)
+        // Switch software decode. mpv creates its OWN ffmpeg decoder
+        // threads via libnx pthread_create, which use libnx's DEFAULT
+        // ~128 KB stack — NOT our 512 KB launchThread wrapper, which only
+        // governs threads WE spawn. Left uncapped, mpv auto-detects
+        // thread count from the core count and frame-threading can
+        // multiply that further; the result on 1080p H.264/HEVC was a
+        // pile of 128 KB-stack workers, one of which faulted with an
+        // Instruction Abort during playback (Atmosphère report: 0x21000
+        // stack region, the tell-tale libnx default size).
+        //
+        // Cap to 4 like switchfin: bounds both the thread count and the
+        // aggregate stack pressure while still using every usable core.
+        // vd-lavc-fast trims some spec-compliance corners that also keep
+        // decode stack depth shallower. Leave the loop filter ON (Switch
+        // is far more capable than Vita) so picture quality isn't hurt.
+        // Memory-lean software decode, matching switchfin's Switch tuning.
+        // 720p H.264 frame-threaded decode OOM-crashed with 4 threads and no
+        // direct rendering (mpv log: "h264: thread_get_buffer() failed",
+        // "lavf: Not enough space", then a null-deref). vd-lavc-dr lets the
+        // decoder render straight into the VO's buffers instead of a second
+        // private pool, and 3 threads keeps the per-thread frame pool smaller.
+        mpv_set_option_string(m_mpv, "vd-lavc-threads", "3");
+        mpv_set_option_string(m_mpv, "vd-lavc-dr", "yes");
+        mpv_set_option_string(m_mpv, "vd-lavc-fast", "yes");
+        mpv_set_option_string(m_mpv, "hwdec", "auto-safe");
+#elif defined(_WIN32)
+        // Windows: zero-copy dxva2/d3d11va surfaces don't interop cleanly with
+        // our vo=libmpv (FBO + NanoVG composite) render path — they come out
+        // garbled (horizontal-line tearing) and the failed dxva2 surface
+        // allocation stalls the pipeline enough to starve WASAPI (audio
+        // crackle). Use copy-back hwdec instead: decoded frames are copied to
+        // system memory and uploaded to the GL FBO exactly like software frames,
+        // so they render correctly. Falls back through d3d11va -> dxva2 ->
+        // software, so a machine with no usable HW decoder still plays (in SW).
+        mpv_set_option_string(m_mpv, "hwdec", "d3d11va-copy,dxva2-copy,no");
+#else
+        mpv_set_option_string(m_mpv, "hwdec", "auto-safe");
+#endif
+#endif // !__ANDROID__
+    }
+
+    // ========================================
+    // Audio output configuration
+    // ========================================
+
+    mpv_set_option_string(m_mpv, "audio-channels", "stereo");
+    mpv_set_option_string(m_mpv, "volume", "100");
+    mpv_set_option_string(m_mpv, "volume-max", "150");
+
+#ifdef __vita__
+    // Audio-specific optimizations for Vita
+    if (m_audioOnly) {
+        // Pre-buffer more audio to prevent stuttering during playback
+        mpv_set_option_string(m_mpv, "audio-buffer", "0.5");  // 500ms audio buffer
+
+        // Demuxer settings for smoother audio
+        mpv_set_option_string(m_mpv, "demuxer-readahead-secs", "5");  // Read 5 seconds ahead
+        mpv_set_option_string(m_mpv, "demuxer-max-bytes", "512KiB");  // Allow some buffering for audio
+    }
+#endif
+
+    // ========================================
+    // Cache and demuxer settings
+    // ========================================
+
+#ifdef __vita__
+    if (m_audioOnly) {
+        // Audio streaming needs cache enabled for network playback
+        mpv_set_option_string(m_mpv, "cache", "yes");
+        mpv_set_option_string(m_mpv, "demuxer-max-bytes", "1MiB");
+        mpv_set_option_string(m_mpv, "demuxer-max-back-bytes", "512KiB");
+    } else {
+        // Video: disable cache to conserve memory (Vita has 256MB)
+        mpv_set_option_string(m_mpv, "cache", "no");
+    }
+#elif defined(__ANDROID__)
+    // Android/Android TV: larger buffers to prevent stutter from network jitter
+    mpv_set_option_string(m_mpv, "cache", "yes");
+    mpv_set_option_string(m_mpv, "demuxer-max-bytes", "32MiB");
+    mpv_set_option_string(m_mpv, "demuxer-max-back-bytes", "16MiB");
+    mpv_set_option_string(m_mpv, "demuxer-readahead-secs", "10");
+    mpv_set_option_string(m_mpv, "cache-secs", "10");
+#elif defined(__PS4__)
+    // PS4: larger buffers for smooth streaming
+    mpv_set_option_string(m_mpv, "cache", "yes");
+    mpv_set_option_string(m_mpv, "demuxer-max-bytes", "32MiB");
+    mpv_set_option_string(m_mpv, "demuxer-max-back-bytes", "16MiB");
+    mpv_set_option_string(m_mpv, "demuxer-readahead-secs", "10");
+    mpv_set_option_string(m_mpv, "cache-secs", "10");
+#else
+    mpv_set_option_string(m_mpv, "cache", "yes");
+    mpv_set_option_string(m_mpv, "demuxer-max-bytes", "4MiB");
+    mpv_set_option_string(m_mpv, "demuxer-max-back-bytes", "2MiB");
+#endif
+
+    // Resume a dropped HTTP connection instead of reporting end-of-stream.
+    //
+    // Without this, ffmpeg's HTTP reader treats any mid-transfer disconnect as
+    // a clean end of file. A device log caught exactly that — "tcp: ffurl_read
+    // returned <error>" followed by "lavf: EOF reached" 46 seconds short of the
+    // end of a track — and everything downstream then behaves as though the
+    // song had finished. Reconnecting is the only part of this that addresses
+    // the fault rather than its symptoms.
+    //
+    // reconnect_streamed covers the non-seekable case, the transcode endpoints,
+    // which ffmpeg otherwise refuses to retry at all.
+    //
+    // This was set once before and backed out when music stopped opening with
+    // HTTP 400. That turned out to be two unrelated bugs — a direct-play
+    // decision sent to the transcode endpoint, and a prefetched URL whose
+    // transcode session had been reaped — both since fixed. The suspicion was
+    // reasonable at the time and wrong.
+    mpv_set_option_string(m_mpv, "stream-lavf-o",
+                          "reconnect=1,reconnect_streamed=1,reconnect_delay_max=5");
+
+    // ========================================
+    // Network settings for streaming
+    // ========================================
+
+    mpv_set_option_string(m_mpv, "network-timeout", "30");
+    mpv_set_option_string(m_mpv, "tls-verify", "no");
+    // Ensure HTTPS/TLS protocols are enabled in ffmpeg's protocol whitelist
+    mpv_set_option_string(m_mpv, "demuxer-lavf-o", "protocol_whitelist=file,http,https,tcp,tls,crypto,data,hls");
+#ifdef __PS4__
+    // PS4: also set ffmpeg-level TLS options in case MPV's tls-verify doesn't propagate correctly to the stream layer
+    mpv_set_option_string(m_mpv, "stream-lavf-o", "tls_verify=0");
+#endif
+
+    // User agent for Plex compatibility
+    mpv_set_option_string(m_mpv, "user-agent", PLEX_CLIENT_NAME "/" PLEX_CLIENT_VERSION);
+
+    // Per official Plex API (developer.plex.tv/pms), X-Plex-Client-Identifier
+    // is a REQUIRED HTTP header (in=header). Set it here so MPV sends it
+    // when streaming from Plex transcode endpoints. Platform/Device come
+    // from the runtime platform layer so each target reports the right
+    // identifier to Plex without ifdef chains here.
+    {
+        const auto& vc = platform::getVideoConstraints();
+        std::string headerFields =
+            std::string("X-Plex-Client-Identifier: ") + PLEX_CLIENT_NAME + "," +
+            "X-Plex-Product: " + PLEX_CLIENT_NAME + "," +
+            "X-Plex-Version: " + PLEX_CLIENT_VERSION + "," +
+            "X-Plex-Platform: " + vc.plexPlatform + "," +
+            "X-Plex-Device: " + vc.plexDevice + "," +
+            "X-Plex-Client-Profile-Name: Generic," +
+            "X-Plex-Device-Name: " + vc.plexDevice;
+        mpv_set_option_string(m_mpv, "http-header-fields", headerFields.c_str());
+    }
+
+    // Note: demuxer-lavf-probe-info and force-seekable caused crashes on Vita Keep options minimal for compatibility
+
+    // ========================================
+    // Seek settings for faster seeking
+    // ========================================
+
+#ifdef __vita__
+    // Use keyframe-based seeking for faster forward/rewind (especially for audio)
+    // hr-seek=no means seek to nearest keyframe instead of exact position
+    // This is much faster and prevents stuttering during seek operations
+    mpv_set_option_string(m_mpv, "hr-seek", "no");
+
+    // Don't wait for audio to resync after seeking - reduces seek delay
+    mpv_set_option_string(m_mpv, "hr-seek-framedrop", "yes");
+#endif
+
+    // ========================================
+    // Subtitle settings
+    // ========================================
+
+    mpv_set_option_string(m_mpv, "sub-auto", "fuzzy");
+    mpv_set_option_string(m_mpv, "subs-fallback", "yes");
+
+    // ========================================
+    // Request log messages for debugging
+    // ========================================
+
+#ifdef __PS4__
+    mpv_request_log_messages(m_mpv, "v");  // Verbose logging on PS4 to debug playback issues
+#elif defined(__ANDROID__)
+    // Stage 4 direct-surface bring-up: we want mpv's own log output
+    // (vo init, gl context creation, mediacodec engagement, hwdec
+    // dispatch) routed through borealis so failures on the Bravia /
+    // CCwGTV that present as "audio plays but screen is black" actually
+    // tell us *why*. Matches mpv-android's approach (their main.cpp
+    // also requests verbose). Tighten to "warn" later once the path is
+    // stable.
+    mpv_request_log_messages(m_mpv, "v");
+#else
+    mpv_request_log_messages(m_mpv, "warn");  // Use warn level to reduce log spam
+#endif
+
+    // ========================================
+    // Initialize MPV
+    // ========================================
+
+    brls::Logger::debug("MpvPlayer: Calling mpv_initialize...");
+
+    int result = mpv_initialize(m_mpv);
+    if (result < 0) {
+        m_errorMessage = std::string("Failed to initialize mpv: ") + mpv_error_string(result);
+        brls::Logger::error("MpvPlayer: {}", m_errorMessage);
+        mpv_destroy(m_mpv);
+        m_mpv = nullptr;
+        m_state = MpvPlayerState::ERROR;
+        return false;
+    }
+
+    brls::Logger::debug("MpvPlayer: mpv_initialize succeeded");
+
+    // ========================================
+    // Set up render context for video display (skip for audio-only)
+    // ========================================
+
+    if (!m_audioOnly) {
+#ifdef __ANDROID__
+        // Direct-surface playback: mpv owns the MpvSurface via vo=gpu,
+        // no libmpv render context, no FBO, no NanoVG composite. The
+        // surface is already in the view tree (Stage 3b); the JNI
+        // layer's rebindIfReady drops the saved wid into mpv now that
+        // we have a handle, and force-window=yes brings the VO up on it.
+        vitaplex::android_mpv_surface::rebindIfReady();
+#else
+        if (!initRenderContext()) {
+            brls::Logger::error("MpvPlayer: Failed to create render context, falling back to audio-only");
+            // Don't fail - we can still play audio
+        }
+#endif
+    } else {
+        brls::Logger::info("MpvPlayer: Skipping render context for audio-only mode");
+    }
+
+    // ========================================
+    // Set up property observers (matching switchfin IDs)
+    // ========================================
+
+    mpv_observe_property(m_mpv, 1, "core-idle", MPV_FORMAT_FLAG);
+    mpv_observe_property(m_mpv, 2, "pause", MPV_FORMAT_FLAG);
+    mpv_observe_property(m_mpv, 3, "duration", MPV_FORMAT_DOUBLE);
+    mpv_observe_property(m_mpv, 4, "playback-time", MPV_FORMAT_DOUBLE);
+    mpv_observe_property(m_mpv, 5, "cache-speed", MPV_FORMAT_INT64);
+    mpv_observe_property(m_mpv, 6, "paused-for-cache", MPV_FORMAT_FLAG);
+    mpv_observe_property(m_mpv, 7, "eof-reached", MPV_FORMAT_FLAG);
+    mpv_observe_property(m_mpv, 8, "seeking", MPV_FORMAT_FLAG);
+    mpv_observe_property(m_mpv, 9, "speed", MPV_FORMAT_DOUBLE);
+    mpv_observe_property(m_mpv, 10, "volume", MPV_FORMAT_INT64);
+
+    brls::Logger::info("MpvPlayer: Initialized successfully");
+    m_state = MpvPlayerState::IDLE;
+    m_commandPending = false;
+    startEventThread();
+    return true;
+}
+
+// mpv's events were drained only from PlayerActivity's timers — updateProgress
+// once a second and m_endWatchTimer every 250ms. Both are brls::RepeatingTimers
+// on a view, so the whole playback state machine advanced only while that view
+// was being ticked. mpv keeps decoding on its own thread regardless, so a track
+// could play to the end with nobody reading the events that say so.
+//
+// A log of exactly that: FILE_LOADED and PLAYBACK_RESTART for a track started
+// at 00:03:14 were not seen until 00:08:09, when the app came back to the
+// foreground. The track had played its full 223 seconds in between and the
+// queue never advanced, because as far as this class knew it was still LOADING.
+// Two timeline reports went out over that session where a comparable one sent
+// seventy-one.
+//
+// So the pump does not belong to a view. mpv calls onMpvWakeup whenever events
+// are queued; that callback runs on mpv's thread and is not allowed to re-enter
+// the mpv API, so all it does is signal this thread, which does the draining.
+// The timers still call update() and that stays harmless — eventMainLoop drains
+// whatever is there and returns.
+void MpvPlayer::onMpvWakeup(void* ctx) {
+    auto* self = static_cast<MpvPlayer*>(ctx);
+    if (!self) return;
+    {
+        std::lock_guard<std::mutex> lock(self->m_eventMutex);
+        self->m_eventPending = true;
+    }
+    self->m_eventCv.notify_one();
+}
+
+void MpvPlayer::startEventThread() {
+    if (m_eventThreadRun.load()) return;
+    m_eventThreadRun.store(true);
+    m_eventPending = true;   // drain anything queued before the callback was set
+
+    m_eventThread = std::thread([this]() {
+        while (m_eventThreadRun.load()) {
+            {
+                std::unique_lock<std::mutex> lock(m_eventMutex);
+                // The timeout is a safety net, not the mechanism: if a wakeup
+                // is ever missed the queue still drains a moment later rather
+                // than stalling until the next UI tick, which is the failure
+                // this whole thread exists to remove.
+                m_eventCv.wait_for(lock, std::chrono::milliseconds(250),
+                                   [this] { return m_eventPending || !m_eventThreadRun.load(); });
+                m_eventPending = false;
+            }
+            if (!m_eventThreadRun.load()) break;
+            if (m_mpv && !m_stopping.load()) eventMainLoop();
+        }
+    });
+    mpv_set_wakeup_callback(m_mpv, &MpvPlayer::onMpvWakeup, this);
+}
+
+void MpvPlayer::stopEventThread() {
+    // Drop the callback before the thread goes, so mpv cannot signal a
+    // condition variable that is about to be destroyed.
+    if (m_mpv) mpv_set_wakeup_callback(m_mpv, nullptr, nullptr);
+    if (!m_eventThreadRun.exchange(false)) return;
+    {
+        std::lock_guard<std::mutex> lock(m_eventMutex);
+        m_eventPending = true;
+    }
+    m_eventCv.notify_all();
+    if (m_eventThread.joinable()) m_eventThread.join();
+}
+
+void MpvPlayer::shutdown() {
+    // Before m_stopping and before the handle goes: the thread touches both.
+    stopEventThread();
+
+    if (m_mpv) {
+        brls::Logger::debug("MpvPlayer: Shutting down");
+
+        m_stopping.store(true);
+#ifdef __vita__
+        vitaplex_set_audio_playback_active(false);
+#endif
+
+        // Clean up render context first (locks m_renderMutex to wait for in-flight renders)
+        cleanupRenderContext();
+
+        // Send quit command (like switchfin does in clean())
+        const char* cmd[] = {"quit", NULL};
+        mpv_command(m_mpv, cmd);
+
+#ifdef __vita__
+        // Give mpv time to cleanup
+        sceKernelDelayThread(200000);  // 200ms
+#endif
+
+        mpv_terminate_destroy(m_mpv);
+        m_mpv = nullptr;
+        m_stopping.store(false);
+    }
+
+#ifdef __PS4__
+    // Stop the HTTPS proxy when player shuts down
+    HttpsProxy::getInstance().stop();
+#endif
+
+    m_state = MpvPlayerState::IDLE;
+    m_commandPending = false;
+}
+
+void MpvPlayer::setAudioOnly(bool audioOnly) {
+    if (m_audioOnly == audioOnly) return;
+
+    brls::Logger::info("MpvPlayer: Setting audio-only mode: {}", audioOnly);
+
+    // If player is already initialized, we need to reinitialize with new mode
+    // because vo and hwdec settings can only be set before mpv_initialize
+    if (m_mpv) {
+        brls::Logger::info("MpvPlayer: Reinitializing to change mode...");
+        shutdown();
+    }
+
+    m_audioOnly = audioOnly;
+}
+
+bool MpvPlayer::loadUrl(const std::string& url, const std::string& title,
+                        int64_t expectedDurationMs) {
+    // Set before anything can fail, and unconditionally, so a value from the
+    // previous track can never be read against this one.
+    m_expectedDurationMs.store(expectedDurationMs);
+
+    // A terminated core accepts commands and never runs them, so rebuild
+    // it before loading rather than queueing into a dead handle. init()
+    // re-attaches the Android surface via rebindIfReady().
+    if (m_coreShutdown) {
+        brls::Logger::warning("MpvPlayer: core had shut down — reinitializing before load");
+        shutdown();
+        m_coreShutdown = false;
+    }
+    if (!m_mpv) {
+        if (!init()) {
+            return false;
+        }
+    }
+
+    // Prevent concurrent load operations
+    if (m_commandPending) {
+        brls::Logger::debug("MpvPlayer: Command already pending, ignoring load request");
+        return false;
+    }
+
+    // Discard events left over from a previous playback session. The event
+    // pump lives on PlayerActivity's update timer, which is stopped before
+    // that activity calls stop() — so the END_FILE (and trailing IDLE) that
+    // stop() provokes are still queued here. Drained on the *next* session's
+    // first tick they arrive moments after the loadfile below and stomp the
+    // new file's LOADING state straight back to IDLE, which is why starting
+    // a second video after leaving the first never began playing.
+    int drained = 0;
+    while (true) {
+        mpv_event* stale = mpv_wait_event(m_mpv, 0);
+        if (!stale || stale->event_id == MPV_EVENT_NONE) break;
+        drained++;
+    }
+    if (drained > 0)
+        brls::Logger::debug("MpvPlayer: dropped {} stale event(s) from the previous session", drained);
+
+    std::string normalizedUrl = url;
+
+    // Normalize URL scheme to lowercase for http/https (handles Http, HTTP, HtTp, etc.)
+    if (normalizedUrl.length() > 7) {
+        // Check for http:// or https:// (case insensitive)
+        std::string prefix = normalizedUrl.substr(0, 8);
+        for (auto& c : prefix) c = tolower(c);
+
+        if (prefix.find("http://") == 0 || prefix.find("https://") == 0) {
+            // Find the :// and lowercase everything before it
+            size_t colonPos = normalizedUrl.find("://");
+            if (colonPos != std::string::npos) {
+                for (size_t i = 0; i < colonPos; i++) {
+                    normalizedUrl[i] = tolower(normalizedUrl[i]);
+                }
+            }
+        }
+    }
+
+#ifdef __PS4__
+    // PS4: MPV's ffmpeg cannot open HTTPS URLs (error -13) because the PS4
+    // ffmpeg build lacks TLS support. Route HTTPS through our local proxy
+    // which uses libcurl (with working TLS) to fetch the content.
+    // This supports both local and remote Plex servers.
+    if (normalizedUrl.substr(0, 8) == "https://") {
+        auto& proxy = HttpsProxy::getInstance();
+        if (!proxy.isRunning()) {
+            proxy.start();
+        }
+        if (proxy.isRunning()) {
+            normalizedUrl = proxy.rewriteUrl(normalizedUrl);
+            brls::Logger::info("MpvPlayer: PS4 HTTPS via proxy: {}", redactTokensInUrl(normalizedUrl).substr(0, 100));
+        } else {
+            // Fallback: simple HTTP downgrade (works for local Plex servers)
+            normalizedUrl = "http://" + normalizedUrl.substr(8);
+            brls::Logger::info("MpvPlayer: PS4 HTTPS->HTTP fallback: {}", redactTokensInUrl(normalizedUrl).substr(0, 80));
+        }
+    }
+#endif
+
+    brls::Logger::info("MpvPlayer: Loading URL: {}", redactTokensInUrl(normalizedUrl));
+
+    m_currentUrl = normalizedUrl;
+    m_playbackInfo = MpvPlaybackInfo();
+    m_playbackInfo.mediaTitle = title;
+
+    // Mark command as pending
+    m_commandPending = true;
+
+#ifdef __vita__
+    // Disable render callback during loading to prevent GXM context conflicts.
+    // Will be re-enabled in FILE_LOADED event handler.
+    m_renderReady.store(false);
+#endif
+
+    // Use simple loadfile command - options are already set globally during init()
+    // Format: loadfile <url> [flags]
+    // Note: Per-file options (5th arg) require different format and aren't well supported
+    brls::Logger::debug("MpvPlayer: Sending loadfile command...");
+
+#ifdef __vita__
+    // Flush GPU pipeline before loadfile. When mpv processes the loadfile command,
+    // it spawns decoder threads that use the shared GXM context. If NanoVG's GPU
+    // operations are still in flight, the concurrent GXM access crashes Thread 6.
+    if (m_mpvRenderCtx) {
+        flushGxmPipeline();
+    }
+#endif
+
+    const char* cmd[] = {"loadfile", normalizedUrl.c_str(), "replace", nullptr};
+    int result = mpv_command_async(m_mpv, CMD_LOADFILE, cmd);
+    if (result < 0) {
+        m_errorMessage = std::string("Failed to queue load command: ") + mpv_error_string(result);
+        brls::Logger::error("MpvPlayer: {}", m_errorMessage);
+        m_commandPending = false;
+        setState(MpvPlayerState::ERROR);
+        return false;
+    }
+    brls::Logger::debug("MpvPlayer: loadfile command queued successfully (result={})", result);
+
+    brls::Logger::debug("MpvPlayer: About to call setState(LOADING)...");
+    setState(MpvPlayerState::LOADING);
+    brls::Logger::debug("MpvPlayer: setState done, about to return true");
+    return true;
+}
+
+bool MpvPlayer::loadFile(const std::string& path) {
+    return loadUrl(path, "");
+}
+
+void MpvPlayer::play() {
+    if (!m_mpv || m_stopping) return;
+
+    // From the end, clearing "pause" achieves nothing — the position is
+    // already at EOF, so mpv unpauses and immediately has nothing to play.
+    // Rewinding is what makes "play" mean what it says here, and seekTo
+    // resumes on the way out of ENDED. This is the central fix: every caller
+    // gets it, including the OS media controls and the queue row that maps
+    // "tap the track already playing" onto resume.
+    if (m_state == MpvPlayerState::ENDED) { seekTo(0); return; }
+
+    int paused = 0;
+    mpv_set_property_async(m_mpv, 0, "pause", MPV_FORMAT_FLAG, &paused);
+}
+
+void MpvPlayer::pause() {
+    if (!m_mpv || m_stopping) return;
+
+    int paused = 1;
+    mpv_set_property_async(m_mpv, 0, "pause", MPV_FORMAT_FLAG, &paused);
+}
+
+void MpvPlayer::togglePause() {
+    if (!m_mpv || m_stopping) return;
+
+    // Cycling "pause" at EOF flips a flag and plays nothing. Same as play().
+    if (m_state == MpvPlayerState::ENDED) { seekTo(0); return; }
+
+    const char* cmd[] = {"cycle", "pause", NULL};
+    mpv_command_async(m_mpv, 0, cmd);
+}
+
+void MpvPlayer::stop() {
+    if (!m_mpv || m_stopping) return;
+
+    brls::Logger::debug("MpvPlayer: Stopping playback");
+
+    const char* cmd[] = {"stop", NULL};
+    m_fileUnloaded = false;
+    mpv_command_async(m_mpv, CMD_STOP, cmd);
+
+    // Whatever load was in flight is being abandoned. FILE_LOADED /
+    // PLAYBACK_RESTART would normally clear this, but leaving the player
+    // stops the event pump (PlayerActivity::willDisappear kills the update
+    // timer before calling us), so those events never arrive — and a stale
+    // "pending" makes loadUrl() reject every future load outright.
+    m_commandPending = false;
+
+    // Settle the unload before returning. `stop` is asynchronous, and our
+    // caller is about to kill the only event pump, so without this the
+    // teardown never completes: mpv keeps the file — and its decoder —
+    // open until the process exits.
+    //
+    // That is fatal on Android specifically. The VO holds a MediaCodec
+    // bound to the Java Surface, and a Surface admits only one codec at a
+    // time, so the NEXT loadfile is accepted (COMMAND_REPLY error=0) and
+    // then stalls forever with no START_FILE — the second video simply
+    // never begins. Platforms with a persistent GL window (Linux/GLFW)
+    // have no such exclusive binding, which is why this reproduces only
+    // on Android.
+    //
+    // Bounded so a wedged core can never hang the UI thread; if the
+    // budget runs out we log it and carry on.
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(600);
+    while (!m_fileUnloaded && std::chrono::steady_clock::now() < deadline) {
+        eventMainLoop();
+        if (m_fileUnloaded) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    if (!m_fileUnloaded)
+        brls::Logger::warning("MpvPlayer: stop() timed out waiting for the file to unload");
+    else
+        brls::Logger::info("MpvPlayer: stop() settled — previous file released");
+
+    m_currentUrl.clear();
+    m_playbackInfo = MpvPlaybackInfo();
+    setState(MpvPlayerState::IDLE);
+}
+
+// ENDED is seekable and used to be refused, which is what made every control
+// dead once the last track of a queue finished. keep-open=yes leaves the file
+// loaded and parked at EOF rather than unloading it, so the media is still
+// there to seek within — the state means "played to the end", not "gone".
+bool MpvPlayer::canSeekNow() const {
+    return m_state == MpvPlayerState::PLAYING ||
+           m_state == MpvPlayerState::PAUSED  ||
+           m_state == MpvPlayerState::ENDED;
+}
+
+// Seeking away from the end is a request to hear it again, so it resumes.
+// Nothing else will do it: the pause observer only ever switches between
+// PLAYING and PAUSED, so it cannot take the state out of ENDED on its own.
+void MpvPlayer::resumeIfEnded() {
+    if (m_state != MpvPlayerState::ENDED) return;
+    int paused = 0;
+    mpv_set_property_async(m_mpv, 0, "pause", MPV_FORMAT_FLAG, &paused);
+    setState(MpvPlayerState::PLAYING);
+}
+
+void MpvPlayer::seekTo(double seconds) {
+    if (!m_mpv || m_stopping) return;
+
+    if (!canSeekNow()) {
+        brls::Logger::debug("MpvPlayer: Cannot seek in state {}", (int)m_state.load());
+        return;
+    }
+
+    char timeStr[32];
+    snprintf(timeStr, sizeof(timeStr), "%.2f", seconds);
+
+    const char* cmd[] = {"seek", timeStr, "absolute", NULL};
+    mpv_command_async(m_mpv, CMD_SEEK, cmd);
+    resumeIfEnded();
+}
+
+void MpvPlayer::seekRelative(double seconds) {
+    if (!m_mpv || m_stopping) return;
+
+    if (!canSeekNow()) return;
+
+    // From the end, "relative" has nowhere forward to go and the skip-back
+    // buttons did nothing. Resolve it against the current position and let
+    // seekTo handle it, which also resumes.
+    if (m_state == MpvPlayerState::ENDED) {
+        seekTo(std::max(0.0, getPosition() + seconds));
+        return;
+    }
+
+    // Clamp backward seeks to avoid seeking before stream start (position 0).
+    // On transcoded HLS streams, seeking before 0 can cause MPV to reset to
+    // the beginning or fail, especially on Android.
+    if (seconds < 0) {
+        double pos = getPosition();
+        if (pos + seconds < 0) {
+            seconds = -pos;  // Clamp to position 0
+            if (seconds >= 0) return;  // Already at or near start
+        }
+    }
+
+    char timeStr[32];
+    snprintf(timeStr, sizeof(timeStr), "%+.2f", seconds);
+
+    // Use "relative+keyframes" for faster, more reliable seeking on
+    // transcoded streams (avoids exact-seek issues with HLS segments)
+    const char* cmd[] = {"seek", timeStr, "relative+keyframes", NULL};
+    mpv_command_async(m_mpv, 0, cmd);
+}
+
+void MpvPlayer::seekPercent(double percent) {
+    if (!m_mpv || m_stopping) return;
+
+    if (m_state == MpvPlayerState::LOADING) return;
+
+    char percentStr[32];
+    snprintf(percentStr, sizeof(percentStr), "%.2f", percent);
+
+    const char* cmd[] = {"seek", percentStr, "absolute-percent", NULL};
+    mpv_command_async(m_mpv, 0, cmd);
+}
+
+void MpvPlayer::seekChapter(int delta) {
+    if (!m_mpv || m_stopping) return;
+
+    char deltaStr[16];
+    snprintf(deltaStr, sizeof(deltaStr), "%d", delta);
+
+    const char* cmd[] = {"add", "chapter", deltaStr, NULL};
+    mpv_command_async(m_mpv, 0, cmd);
+}
+
+void MpvPlayer::setVolume(int percent) {
+    if (!m_mpv || m_stopping) return;
+
+    if (percent < 0) percent = 0;
+    if (percent > 150) percent = 150;
+
+    int64_t vol = (int64_t)percent;
+    mpv_set_property_async(m_mpv, 0, "volume", MPV_FORMAT_INT64, &vol);
+}
+
+int MpvPlayer::getVolume() const {
+    if (!m_mpv) return 100;
+
+    int64_t vol = 100;
+    mpv_get_property(m_mpv, "volume", MPV_FORMAT_INT64, &vol);
+    return (int)vol;
+}
+
+void MpvPlayer::adjustVolume(int delta) {
+    setVolume(getVolume() + delta);
+}
+
+void MpvPlayer::setMute(bool muted) {
+    if (!m_mpv || m_stopping) return;
+
+    int val = muted ? 1 : 0;
+    mpv_set_property_async(m_mpv, 0, "mute", MPV_FORMAT_FLAG, &val);
+}
+
+bool MpvPlayer::isMuted() const {
+    if (!m_mpv) return false;
+
+    int val = 0;
+    mpv_get_property(m_mpv, "mute", MPV_FORMAT_FLAG, &val);
+    return val != 0;
+}
+
+void MpvPlayer::toggleMute() {
+    if (!m_mpv || m_stopping) return;
+
+    const char* cmd[] = {"cycle", "mute", NULL};
+    mpv_command_async(m_mpv, 0, cmd);
+}
+
+void MpvPlayer::setSpeed(double speed) {
+    if (!m_mpv || m_stopping) return;
+
+    // mpv will accept far wider than this, but past these the audio filter stops
+    // producing anything intelligible and seeking gets unreliable.
+    if (speed < 0.25) speed = 0.25;
+    if (speed > 4.0)  speed = 4.0;
+
+    mpv_set_property_async(m_mpv, 0, "speed", MPV_FORMAT_DOUBLE, &speed);
+}
+
+double MpvPlayer::getSpeed() const {
+    if (!m_mpv) return 1.0;
+
+    double speed = 1.0;
+    mpv_get_property(m_mpv, "speed", MPV_FORMAT_DOUBLE, &speed);
+    return speed;
+}
+
+void MpvPlayer::setSubtitleTrack(int track) {
+    if (!m_mpv || m_stopping) return;
+
+    int64_t sid = track;
+    mpv_set_property_async(m_mpv, 0, "sid", MPV_FORMAT_INT64, &sid);
+}
+
+void MpvPlayer::setAudioTrack(int track) {
+    if (!m_mpv || m_stopping) return;
+
+    int64_t aid = track;
+    mpv_set_property_async(m_mpv, 0, "aid", MPV_FORMAT_INT64, &aid);
+}
+
+void MpvPlayer::cycleSubtitle() {
+    if (!m_mpv || m_stopping) return;
+
+    const char* cmd[] = {"cycle", "sid", NULL};
+    mpv_command_async(m_mpv, 0, cmd);
+}
+
+void MpvPlayer::cycleAudio() {
+    if (!m_mpv || m_stopping) return;
+
+    const char* cmd[] = {"cycle", "aid", NULL};
+    mpv_command_async(m_mpv, 0, cmd);
+}
+
+void MpvPlayer::setVideoTrack(int track) {
+    if (!m_mpv || m_stopping) return;
+
+    int64_t vid = track;
+    mpv_set_property_async(m_mpv, 0, "vid", MPV_FORMAT_INT64, &vid);
+}
+
+void MpvPlayer::disableSubtitles() {
+    if (!m_mpv || m_stopping) return;
+
+    const char* val = "no";
+    mpv_set_property_async(m_mpv, 0, "sid", MPV_FORMAT_STRING, &val);
+}
+
+std::vector<MpvPlayer::TrackInfo> MpvPlayer::getTrackList(const std::string& type) const {
+    std::vector<TrackInfo> tracks;
+    if (!m_mpv) return tracks;
+
+    // Get the track count
+    int64_t count = 0;
+    if (mpv_get_property(m_mpv, "track-list/count", MPV_FORMAT_INT64, &count) < 0)
+        return tracks;
+
+    for (int64_t i = 0; i < count; i++) {
+        TrackInfo info;
+        char prop[64];
+
+        snprintf(prop, sizeof(prop), "track-list/%lld/id", (long long)i);
+        int64_t tmpId = 0;
+        mpv_get_property(m_mpv, prop, MPV_FORMAT_INT64, &tmpId);
+        info.id = static_cast<int>(tmpId);
+
+        snprintf(prop, sizeof(prop), "track-list/%lld/type", (long long)i);
+        char* val = mpv_get_property_string(m_mpv, prop);
+        if (val) { info.type = val; mpv_free(val); }
+
+        // Filter by type if specified
+        if (!type.empty() && info.type != type) continue;
+
+        snprintf(prop, sizeof(prop), "track-list/%lld/title", (long long)i);
+        val = mpv_get_property_string(m_mpv, prop);
+        if (val) { info.title = val; mpv_free(val); }
+
+        snprintf(prop, sizeof(prop), "track-list/%lld/lang", (long long)i);
+        val = mpv_get_property_string(m_mpv, prop);
+        if (val) { info.lang = val; mpv_free(val); }
+
+        snprintf(prop, sizeof(prop), "track-list/%lld/codec", (long long)i);
+        val = mpv_get_property_string(m_mpv, prop);
+        if (val) { info.codec = val; mpv_free(val); }
+
+        snprintf(prop, sizeof(prop), "track-list/%lld/selected", (long long)i);
+        int sel = 0;
+        mpv_get_property(m_mpv, prop, MPV_FORMAT_FLAG, &sel);
+        info.selected = (sel != 0);
+
+        snprintf(prop, sizeof(prop), "track-list/%lld/default", (long long)i);
+        int def = 0;
+        mpv_get_property(m_mpv, prop, MPV_FORMAT_FLAG, &def);
+        info.isDefault = (def != 0);
+
+        tracks.push_back(info);
+    }
+
+    return tracks;
+}
+
+void MpvPlayer::setSubtitleDelay(double seconds) {
+    if (!m_mpv || m_stopping) return;
+
+    mpv_set_property_async(m_mpv, 0, "sub-delay", MPV_FORMAT_DOUBLE, &seconds);
+}
+
+void MpvPlayer::setAudioDelay(double seconds) {
+    if (!m_mpv || m_stopping) return;
+
+    mpv_set_property_async(m_mpv, 0, "audio-delay", MPV_FORMAT_DOUBLE, &seconds);
+}
+
+void MpvPlayer::toggleSubtitles() {
+    if (!m_mpv || m_stopping) return;
+
+    const char* cmd[] = {"cycle", "sub-visibility", NULL};
+    mpv_command_async(m_mpv, 0, cmd);
+    m_subtitlesVisible = !m_subtitlesVisible;
+}
+
+void MpvPlayer::loadSubtitleUrl(const std::string& url) {
+    if (!m_mpv || m_stopping) return;
+
+    std::string subUrl = url;
+#ifdef __PS4__
+    // Route HTTPS subtitle URLs through the local proxy (same as loadUrl)
+    if (subUrl.length() > 8 && subUrl.substr(0, 8) == "https://") {
+        auto& proxy = HttpsProxy::getInstance();
+        if (proxy.isRunning()) {
+            subUrl = proxy.rewriteUrl(subUrl);
+        } else {
+            subUrl = "http://" + subUrl.substr(8);
+        }
+    }
+#endif
+
+    brls::Logger::info("MpvPlayer: Loading external subtitle: {}", redactTokensInUrl(subUrl));
+    const char* cmd[] = {"sub-add", subUrl.c_str(), "auto", NULL};
+    mpv_command_async(m_mpv, 0, cmd);
+    m_subtitlesVisible = true;
+}
+
+void MpvPlayer::removeExternalSubtitles() {
+    if (!m_mpv || m_stopping) return;
+
+    // Remove all subtitle tracks by setting sid to "no"
+    const char* val = "no";
+    mpv_set_property_async(m_mpv, 0, "sid", MPV_FORMAT_STRING, &val);
+    m_subtitlesVisible = false;
+}
+
+double MpvPlayer::getPosition() const {
+    if (!m_mpv) return 0.0;
+
+    double pos = 0.0;
+    mpv_get_property(m_mpv, "playback-time", MPV_FORMAT_DOUBLE, &pos);
+    return pos;
+}
+
+bool MpvPlayer::isSeekable() const {
+    if (!m_mpv) return false;
+    int flag = 0;
+    if (mpv_get_property(m_mpv, "seekable", MPV_FORMAT_FLAG, &flag) < 0) {
+        // Property not answerable yet (nothing loaded, still opening). Assume
+        // seekable: the caller's fallback is to restart the stream, which is
+        // far more disruptive than a seek that quietly does nothing.
+        return true;
+    }
+    return flag != 0;
+}
+
+double MpvPlayer::getDuration() const {
+    if (!m_mpv) return 0.0;
+
+    double dur = 0.0;
+    mpv_get_property(m_mpv, "duration", MPV_FORMAT_DOUBLE, &dur);
+    return dur;
+}
+
+double MpvPlayer::getPercentPosition() const {
+    double duration = getDuration();
+    if (duration <= 0.0) return 0.0;
+    return (getPosition() / duration) * 100.0;
+}
+
+void MpvPlayer::showOSD(const std::string& text, double durationSec) {
+    if (!m_mpv || m_stopping) return;
+
+    char durStr[16];
+    snprintf(durStr, sizeof(durStr), "%d", (int)(durationSec * 1000));
+
+    const char* cmd[] = {"show-text", text.c_str(), durStr, NULL};
+    mpv_command_async(m_mpv, 0, cmd);
+}
+
+void MpvPlayer::toggleOSD() {
+    if (!m_mpv || m_stopping) return;
+
+    const char* cmd[] = {"cycle-values", "osd-level", "3", "1", NULL};
+    mpv_command_async(m_mpv, 0, cmd);
+}
+
+void MpvPlayer::setOption(const std::string& name, const std::string& value) {
+    if (!m_mpv) return;
+    mpv_set_option_string(m_mpv, name.c_str(), value.c_str());
+}
+
+std::string MpvPlayer::getProperty(const std::string& name) const {
+    if (!m_mpv) return "";
+
+    char* val = mpv_get_property_string(m_mpv, name.c_str());
+    if (!val) return "";
+
+    std::string result(val);
+    mpv_free(val);
+    return result;
+}
+
+#ifdef __ANDROID__
+void MpvPlayer::attachAndroidSurface(int64_t wid) {
+    if (!m_mpv) {
+        // Surface created before MpvPlayer existed (happens every
+        // launch — the activity layout runs first). The Surface global
+        // ref is stashed in the JNI layer; init() will call
+        // android_mpv_surface::rebindIfReady() to re-enter this path
+        // with a live handle.
+        brls::Logger::warning("MpvPlayer: attachAndroidSurface with no mpv handle (will rebind after init)");
+        return;
+    }
+    // wid is the address of a JNI global ref to the Java Surface; mpv's
+    // gpu-context=android calls ANativeWindow_fromSurface() on it. The
+    // option is one of the few that's settable post-init — mpv applies
+    // it on the next VO bring-up.
+    int rc = mpv_set_option(m_mpv, "wid", MPV_FORMAT_INT64, &wid);
+    if (rc < 0) {
+        brls::Logger::error("MpvPlayer: set wid failed: {}", mpv_error_string(rc));
+        return;
+    }
+    // After init these are properties, not options. Mirrors mpv-android
+    // BaseMPVView.surfaceCreated: force-window=yes triggers the VO to
+    // come up on the new wid; setting vo=gpu via property re-enables
+    // the VO if a prior detach had set it to null.
+    mpv_set_property_string(m_mpv, "force-window", "yes");
+    mpv_set_property_string(m_mpv, "vo", "gpu");
+    brls::Logger::info("MpvPlayer: attached Android surface (vo=gpu, force-window=yes)");
+}
+
+void MpvPlayer::detachAndroidSurface() {
+    if (!m_mpv) return;
+    // Tear the VO down before the JNI layer releases the Surface global
+    // ref so mpv doesn't render into a freed window. Mirrors
+    // mpv-android's BaseMPVView.surfaceDestroyed teardown order (vo=null
+    // → force-window=no → drop wid).
+    mpv_set_property_string(m_mpv, "vo", "null");
+    mpv_set_property_string(m_mpv, "force-window", "no");
+    int64_t wid = 0;
+    mpv_set_option(m_mpv, "wid", MPV_FORMAT_INT64, &wid);
+    brls::Logger::info("MpvPlayer: detached Android surface");
+}
+
+void MpvPlayer::setAndroidSurfaceSize(int width, int height) {
+    if (!m_mpv || width <= 0 || height <= 0) return;
+    char buf[32];
+    snprintf(buf, sizeof(buf), "%dx%d", width, height);
+    mpv_set_property_string(m_mpv, "android-surface-size", buf);
+}
+#endif
+
+void MpvPlayer::setState(MpvPlayerState newState) {
+    brls::Logger::debug("MpvPlayer::setState entered with newState={}", (int)newState);
+    if (m_state != newState) {
+        brls::Logger::debug("MpvPlayer: State change: {} -> {}", (int)m_state.load(), (int)newState);
+        m_state = newState;
+
+        // Prevent screen from turning off during playback.
+        //
+        // Deferred to the UI thread: setState now also runs on the event
+        // thread, and this reaches the platform layer (a JNI call on Android).
+        // It is cosmetic, so arriving a frame late is fine — unlike the state
+        // assignment above, which has to be immediate.
+        bool playing = (newState == MpvPlayerState::PLAYING ||
+                       newState == MpvPlayerState::BUFFERING);
+        brls::sync([playing]() {
+            brls::Application::getPlatform()->disableScreenDimming(playing,
+                "MpvPlayer", "VitaPlex");
+        });
+
+#ifdef __vita__
+        // Throttle the borealis main loop during audio-only playback.
+        // The music player screen is mostly static so 30fps is fine,
+        // and the freed CPU time prevents ao_vita audio underruns.
+        if (m_audioOnly) {
+            vitaplex_set_audio_playback_active(playing);
+        }
+#endif
+        brls::Logger::debug("MpvPlayer::setState assignment done");
+    }
+    brls::Logger::debug("MpvPlayer::setState exiting");
+}
+
+void MpvPlayer::update() {
+    if (!m_mpv || m_stopping) return;
+
+    // Process events (matching switchfin's eventMainLoop)
+    eventMainLoop();
+
+    // Update playback info when playing
+    if (m_state == MpvPlayerState::PLAYING || m_state == MpvPlayerState::PAUSED) {
+        updatePlaybackInfo();
+    }
+}
+
+void MpvPlayer::eventMainLoop() {
+    if (!m_mpv) return;
+
+    // See m_pumpMutex: the event thread and the UI thread both drain here.
+    std::lock_guard<std::recursive_mutex> pump(m_pumpMutex);
+    if (!m_mpv) return;   // shutdown may have won the race for the lock
+
+    // Process all pending events (matching switchfin's approach)
+    while (true) {
+        mpv_event* event = mpv_wait_event(m_mpv, 0);
+
+        if (!event || event->event_id == MPV_EVENT_NONE) {
+            return;
+        }
+
+        switch (event->event_id) {
+            case MPV_EVENT_LOG_MESSAGE: {
+                if (event->data) {
+                    mpv_event_log_message* msg = (mpv_event_log_message*)event->data;
+                    // mpv quotes the whole URL back in its stream errors, and
+                    // our URLs carry X-Plex-Token. Logged raw, that put the
+                    // user's long-lived token in a log they then paste into a
+                    // bug report — which is exactly what redactTokensInUrl
+                    // exists to stop. Every level goes through it; the cost is
+                    // a copy on a line we were already formatting.
+                    const std::string text = redactTokensInUrl(msg->text ? msg->text : "");
+                    if (msg->log_level <= MPV_LOG_LEVEL_ERROR) {
+                        brls::Logger::error("mpv {}: {}", msg->prefix, text);
+                    } else if (msg->log_level <= MPV_LOG_LEVEL_WARN) {
+                        brls::Logger::warning("mpv {}: {}", msg->prefix, text);
+#if defined(__PS4__) || defined(__ANDROID__)
+                    } else {
+                        // Pipe info/verbose through borealis::Logger::info on
+                        // PS4 and Android so the diagnostic level we asked
+                        // mpv for actually surfaces in adb logcat. Removable
+                        // once the Android direct-surface path is verified
+                        // stable.
+                        brls::Logger::info("mpv {}: {}", msg->prefix, text);
+#endif
+                    }
+                }
+                break;
+            }
+
+            case MPV_EVENT_SHUTDOWN:
+                // The core is gone. Nothing may be issued on this handle
+                // afterwards — mpv_command_async still returns 0 and even
+                // replies, it just never runs anything. Flag it so the next
+                // load rebuilds the context rather than silently failing.
+                brls::Logger::warning("MpvPlayer: EVENT_SHUTDOWN — core terminated, will reinit on next load");
+                m_coreShutdown = true;
+                m_fileUnloaded = true;
+                setState(MpvPlayerState::IDLE);
+                return;
+
+            case MPV_EVENT_START_FILE:
+                brls::Logger::debug("MpvPlayer: EVENT_START_FILE");
+                setState(MpvPlayerState::LOADING);
+                break;
+
+            case MPV_EVENT_FILE_LOADED:
+                brls::Logger::info("MpvPlayer: EVENT_FILE_LOADED");
+                m_commandPending = false;
+                m_fileUnloaded = false;   // a file is open again
+                // Don't transition to PLAYING yet - wait for PLAYBACK_RESTART
+                break;
+
+            case MPV_EVENT_PLAYBACK_RESTART:
+                brls::Logger::debug("MpvPlayer: EVENT_PLAYBACK_RESTART");
+                m_commandPending = false;
+                // Now safe to say we're playing
+                if (m_state == MpvPlayerState::LOADING || m_state == MpvPlayerState::BUFFERING) {
+                    int paused = 0;
+                    if (mpv_get_property(m_mpv, "pause", MPV_FORMAT_FLAG, &paused) >= 0) {
+                        setState(paused ? MpvPlayerState::PAUSED : MpvPlayerState::PLAYING);
+                    } else {
+                        setState(MpvPlayerState::PLAYING);
+                    }
+                }
+                break;
+
+            case MPV_EVENT_END_FILE: {
+                if (event->data) {
+                    mpv_event_end_file* end = (mpv_event_end_file*)event->data;
+                    brls::Logger::debug("MpvPlayer: EVENT_END_FILE reason={} error={}",
+                                       (int)end->reason, end->error);
+
+                    m_commandPending = false;
+                    // The file (and with it the decoder holding the Android surface) is gone — releases stop()'s wait.
+                    m_fileUnloaded = true;
+
+                    // MPV_END_FILE_REASON_EOF = 0 MPV_END_FILE_REASON_STOP = 2 MPV_END_FILE_REASON_ERROR = 4
+                    if (end->reason == 0) {
+                        setState(MpvPlayerState::ENDED);
+                    } else if (end->reason == 4 || end->error < 0) {
+                        if (end->error < 0) {
+                            m_errorMessage = std::string("Playback error: ") + mpv_error_string(end->error);
+                        } else {
+                            m_errorMessage = "Playback failed";
+                        }
+                        brls::Logger::error("MpvPlayer: {} (reason={}, error={}, url={})",
+                                           m_errorMessage, (int)end->reason, end->error,
+                                           redactTokensInUrl(m_currentUrl.substr(0, 120)));
+                        setState(MpvPlayerState::ERROR);
+                    } else {
+                        setState(MpvPlayerState::IDLE);
+                    }
+                }
+                break;
+            }
+
+            case MPV_EVENT_IDLE:
+                brls::Logger::debug("MpvPlayer: EVENT_IDLE");
+                m_commandPending = false;
+                m_fileUnloaded = true;
+                if (m_state != MpvPlayerState::ERROR && m_state != MpvPlayerState::ENDED) {
+                    setState(MpvPlayerState::IDLE);
+                }
+                break;
+
+            case MPV_EVENT_COMMAND_REPLY:
+                brls::Logger::debug("MpvPlayer: EVENT_COMMAND_REPLY id={} error={}",
+                                   event->reply_userdata, event->error);
+                if (event->reply_userdata == CMD_LOADFILE && event->error < 0) {
+                    m_errorMessage = std::string("Load failed: ") + mpv_error_string(event->error);
+                    brls::Logger::error("MpvPlayer: {}", m_errorMessage);
+                    m_commandPending = false;
+                    setState(MpvPlayerState::ERROR);
+                }
+                break;
+
+            case MPV_EVENT_PROPERTY_CHANGE:
+                if (event->data) {
+                    handlePropertyChange((mpv_event_property*)event->data, event->reply_userdata);
+                }
+                break;
+
+            default:
+                break;
+        }
+    }
+}
+
+void MpvPlayer::handlePropertyChange(mpv_event_property* prop, uint64_t id) {
+    if (!prop || !prop->name) return;
+
+    // Handle property changes based on observer ID (matching switchfin)
+    switch (id) {
+        case 1: // core-idle
+            if (prop->format == MPV_FORMAT_FLAG && prop->data) {
+                bool idle = *(int*)prop->data != 0;
+                brls::Logger::debug("MpvPlayer: core-idle = {}", idle);
+            }
+            break;
+
+        case 2: // pause
+            if (prop->format == MPV_FORMAT_FLAG && prop->data) {
+                bool paused = *(int*)prop->data != 0;
+                if (m_state == MpvPlayerState::PLAYING || m_state == MpvPlayerState::PAUSED) {
+                    setState(paused ? MpvPlayerState::PAUSED : MpvPlayerState::PLAYING);
+                }
+            }
+            break;
+
+        case 3: // duration
+            if (prop->format == MPV_FORMAT_DOUBLE && prop->data) {
+                m_playbackInfo.duration = *(double*)prop->data;
+            }
+            break;
+
+        case 4: // playback-time
+            if (prop->format == MPV_FORMAT_DOUBLE && prop->data) {
+                m_playbackInfo.position = *(double*)prop->data;
+            }
+            break;
+
+        case 5: // cache-speed
+            if (prop->format == MPV_FORMAT_INT64 && prop->data) {
+                m_playbackInfo.cacheUsed = (double)(*(int64_t*)prop->data);
+            }
+            break;
+
+        case 6: // paused-for-cache
+            if (prop->format == MPV_FORMAT_FLAG && prop->data) {
+                bool buffering = *(int*)prop->data != 0;
+                m_playbackInfo.buffering = buffering;
+                if (buffering && m_state == MpvPlayerState::PLAYING) {
+                    setState(MpvPlayerState::BUFFERING);
+                } else if (!buffering && m_state == MpvPlayerState::BUFFERING) {
+                    setState(MpvPlayerState::PLAYING);
+                }
+            }
+            break;
+
+        case 7: // eof-reached
+            if (prop->format == MPV_FORMAT_FLAG && prop->data) {
+                bool eof = *(int*)prop->data != 0;
+                if (eof && (m_state == MpvPlayerState::PLAYING || m_state == MpvPlayerState::PAUSED)) {
+                    // This is what ends a track. keep-open=yes stops mpv
+                    // unloading the file at the end, so MPV_EVENT_END_FILE does
+                    // not fire for a normal finish on any platform — only for a
+                    // stop, an error or a redirect. eof-reached is the signal.
+                    //
+                    // The catch is that the demuxer raises it for a truncated
+                    // read exactly as it does for the real end of a file. A
+                    // dropped connection, a transcode session the server tore
+                    // down, a stall ffmpeg gave up on: all of them arrive here
+                    // as "finished". Acting on that mid-track is heard as the
+                    // music randomly skipping to the next song.
+                    //
+                    // So only believe it near the end of the track. A live
+                    // stream reports no usable duration, and must still be able
+                    // to end, so those are let through.
+                    //
+                    // Which duration matters. mpv's own comes from the stream it
+                    // is reading, so a truncated stream shrinks it to match the
+                    // position — the two agree precisely because the stream
+                    // broke, and comparing them passes every time. A device log
+                    // caught it doing exactly that: "EOF reached at 156.2/156.6s"
+                    // on a track the server had been told all along was 203s.
+                    // So prefer the server's length whenever the caller knew it.
+                    constexpr double kEofSlackSec = 5.0;
+                    const double pos = m_playbackInfo.position;
+                    const int64_t expectedMs = m_expectedDurationMs.load();
+                    const double dur = expectedMs > 0 ? expectedMs / 1000.0
+                                                      : m_playbackInfo.duration;
+
+                    if (dur <= 0.0 || pos >= dur - kEofSlackSec) {
+                        brls::Logger::debug("MpvPlayer: EOF reached at {:.1f}/{:.1f}s", pos, dur);
+                        setState(MpvPlayerState::ENDED);
+                    } else {
+                        // Not the end of the track — the stream died early.
+                        // Report it rather than skipping: silently advancing is
+                        // what made this look random instead of like a network
+                        // fault.
+                        m_errorMessage = "Stream ended early";
+                        brls::Logger::error(
+                            "MpvPlayer: stream ended at {:.1f}s of {:.1f}s — treating as a "
+                            "broken stream, not end of track (url={})",
+                            pos, dur, m_currentUrl.substr(0, 120));
+                        setState(MpvPlayerState::ERROR);
+                    }
+                }
+            }
+            break;
+
+        case 8: // seeking
+            if (prop->format == MPV_FORMAT_FLAG && prop->data) {
+                m_playbackInfo.seeking = *(int*)prop->data != 0;
+            }
+            break;
+
+        case 9: // speed
+            if (prop->format == MPV_FORMAT_DOUBLE && prop->data) {
+                // Could store playback speed if needed
+            }
+            break;
+
+        case 10: // volume
+            if (prop->format == MPV_FORMAT_INT64 && prop->data) {
+                m_playbackInfo.volume = (int)(*(int64_t*)prop->data);
+            }
+            break;
+    }
+}
+
+void MpvPlayer::updatePlaybackInfo() {
+    if (!m_mpv || m_state == MpvPlayerState::IDLE || m_state == MpvPlayerState::LOADING) return;
+
+    // m_playbackInfo is written here on the UI thread and by the observed
+    // property handlers on the event thread. Those run inside eventMainLoop,
+    // which holds this same lock, so taking it here is what keeps the struct
+    // from being written by both at once.
+    std::lock_guard<std::recursive_mutex> pump(m_pumpMutex);
+
+    // Get video codec info if not yet fetched
+    if (m_playbackInfo.videoCodec.empty() && m_state == MpvPlayerState::PLAYING) {
+        char* val = mpv_get_property_string(m_mpv, "video-codec");
+        if (val) {
+            m_playbackInfo.videoCodec = val;
+            mpv_free(val);
+        }
+
+        int64_t w = 0, h = 0;
+        mpv_get_property(m_mpv, "width", MPV_FORMAT_INT64, &w);
+        mpv_get_property(m_mpv, "height", MPV_FORMAT_INT64, &h);
+        m_playbackInfo.videoWidth = (int)w;
+        m_playbackInfo.videoHeight = (int)h;
+
+        double fps = 0.0;
+        mpv_get_property(m_mpv, "estimated-vf-fps", MPV_FORMAT_DOUBLE, &fps);
+        m_playbackInfo.fps = fps;
+
+        if (m_playbackInfo.videoWidth > 0) {
+            brls::Logger::info("MpvPlayer: Video {}x{} @ {:.2f}fps codec={}",
+                              m_playbackInfo.videoWidth, m_playbackInfo.videoHeight,
+                              m_playbackInfo.fps, m_playbackInfo.videoCodec);
+        }
+    }
+
+    if (m_playbackInfo.audioCodec.empty() && m_state == MpvPlayerState::PLAYING) {
+        char* val = mpv_get_property_string(m_mpv, "audio-codec");
+        if (val) {
+            m_playbackInfo.audioCodec = val;
+            mpv_free(val);
+        }
+
+        int64_t ch = 0, sr = 0;
+        mpv_get_property(m_mpv, "audio-params/channel-count", MPV_FORMAT_INT64, &ch);
+        mpv_get_property(m_mpv, "audio-params/samplerate", MPV_FORMAT_INT64, &sr);
+        m_playbackInfo.audioChannels = (int)ch;
+        m_playbackInfo.sampleRate = (int)sr;
+
+        if (m_playbackInfo.audioChannels > 0) {
+            brls::Logger::info("MpvPlayer: Audio {}ch @ {}Hz codec={}",
+                              m_playbackInfo.audioChannels, m_playbackInfo.sampleRate,
+                              m_playbackInfo.audioCodec);
+        }
+    }
+}
+
+// Callback for mpv render context when a new frame is ready.
+// Matches switchfin: always queue via brls::sync(), never drop the signal.
+// brls::sync() callbacks run AFTER nvgEndFrame() so there's no GXM conflict.
+void MpvPlayer::onRenderUpdate(void* ctx) {
+    MpvPlayer* player = static_cast<MpvPlayer*>(ctx);
+    if (!player || player->m_stopping.load()) {
+        return;
+    }
+
+    // Always queue render on main thread (matching switchfin exactly).
+    // Do NOT check m_renderReady here — dropping signals before FILE_LOADED
+    // causes mpv to stop sending update callbacks, resulting in a black screen.
+    brls::sync([player]() {
+        if (player->m_stopping.load() || !player->m_mpvRenderCtx) {
+            return;
+        }
+
+        uint64_t flags = mpv_render_context_update(player->m_mpvRenderCtx);
+        if (flags & MPV_RENDER_UPDATE_FRAME) {
+#ifdef __vita__
+            mpv_render_context_render(player->m_mpvRenderCtx, player->m_mpvParams);
+            mpv_render_context_report_swap(player->m_mpvRenderCtx);
+#elif defined(__ANDROID__)
+            std::lock_guard<std::mutex> lock(player->m_renderMutex);
+            if (!player->m_mpvRenderCtx || player->m_glFbo == 0) {
+                return;
+            }
+            // mpv renders directly into our FBO (which is backed by the
+            // NanoVG-managed GL texture). No CPU copy, no nvgUpdateImage.
+            //
+            // Save the current GL state that mpv might clobber and restore it
+            // afterwards. Crucially, explicitly bind our FBO and set a viewport
+            // covering the whole FBO before rendering — mpv's OpenGL backend
+            // inherits the active viewport, and by the time this sync callback
+            // runs NanoVG/borealis has left the viewport set to its last draw
+            // region (typically a small OSD rect). Without this, mpv renders
+            // the entire video into that sub-rect of the 1920x1080 FBO,
+            // producing a tiny video strip surrounded by mpv's clear color.
+            GLint prevFbo = 0;
+            GLint prevViewport[4] = {0, 0, 0, 0};
+            glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &prevFbo);
+            glGetIntegerv(GL_VIEWPORT, prevViewport);
+
+            glBindFramebuffer(GL_FRAMEBUFFER, player->m_glFbo);
+            glViewport(0, 0, player->m_videoWidth, player->m_videoHeight);
+
+            mpv_render_context_render(player->m_mpvRenderCtx, player->m_mpvParams);
+            mpv_render_context_report_swap(player->m_mpvRenderCtx);
+
+            // Restore the previous GL state so NanoVG's next frame sees what it expects.
+            glBindFramebuffer(GL_FRAMEBUFFER, (GLuint)prevFbo);
+            glViewport(prevViewport[0], prevViewport[1],
+                       prevViewport[2], prevViewport[3]);
+#else
+            std::lock_guard<std::mutex> lock(player->m_renderMutex);
+#if defined(__SWITCH__) && defined(BOREALIS_USE_OPENGL)
+            if (player->m_useGlRender) {
+                if (!player->m_mpvRenderCtx || player->m_glFbo == 0) {
+                    return;
+                }
+                // mpv renders straight into our FBO (backed by the NanoVG GL
+                // texture) — no CPU copy, no nvgUpdateImage. Save the GL state
+                // mpv clobbers and bind our FBO + a full-FBO viewport first: by
+                // the time this brls::sync callback runs, NanoVG has left the
+                // viewport on its last (small) draw rect, and mpv's GL backend
+                // inherits the active viewport. Without this the video lands in
+                // a tiny sub-rect surrounded by mpv's clear color.
+                GLint prevFbo = 0;
+                GLint prevViewport[4] = {0, 0, 0, 0};
+                glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &prevFbo);
+                glGetIntegerv(GL_VIEWPORT, prevViewport);
+
+                glBindFramebuffer(GL_FRAMEBUFFER, player->m_glFbo);
+                glViewport(0, 0, player->m_videoWidth, player->m_videoHeight);
+
+                mpv_opengl_fbo* glFbo = &player->m_mpvOpenGLFbo;
+                mpv_render_param glParams[] = {
+                    {MPV_RENDER_PARAM_OPENGL_FBO, glFbo},
+                    {MPV_RENDER_PARAM_INVALID, nullptr},
+                };
+                mpv_render_context_render(player->m_mpvRenderCtx, glParams);
+                mpv_render_context_report_swap(player->m_mpvRenderCtx);
+
+                glBindFramebuffer(GL_FRAMEBUFFER, (GLuint)prevFbo);
+                glViewport(prevViewport[0], prevViewport[1],
+                           prevViewport[2], prevViewport[3]);
+                return;
+            }
+#endif
+            if (player->m_videoBuffer.empty() || player->m_videoWidth <= 0 || player->m_videoHeight <= 0) {
+                return;
+            }
+
+            int swSize[2] = {player->m_videoWidth, player->m_videoHeight};
+            int swStride = player->m_videoWidth * 4;
+            char swFormat[] = "rgba";
+            void* swPixels = player->m_videoBuffer.data();
+            mpv_render_param swParams[] = {
+                {MPV_RENDER_PARAM_SW_SIZE, swSize},
+                {MPV_RENDER_PARAM_SW_FORMAT, swFormat},
+                {MPV_RENDER_PARAM_SW_STRIDE, &swStride},
+                {MPV_RENDER_PARAM_SW_POINTER, swPixels},
+                {MPV_RENDER_PARAM_INVALID, nullptr},
+            };
+            mpv_render_context_render(player->m_mpvRenderCtx, swParams);
+            mpv_render_context_report_swap(player->m_mpvRenderCtx);
+
+            NVGcontext* vg = brls::Application::getNVGContext();
+            if (vg && player->m_nvgImage != 0) {
+                nvgUpdateImage(vg, player->m_nvgImage, player->m_videoBuffer.data());
+            }
+#endif
+        }
+    });
+}
+
+bool MpvPlayer::initRenderContext() {
+#ifdef __vita__
+    if (m_mpvRenderCtx) {
+        brls::Logger::debug("MpvPlayer: Render context already exists");
+        return true;
+    }
+
+    if (!m_mpv) {
+        brls::Logger::error("MpvPlayer: Cannot create render context - mpv not initialized");
+        return false;
+    }
+
+    brls::Logger::info("MpvPlayer: Creating GXM render context...");
+
+    // Get the GXM window from borealis
+    brls::PsvVideoContext* videoContext = dynamic_cast<brls::PsvVideoContext*>(
+        brls::Application::getPlatform()->getVideoContext());
+    if (!videoContext) {
+        brls::Logger::error("MpvPlayer: Failed to get PSV video context - will play audio only");
+        return false;
+    }
+
+    NVGXMwindow* gxm = videoContext->getWindow();
+    if (!gxm) {
+        brls::Logger::error("MpvPlayer: Failed to get GXM window - will play audio only");
+        return false;
+    }
+
+    if (!gxm->context || !gxm->shader_patcher) {
+        brls::Logger::error("MpvPlayer: GXM context or shader_patcher is null - will play audio only");
+        return false;
+    }
+
+    NVGcontext* vg = brls::Application::getNVGContext();
+    if (!vg) {
+        brls::Logger::error("MpvPlayer: Failed to get NanoVG context - will play audio only");
+        return false;
+    }
+
+    brls::Logger::info("MpvPlayer: GXM context acquired, setting up render params...");
+
+    // Set up GXM init parameters (matching switchfin)
+    mpv_gxm_init_params gxm_params = {
+        .context = gxm->context,
+        .shader_patcher = gxm->shader_patcher,
+        .buffer_index = 0,
+        .msaa = SCE_GXM_MULTISAMPLE_4X,  // Match switchfin
+    };
+
+    brls::Logger::info("MpvPlayer: Setting up MPV render params with API type: {}", MPV_RENDER_API_TYPE_GXM);
+
+    mpv_render_param params[] = {
+        {MPV_RENDER_PARAM_API_TYPE, const_cast<char*>(MPV_RENDER_API_TYPE_GXM)},
+        {MPV_RENDER_PARAM_GXM_INIT_PARAMS, &gxm_params},
+        {MPV_RENDER_PARAM_INVALID, nullptr},
+    };
+
+    // Flush the GPU pipeline before sharing the GXM context with mpv.
+    // mpv's decoder threads will use this context, and GXM is not thread-safe.
+    flushGxmPipeline();
+
+    // Create render context
+    brls::Logger::info("MpvPlayer: Calling mpv_render_context_create...");
+    int result = mpv_render_context_create(&m_mpvRenderCtx, m_mpv, params);
+    if (result < 0) {
+        brls::Logger::error("MpvPlayer: Failed to create GXM render context: {} (code {})",
+                           mpv_error_string(result), result);
+        brls::Logger::error("MpvPlayer: Will continue with audio-only playback");
+        return false;
+    }
+
+    brls::Logger::info("MpvPlayer: GXM render context created successfully!");
+
+    // Create NanoVG image and GXM framebuffer for video output
+    m_videoWidth = DISPLAY_WIDTH;
+    m_videoHeight = DISPLAY_HEIGHT;
+    int texture_stride = ALIGN(m_videoWidth, 8);
+
+    // Create NanoVG image with zeroed (black) pixel data.
+    // Passing nullptr would leave the GXM texture uninitialized, which can cause
+    // a GPU fault if NanoVG's draw pipeline touches it before MPV renders a frame.
+    size_t pixelDataSize = (size_t)m_videoWidth * m_videoHeight * 4;
+    std::vector<unsigned char> blackPixels(pixelDataSize, 0);
+    m_nvgImage = nvgCreateImageRGBA(vg, m_videoWidth, m_videoHeight, 0, blackPixels.data());
+    if (m_nvgImage == 0) {
+        brls::Logger::error("MpvPlayer: Failed to create NanoVG image");
+        mpv_render_context_free(m_mpvRenderCtx);
+        m_mpvRenderCtx = nullptr;
+        return false;
+    }
+
+    // Get the texture from NanoVG image for GXM framebuffer
+    NVGXMtexture* texture = nvgxmImageHandle(vg, m_nvgImage);
+    if (!texture) {
+        brls::Logger::error("MpvPlayer: Failed to get NanoVG texture handle");
+        nvgDeleteImage(vg, m_nvgImage);
+        m_nvgImage = 0;
+        mpv_render_context_free(m_mpvRenderCtx);
+        m_mpvRenderCtx = nullptr;
+        return false;
+    }
+
+    // Create GXM framebuffer for MPV to render to
+    NVGXMframebufferInitOptions framebufferOpts = {
+        .display_buffer_count = 1,
+        .scenesPerFrame = 1,
+        .render_target = texture,
+        .color_format = SCE_GXM_COLOR_FORMAT_U8U8U8U8_ABGR,
+        .color_surface_type = SCE_GXM_COLOR_SURFACE_LINEAR,
+        .display_width = m_videoWidth,
+        .display_height = m_videoHeight,
+        .display_stride = texture_stride,
+    };
+
+    NVGXMframebuffer* fbo = gxmCreateFramebuffer(&framebufferOpts);
+    if (!fbo) {
+        brls::Logger::error("MpvPlayer: Failed to create GXM framebuffer");
+        nvgDeleteImage(vg, m_nvgImage);
+        m_nvgImage = 0;
+        mpv_render_context_free(m_mpvRenderCtx);
+        m_mpvRenderCtx = nullptr;
+        return false;
+    }
+
+    m_gxmFramebuffer = fbo;
+
+    // Set up MPV FBO parameters (matching switchfin exactly)
+    m_mpvFbo.render_target = fbo->gxm_render_target;
+    m_mpvFbo.color_surface = &fbo->gxm_color_surfaces[0].surface;
+    m_mpvFbo.depth_stencil_surface = &fbo->gxm_depth_stencil_surface;
+    m_mpvFbo.w = m_videoWidth;
+    m_mpvFbo.h = m_videoHeight;
+    m_mpvFbo.format = SCE_GXM_TEXTURE_FORMAT_U8U8U8U8_RGBA;  // Must match NanoVG texture format
+
+    // Set up render params array (matching switchfin: FLIP_Y + GXM_FBO + terminator)
+    m_mpvParams[0] = {MPV_RENDER_PARAM_FLIP_Y, &m_flipY};
+    m_mpvParams[1] = {MPV_RENDER_PARAM_GXM_FBO, &m_mpvFbo};
+    m_mpvParams[2] = {MPV_RENDER_PARAM_INVALID, nullptr};
+
+    // Register the render update callback but keep m_renderReady=false.
+    // The callback checks m_renderReady and will skip rendering until it's true.
+    // We defer setting m_renderReady=true until FILE_LOADED event, so MPV's
+    // render callback doesn't use the shared GXM context during the loading phase
+    // (which would conflict with NanoVG on the main thread).
+    mpv_render_context_set_update_callback(m_mpvRenderCtx, onRenderUpdate, this);
+
+    // Flush the GXM pipeline after all resource creation to ensure:
+    // 1. mpv_render_context_create's shader patcher ops are fully committed
+    // 2. The framebuffer's render target and surfaces are finalized
+    // 3. The NanoVG texture upload (black pixels) is complete
+    // Without this flush, the next NanoVG draw frame can hit stale/conflicting
+    // GXM state left behind by the render context and framebuffer creation.
+    flushGxmPipeline();
+
+    brls::Logger::info("MpvPlayer: GXM render context created successfully ({}x{})", m_videoWidth, m_videoHeight);
+    return true;
+#elif defined(__ANDROID__)
+    // Android/Android TV: zero-copy OpenGL rendering. mpv renders directly
+    // into a NanoVG-managed GL texture via our FBO. Combined with
+    // hwdec=mediacodec (GPU interop), the whole pipeline stays on the GPU —
+    // critical for weak Android TV SoCs that can't sustain CPU framebuffer
+    // copies at 1080p60.
+    if (m_mpvRenderCtx) {
+        return true;
+    }
+    if (!m_mpv) {
+        return false;
+    }
+
+    NVGcontext* vg = brls::Application::getNVGContext();
+    if (!vg) {
+        brls::Logger::error("MpvPlayer: Failed to get NanoVG context");
+        return false;
+    }
+
+    // Render-target resolution. mpv scales/letterboxes internally to fit.
+    // 1080p matches the Android TV display while keeping GL texture memory
+    // modest (~8 MB for RGBA8).
+    m_videoWidth = 1920;
+    m_videoHeight = 1080;
+
+    // Create an initially-black NanoVG image; we'll pull out the underlying
+    // GL texture and bind it to our own FBO as the color attachment. Zero-init
+    // prevents showing undefined pixels for the first frame before mpv renders.
+    //
+    // Orientation: mpv's OpenGL renderer writes into the FBO using the same
+    // top-left origin NanoVG assumes for uploaded image data (mpv's GLES
+    // backend flips into that convention internally). So we use zero flags
+    // here and leave mpv's FLIP_Y param unset. Applying NVG_IMAGE_FLIPY OR
+    // MPV_RENDER_PARAM_FLIP_Y alone produces an upside-down picture; this
+    // "no flip" combination matches the actual orientation mpv delivers.
+    std::vector<unsigned char> blackPixels((size_t)m_videoWidth * (size_t)m_videoHeight * 4, 0);
+    m_nvgImage = nvgCreateImageRGBA(vg, m_videoWidth, m_videoHeight, 0, blackPixels.data());
+    if (m_nvgImage == 0) {
+        brls::Logger::error("MpvPlayer: Failed to create NanoVG video image");
+        return false;
+    }
+
+    GLuint glTexture = nvglImageHandleGLES3(vg, m_nvgImage);
+    if (glTexture == 0) {
+        brls::Logger::error("MpvPlayer: Failed to get GL texture handle from NanoVG image");
+        nvgDeleteImage(vg, m_nvgImage);
+        m_nvgImage = 0;
+        return false;
+    }
+
+    // Create the GL framebuffer and attach the NanoVG texture.
+    glGenFramebuffers(1, &m_glFbo);
+    glBindFramebuffer(GL_FRAMEBUFFER, m_glFbo);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                           GL_TEXTURE_2D, glTexture, 0);
+    GLenum status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    if (status != GL_FRAMEBUFFER_COMPLETE) {
+        brls::Logger::error("MpvPlayer: GL framebuffer incomplete: 0x{:x}", (unsigned)status);
+        glDeleteFramebuffers(1, &m_glFbo);
+        m_glFbo = 0;
+        nvgDeleteImage(vg, m_nvgImage);
+        m_nvgImage = 0;
+        return false;
+    }
+
+    // Hand SDL's GL proc loader to mpv's GL backend.
+    mpv_opengl_init_params glInit = {};
+    glInit.get_proc_address = mpvGlGetProcAddress;
+    glInit.get_proc_address_ctx = nullptr;
+
+    mpv_render_param params[] = {
+        {MPV_RENDER_PARAM_API_TYPE, const_cast<char*>(MPV_RENDER_API_TYPE_OPENGL)},
+        {MPV_RENDER_PARAM_OPENGL_INIT_PARAMS, &glInit},
+        {MPV_RENDER_PARAM_INVALID, nullptr},
+    };
+
+    int result = mpv_render_context_create(&m_mpvRenderCtx, m_mpv, params);
+    if (result < 0) {
+        brls::Logger::error("MpvPlayer: Failed to create OpenGL render context: {}",
+                            mpv_error_string(result));
+        glDeleteFramebuffers(1, &m_glFbo);
+        m_glFbo = 0;
+        nvgDeleteImage(vg, m_nvgImage);
+        m_nvgImage = 0;
+        return false;
+    }
+
+    // Per-frame render params: FBO only. mpv's OpenGL-ES backend already
+    // writes in the top-down orientation NanoVG expects for its uploaded
+    // images, so we neither set NVG_IMAGE_FLIPY on the NanoVG image nor
+    // pass MPV_RENDER_PARAM_FLIP_Y here. Adding either gives an upside-down
+    // picture (single flip); having both cancels back to correct.
+    m_mpvOpenGLFbo.fbo = (int)m_glFbo;
+    m_mpvOpenGLFbo.w = m_videoWidth;
+    m_mpvOpenGLFbo.h = m_videoHeight;
+    m_mpvOpenGLFbo.internal_format = GL_RGBA8;
+
+    m_mpvParams[0] = {MPV_RENDER_PARAM_OPENGL_FBO, &m_mpvOpenGLFbo};
+    m_mpvParams[1] = {MPV_RENDER_PARAM_INVALID, nullptr};
+
+    mpv_render_context_set_update_callback(m_mpvRenderCtx, onRenderUpdate, this);
+    m_renderReady.store(true);
+    brls::Logger::info("MpvPlayer: Android OpenGL render context initialized ({}x{})",
+                       m_videoWidth, m_videoHeight);
+    return true;
+#else
+    if (m_mpvRenderCtx) {
+        return true;
+    }
+    if (!m_mpv) {
+        return false;
+    }
+
+#if defined(__SWITCH__) && defined(BOREALIS_USE_OPENGL)
+    // Try the OpenGL GPU render path first (mirrors the Android path, but GL3 +
+    // GLFW instead of GLES3 + SDL). mpv renders into a GPU texture, so there's
+    // no per-frame CPU framebuffer upload — the main fix for choppy Switch
+    // video. If the prebuilt switch-libmpv lacks GL render support this fails
+    // cleanly and we fall through to the software path below, so the worst case
+    // is exactly today's working behavior, never a regression to audio-only.
+    {
+        NVGcontext* glVg = brls::Application::getNVGContext();
+        if (glVg) {
+            // 720p target: native for the handheld screen (no upscale),
+            // cheaply GPU-upscaled when docked, half the texture memory of
+            // 1080p. GPU scaling is cheap here, unlike the software path.
+            m_videoWidth  = 1280;
+            m_videoHeight = 720;
+
+            std::vector<unsigned char> blackPixels(
+                (size_t)m_videoWidth * (size_t)m_videoHeight * 4, 0);
+            int nvgImage = nvgCreateImageRGBA(glVg, m_videoWidth, m_videoHeight,
+                                              0, blackPixels.data());
+            GLuint glTexture = nvgImage ? nvglImageHandleGL3(glVg, nvgImage) : 0;
+
+            GLuint glFbo = 0;
+            GLenum status = GL_FRAMEBUFFER_UNSUPPORTED;
+            if (glTexture != 0) {
+                glGenFramebuffers(1, &glFbo);
+                glBindFramebuffer(GL_FRAMEBUFFER, glFbo);
+                glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                                       GL_TEXTURE_2D, glTexture, 0);
+                status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+                glBindFramebuffer(GL_FRAMEBUFFER, 0);
+            }
+
+            if (glTexture != 0 && status == GL_FRAMEBUFFER_COMPLETE) {
+                mpv_opengl_init_params glInit = {};
+                glInit.get_proc_address = mpvSwitchGlGetProcAddress;
+                glInit.get_proc_address_ctx = nullptr;
+
+                mpv_render_param params[] = {
+                    {MPV_RENDER_PARAM_API_TYPE,
+                     const_cast<char*>(MPV_RENDER_API_TYPE_OPENGL)},
+                    {MPV_RENDER_PARAM_OPENGL_INIT_PARAMS, &glInit},
+                    {MPV_RENDER_PARAM_INVALID, nullptr},
+                };
+
+                int result = mpv_render_context_create(&m_mpvRenderCtx, m_mpv,
+                                                       params);
+                if (result >= 0) {
+                    m_nvgImage = nvgImage;
+                    m_glFbo = glFbo;
+                    // Orientation: mpv's GL backend writes top-down into the FBO
+                    // the same way NanoVG expects its uploaded images, so no flip
+                    // on either side — matching the Android path, which shares
+                    // mpv's GL renderer. If video comes out upside down, this is
+                    // the one knob to flip (NVG_IMAGE_FLIPY or FLIP_Y param).
+                    m_mpvOpenGLFbo.fbo = (int)m_glFbo;
+                    m_mpvOpenGLFbo.w = m_videoWidth;
+                    m_mpvOpenGLFbo.h = m_videoHeight;
+                    m_mpvOpenGLFbo.internal_format = GL_RGBA8;
+                    m_useGlRender = true;
+
+                    mpv_render_context_set_update_callback(m_mpvRenderCtx,
+                                                           onRenderUpdate, this);
+                    m_renderReady.store(true);
+                    brls::Logger::info(
+                        "MpvPlayer: Switch OpenGL render context initialized "
+                        "({}x{})", m_videoWidth, m_videoHeight);
+                    return true;
+                }
+                brls::Logger::warning(
+                    "MpvPlayer: OpenGL render context create failed ({}), "
+                    "falling back to software", mpv_error_string(result));
+            } else {
+                brls::Logger::warning(
+                    "MpvPlayer: OpenGL FBO setup failed (tex={}, status=0x{:x}),"
+                    " falling back to software",
+                    (unsigned)glTexture, (unsigned)status);
+            }
+
+            // GL path failed — tear down partial resources so the software path
+            // below recreates its own image/buffer from a clean slate.
+            m_mpvRenderCtx = nullptr;
+            if (glFbo != 0) {
+                glDeleteFramebuffers(1, &glFbo);
+            }
+            if (nvgImage != 0) {
+                nvgDeleteImage(glVg, nvgImage);
+            }
+            m_glFbo = 0;
+            m_nvgImage = 0;
+            m_useGlRender = false;
+        }
+    }
+#endif
+
+    NVGcontext* vg = brls::Application::getNVGContext();
+    if (!vg) {
+        brls::Logger::error("MpvPlayer: Failed to get NanoVG context for non-Vita render");
+        return false;
+    }
+
+    {
+        const auto& vc = platform::getVideoConstraints();
+        m_videoWidth  = vc.maxVideoWidth;
+        m_videoHeight = vc.maxVideoHeight;
+#ifdef __SWITCH__
+        // Switch uses mpv's SOFTWARE render API: every frame mpv scales the
+        // decoded picture into a CPU RGBA buffer that we then upload to a GL
+        // texture. A 1080p target means upscaling the (usually 720p) transcode
+        // on the CPU and pushing an ~8 MB texture per frame — a big chunk of the
+        // choppiness. Cap the render target at 720p: native for the handheld
+        // screen (no upscale), cheaply GPU-upscaled when docked, and roughly
+        // half the per-frame CPU + upload cost. (The real cure is a GPU mpv
+        // render path; this keeps the software path smooth meanwhile.)
+        if (m_videoWidth  > 1280) m_videoWidth  = 1280;
+        if (m_videoHeight > 720)  m_videoHeight = 720;
+#endif
+    }
+    m_videoBuffer.assign((size_t)m_videoWidth * (size_t)m_videoHeight * 4, 0);
+
+    m_nvgImage = nvgCreateImageRGBA(vg, m_videoWidth, m_videoHeight, 0, m_videoBuffer.data());
+    if (m_nvgImage == 0) {
+        brls::Logger::error("MpvPlayer: Failed to create non-Vita video image");
+        return false;
+    }
+
+    char apiType[] = MPV_RENDER_API_TYPE_SW;
+    mpv_render_param params[] = {
+        {MPV_RENDER_PARAM_API_TYPE, apiType},
+        {MPV_RENDER_PARAM_INVALID, nullptr},
+    };
+
+    int result = mpv_render_context_create(&m_mpvRenderCtx, m_mpv, params);
+    if (result < 0) {
+        brls::Logger::error("MpvPlayer: Failed to create SW render context: {}", mpv_error_string(result));
+        nvgDeleteImage(vg, m_nvgImage);
+        m_nvgImage = 0;
+        return false;
+    }
+
+    mpv_render_context_set_update_callback(m_mpvRenderCtx, onRenderUpdate, this);
+    m_renderReady.store(true);
+    brls::Logger::info("MpvPlayer: Non-Vita software render context initialized");
+    return true;
+#endif
+}
+
+void MpvPlayer::cleanupRenderContext() {
+#ifdef __vita__
+    // Signal that render is no longer ready FIRST (atomic, visible to mpv thread immediately)
+    m_renderReady.store(false);
+
+    // Flush GPU pipeline before freeing GXM resources
+    flushGxmPipeline();
+
+    {
+        // Lock the render mutex to ensure no in-flight render callback is accessing GXM resources while we free them
+        std::lock_guard<std::mutex> lock(m_renderMutex);
+
+        if (m_mpvRenderCtx) {
+            brls::Logger::debug("MpvPlayer: Cleaning up GXM render context");
+            mpv_render_context_free(m_mpvRenderCtx);
+            m_mpvRenderCtx = nullptr;
+        }
+
+        // Clean up GXM framebuffer
+        if (m_gxmFramebuffer) {
+            gxmDeleteFramebuffer(static_cast<NVGXMframebuffer*>(m_gxmFramebuffer));
+            m_gxmFramebuffer = nullptr;
+        }
+
+        // Clean up NanoVG image
+        NVGcontext* vg = brls::Application::getNVGContext();
+        if (m_nvgImage && vg) {
+            nvgDeleteImage(vg, m_nvgImage);
+            m_nvgImage = 0;
+        }
+
+        // Reset FBO and render params
+        m_mpvFbo = {};
+        m_mpvParams[0] = {MPV_RENDER_PARAM_INVALID, nullptr};
+        m_mpvParams[1] = {MPV_RENDER_PARAM_INVALID, nullptr};
+        m_mpvParams[2] = {MPV_RENDER_PARAM_INVALID, nullptr};
+    }
+#elif defined(__ANDROID__)
+    m_renderReady.store(false);
+    std::lock_guard<std::mutex> lock(m_renderMutex);
+    if (m_mpvRenderCtx) {
+        // Free the render context before the GL resources so mpv's GL
+        // backend has a chance to tear down its own GL objects.
+        mpv_render_context_free(m_mpvRenderCtx);
+        m_mpvRenderCtx = nullptr;
+    }
+    if (m_glFbo) {
+        glDeleteFramebuffers(1, &m_glFbo);
+        m_glFbo = 0;
+    }
+    {
+        NVGcontext* vg = brls::Application::getNVGContext();
+        if (m_nvgImage && vg) {
+            nvgDeleteImage(vg, m_nvgImage);
+            m_nvgImage = 0;
+        }
+    }
+    m_mpvOpenGLFbo = {};
+    m_mpvParams[0] = {MPV_RENDER_PARAM_INVALID, nullptr};
+    m_mpvParams[1] = {MPV_RENDER_PARAM_INVALID, nullptr};
+    m_mpvParams[2] = {MPV_RENDER_PARAM_INVALID, nullptr};
+#else
+    m_renderReady.store(false);
+    std::lock_guard<std::mutex> lock(m_renderMutex);
+    if (m_mpvRenderCtx) {
+        mpv_render_context_free(m_mpvRenderCtx);
+        m_mpvRenderCtx = nullptr;
+    }
+#if defined(__SWITCH__) && defined(BOREALIS_USE_OPENGL)
+    // GL path: free the FBO (no-op when the software fallback was active, since
+    // m_glFbo stays 0). The NanoVG image is freed below — shared with SW.
+    if (m_glFbo) {
+        glDeleteFramebuffers(1, &m_glFbo);
+        m_glFbo = 0;
+    }
+    m_mpvOpenGLFbo = {};
+    m_useGlRender = false;
+#endif
+    NVGcontext* vg = brls::Application::getNVGContext();
+    if (m_nvgImage && vg) {
+        nvgDeleteImage(vg, m_nvgImage);
+        m_nvgImage = 0;
+    }
+    m_videoBuffer.clear();
+#endif
+}
+
+void MpvPlayer::render() {
+    // Rendering is handled in onRenderUpdate callback via brls::sync()
+    // This function exists for API compatibility but does nothing
+    // VideoView::draw() just displays the already-rendered NanoVG texture
+}
+
+} // namespace vitaplex

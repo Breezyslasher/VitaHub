@@ -1,0 +1,697 @@
+/**
+ * VitaPlex - Music Queue Manager Implementation
+ */
+
+#include "app/music_queue.hpp"
+#include "platform/paths.hpp"
+#include <borealis.hpp>
+#include <algorithm>
+#include <chrono>
+#include <fstream>
+
+namespace vitaplex {
+
+// Queue save-state path is resolved through the platform paths helper so
+// every target (Vita, PS4, Switch, Android, desktop) writes into its own
+// app-local data directory instead of the old hard-coded Vita "ux0:" path.
+static std::string queueStateFile() {
+    return platformPath("queue_state.txt");
+}
+
+MusicQueue::MusicQueue() {
+    // Seed random number generator
+    auto seed = std::chrono::high_resolution_clock::now().time_since_epoch().count();
+    m_rng.seed(static_cast<unsigned int>(seed));
+}
+
+MusicQueue& MusicQueue::getInstance() {
+    static MusicQueue instance;
+    return instance;
+}
+
+void MusicQueue::clear() {
+    m_queue.clear();
+    m_shuffleOrder.clear();
+    m_currentIndex = -1;
+    m_shufflePosition = -1;
+    m_playQueueID = 0;  // Clear server sync
+    notifyQueueChanged();
+}
+
+QueueItem MusicQueue::mediaItemToQueueItem(const MediaItem& item, int index) {
+    QueueItem qi;
+    qi.ratingKey = item.ratingKey;
+    qi.title = item.title;
+    qi.artist = item.grandparentTitle;  // Artist for tracks
+    qi.album = item.parentTitle;        // Album for tracks
+    // Use track thumb, falling back to album (parent) then artist (grandparent) thumb
+    qi.thumb = item.thumb;
+    if (qi.thumb.empty()) qi.thumb = item.parentThumb;
+    if (qi.thumb.empty()) qi.thumb = item.grandparentThumb;
+    qi.duration = item.duration / 1000; // Convert ms to seconds
+    qi.userRating = item.userRating;
+    qi.mediaType = item.mediaType;
+    qi.index = index;
+    return qi;
+}
+
+void MusicQueue::setCurrentTrackRating(float rating) {
+    if (m_currentIndex < 0 || m_currentIndex >= (int)m_queue.size()) return;
+    m_queue[(size_t)m_currentIndex].userRating = rating;
+}
+
+void MusicQueue::addTrack(const MediaItem& item) {
+    int index = (int)m_queue.size();
+    m_queue.push_back(mediaItemToQueueItem(item, index));
+
+    // Update shuffle order if shuffling
+    if (m_shuffleEnabled) {
+        // Somewhere in the part not played yet, which is anywhere from just
+        // after the current position to the very end.
+        //
+        // The span has to be clamped first. m_shuffleOrder.size() is unsigned
+        // and m_shufflePosition is a signed int that is -1 before anything
+        // plays, so `size() - m_shufflePosition` is unsigned arithmetic: equal
+        // values give a modulo by zero, and a position past the end wraps to a
+        // number near SIZE_MAX and lands the insert far outside the vector.
+        // insertTrackAfterCurrent clamps for the same reason; this did not.
+        int tailStart = m_shufflePosition + 1;
+        if (tailStart < 0) tailStart = 0;
+        if (tailStart > (int)m_shuffleOrder.size()) tailStart = (int)m_shuffleOrder.size();
+        const int slots = (int)m_shuffleOrder.size() - tailStart + 1;   // never < 1
+        const int insertPos = tailStart + (int)(m_rng() % (unsigned)slots);
+        m_shuffleOrder.insert(m_shuffleOrder.begin() + insertPos, index);
+    }
+
+    notifyQueueChanged();
+}
+
+void MusicQueue::insertTrackAfterCurrent(const MediaItem& item) {
+    int insertPos = m_currentIndex + 1;
+    if (insertPos < 0) insertPos = 0;
+    if (insertPos > (int)m_queue.size()) insertPos = (int)m_queue.size();
+
+    m_queue.insert(m_queue.begin() + insertPos, mediaItemToQueueItem(item, insertPos));
+
+    // Update indices for items after the insertion point
+    for (int i = insertPos; i < (int)m_queue.size(); i++) {
+        m_queue[i].index = i;
+    }
+
+    // Update shuffle order incrementally: bump indices >= insertPos, then insert
+    // the new track right after the current shuffle position (play next behavior)
+    if (m_shuffleEnabled) {
+        for (auto& idx : m_shuffleOrder) {
+            if (idx >= insertPos) idx++;
+        }
+        // Insert right after current shuffle position so it plays next
+        int shuffleInsert = m_shufflePosition + 1;
+        if (shuffleInsert > (int)m_shuffleOrder.size()) shuffleInsert = (int)m_shuffleOrder.size();
+        m_shuffleOrder.insert(m_shuffleOrder.begin() + shuffleInsert, insertPos);
+    }
+
+    notifyQueueChanged();
+    brls::Logger::info("MusicQueue: Inserted track after current at position {}", insertPos);
+}
+
+void MusicQueue::addTracks(const std::vector<MediaItem>& items) {
+    int startIndex = (int)m_queue.size();
+    m_queue.reserve(m_queue.size() + items.size());
+    for (size_t i = 0; i < items.size(); i++) {
+        m_queue.push_back(mediaItemToQueueItem(items[i], startIndex + (int)i));
+    }
+
+    // Append new indices to the end of shuffle order, then Fisher-Yates
+    // shuffle only the unplayed tail portion — O(n) instead of O(n²)
+    if (m_shuffleEnabled && !m_queue.empty()) {
+        // Append new track indices
+        m_shuffleOrder.reserve(m_shuffleOrder.size() + items.size());
+        for (size_t i = 0; i < items.size(); i++) {
+            m_shuffleOrder.push_back(startIndex + (int)i);
+        }
+        // Shuffle the unplayed tail (everything after current shuffle position)
+        int tailStart = m_shufflePosition + 1;
+        int tailSize = (int)m_shuffleOrder.size() - tailStart;
+        for (int i = tailSize - 1; i > 0; i--) {
+            int j = m_rng() % (i + 1);
+            std::swap(m_shuffleOrder[tailStart + i], m_shuffleOrder[tailStart + j]);
+        }
+    }
+
+    notifyQueueChanged();
+}
+
+void MusicQueue::removeTrack(int index) {
+    if (index < 0 || index >= (int)m_queue.size()) return;
+
+    m_queue.erase(m_queue.begin() + index);
+
+    // Update indices for remaining items
+    for (int i = index; i < (int)m_queue.size(); i++) {
+        m_queue[i].index = i;
+    }
+
+    // Adjust current index if needed
+    if (m_currentIndex >= (int)m_queue.size()) {
+        m_currentIndex = m_queue.empty() ? -1 : (int)m_queue.size() - 1;
+    } else if (m_currentIndex > index) {
+        m_currentIndex--;
+    }
+
+    // Update shuffle order incrementally: remove the entry and adjust indices
+    if (m_shuffleEnabled) {
+        // Find and remove the deleted index from shuffle order
+        for (auto it = m_shuffleOrder.begin(); it != m_shuffleOrder.end(); ++it) {
+            if (*it == index) {
+                int pos = (int)(it - m_shuffleOrder.begin());
+                m_shuffleOrder.erase(it);
+                // Adjust shuffle position if the removed entry was before it
+                if (pos < m_shufflePosition) {
+                    m_shufflePosition--;
+                } else if (pos == m_shufflePosition && m_shufflePosition >= (int)m_shuffleOrder.size()) {
+                    m_shufflePosition = (int)m_shuffleOrder.size() - 1;
+                }
+                break;
+            }
+        }
+        // Decrement all indices > removed index
+        for (auto& idx : m_shuffleOrder) {
+            if (idx > index) idx--;
+        }
+    }
+
+    notifyQueueChanged();
+}
+
+void MusicQueue::moveTrack(int fromIndex, int toIndex) {
+    if (fromIndex < 0 || fromIndex >= (int)m_queue.size()) return;
+    if (toIndex < 0 || toIndex >= (int)m_queue.size()) return;
+    if (fromIndex == toIndex) return;
+
+    QueueItem item = m_queue[fromIndex];
+    m_queue.erase(m_queue.begin() + fromIndex);
+    m_queue.insert(m_queue.begin() + toIndex, item);
+
+    // Update indices
+    for (int i = 0; i < (int)m_queue.size(); i++) {
+        m_queue[i].index = i;
+    }
+
+    // Adjust current index
+    if (m_currentIndex == fromIndex) {
+        m_currentIndex = toIndex;
+    } else if (fromIndex < m_currentIndex && toIndex >= m_currentIndex) {
+        m_currentIndex--;
+    } else if (fromIndex > m_currentIndex && toIndex <= m_currentIndex) {
+        m_currentIndex++;
+    }
+
+    notifyQueueChanged();
+}
+
+void MusicQueue::moveInPlayOrder(int fromPlayPos, int toPlayPos) {
+    if (!m_shuffleEnabled) {
+        // Play order == queue order; reuse the absolute-index move.
+        moveTrack(fromPlayPos, toPlayPos);
+        return;
+    }
+    if (fromPlayPos < 0 || fromPlayPos >= (int)m_shuffleOrder.size()) return;
+    if (toPlayPos < 0 || toPlayPos >= (int)m_shuffleOrder.size()) return;
+    if (fromPlayPos == toPlayPos) return;
+
+    // Reorder the shuffle order only — m_queue (and the absolute indices the UI
+    // rows hold) stays put, so each row keeps showing the same track.
+    int v = m_shuffleOrder[fromPlayPos];
+    m_shuffleOrder.erase(m_shuffleOrder.begin() + fromPlayPos);
+    m_shuffleOrder.insert(m_shuffleOrder.begin() + toPlayPos, v);
+
+    // Keep the current play position pointing at the same (current) track.
+    if (m_shufflePosition == fromPlayPos) {
+        m_shufflePosition = toPlayPos;
+    } else if (fromPlayPos < m_shufflePosition && toPlayPos >= m_shufflePosition) {
+        m_shufflePosition--;
+    } else if (fromPlayPos > m_shufflePosition && toPlayPos <= m_shufflePosition) {
+        m_shufflePosition++;
+    }
+
+    notifyQueueChanged();
+}
+
+void MusicQueue::setQueue(const std::vector<MediaItem>& items, int startIndex) {
+    clear();
+
+    m_queue.reserve(items.size());
+    for (size_t i = 0; i < items.size(); i++) {
+        m_queue.push_back(mediaItemToQueueItem(items[i], (int)i));
+    }
+
+    if (m_shuffleEnabled) {
+        generateShuffleOrder();
+        // Find the start index in shuffle order
+        m_shufflePosition = 0;
+        for (size_t i = 0; i < m_shuffleOrder.size(); i++) {
+            if (m_shuffleOrder[i] == startIndex) {
+                // Move this to the front of remaining shuffle
+                std::swap(m_shuffleOrder[0], m_shuffleOrder[i]);
+                break;
+            }
+        }
+        m_currentIndex = m_shuffleOrder[0];
+    } else {
+        m_currentIndex = (startIndex >= 0 && startIndex < (int)m_queue.size())
+                        ? startIndex : 0;
+    }
+
+    notifyQueueChanged();
+    brls::Logger::info("MusicQueue: Set queue with {} tracks, starting at {}",
+                       m_queue.size(), m_currentIndex);
+}
+
+bool MusicQueue::playTrack(int index) {
+    if (index < 0 || index >= (int)m_queue.size()) {
+        return false;
+    }
+
+    m_currentIndex = index;
+
+    // Update shuffle position if shuffling
+    if (m_shuffleEnabled) {
+        for (size_t i = 0; i < m_shuffleOrder.size(); i++) {
+            if (m_shuffleOrder[i] == index) {
+                m_shufflePosition = (int)i;
+                break;
+            }
+        }
+    }
+
+    brls::Logger::info("MusicQueue: Playing track {} - {}", index, m_queue[index].title);
+    return true;
+}
+
+bool MusicQueue::playNext() {
+    if (m_queue.empty()) return false;
+
+    int nextIndex = -1;
+
+    if (m_repeatMode == RepeatMode::ONE) {
+        // Repeat same track
+        nextIndex = m_currentIndex;
+    } else if (m_shuffleEnabled) {
+        // Use shuffle order
+        m_shufflePosition++;
+        if (m_shufflePosition >= (int)m_shuffleOrder.size()) {
+            if (m_repeatMode == RepeatMode::ALL) {
+                // Reshuffle and start over
+                reshuffle();
+                m_shufflePosition = 0;
+            } else {
+                // End of queue - stop
+                m_shufflePosition = (int)m_shuffleOrder.size() - 1;
+                return false;
+            }
+        }
+        nextIndex = m_shuffleOrder[m_shufflePosition];
+    } else {
+        // Normal sequential order
+        nextIndex = m_currentIndex + 1;
+        if (nextIndex >= (int)m_queue.size()) {
+            if (m_repeatMode == RepeatMode::ALL) {
+                nextIndex = 0;
+            } else {
+                // End of queue - stop
+                return false;
+            }
+        }
+    }
+
+    m_currentIndex = nextIndex;
+    brls::Logger::info("MusicQueue: Next track {} - {}", m_currentIndex, m_queue[m_currentIndex].title);
+    return true;
+}
+
+bool MusicQueue::playPrevious() {
+    if (m_queue.empty()) return false;
+
+    int prevIndex = -1;
+
+    if (m_shuffleEnabled) {
+        m_shufflePosition--;
+        if (m_shufflePosition < 0) {
+            if (m_repeatMode == RepeatMode::ALL) {
+                m_shufflePosition = (int)m_shuffleOrder.size() - 1;
+            } else {
+                m_shufflePosition = 0;
+                return false;
+            }
+        }
+        prevIndex = m_shuffleOrder[m_shufflePosition];
+    } else {
+        prevIndex = m_currentIndex - 1;
+        if (prevIndex < 0) {
+            if (m_repeatMode == RepeatMode::ALL) {
+                prevIndex = (int)m_queue.size() - 1;
+            } else {
+                return false;
+            }
+        }
+    }
+
+    m_currentIndex = prevIndex;
+    brls::Logger::info("MusicQueue: Previous track {} - {}", m_currentIndex, m_queue[m_currentIndex].title);
+    return true;
+}
+
+bool MusicQueue::hasNext() const {
+    if (m_queue.empty()) return false;
+    if (m_repeatMode == RepeatMode::ONE || m_repeatMode == RepeatMode::ALL) return true;
+
+    if (m_shuffleEnabled) {
+        return m_shufflePosition < (int)m_shuffleOrder.size() - 1;
+    }
+    return m_currentIndex < (int)m_queue.size() - 1;
+}
+
+bool MusicQueue::hasPrevious() const {
+    if (m_queue.empty()) return false;
+    if (m_repeatMode == RepeatMode::ALL) return true;
+
+    if (m_shuffleEnabled) {
+        return m_shufflePosition > 0;
+    }
+    return m_currentIndex > 0;
+}
+
+const QueueItem* MusicQueue::peekNextTrack() const {
+    // Mirrors playNext()'s index selection without any of its side effects.
+    if (m_queue.empty()) return nullptr;
+
+    int nextIndex;
+    if (m_repeatMode == RepeatMode::ONE) {
+        nextIndex = m_currentIndex;
+    } else if (m_shuffleEnabled) {
+        int pos = m_shufflePosition + 1;
+        // Off the end, playNext() reshuffles — which track follows is not decided yet, so there is nothing to report.
+        if (pos < 0 || pos >= (int)m_shuffleOrder.size()) return nullptr;
+        nextIndex = m_shuffleOrder[pos];
+    } else {
+        nextIndex = m_currentIndex + 1;
+        if (nextIndex >= (int)m_queue.size()) {
+            if (m_repeatMode != RepeatMode::ALL) return nullptr;
+            nextIndex = 0;
+        }
+    }
+
+    if (nextIndex < 0 || nextIndex >= (int)m_queue.size()) return nullptr;
+    return &m_queue[nextIndex];
+}
+
+bool MusicQueue::isMusicQueue() const {
+    const QueueItem* track = getCurrentTrack();
+    if (!track && !m_queue.empty()) track = &m_queue.front();
+    return track && track->mediaType == MediaType::MUSIC_TRACK;
+}
+
+const QueueItem* MusicQueue::getCurrentTrack() const {
+    if (m_currentIndex < 0 || m_currentIndex >= (int)m_queue.size()) {
+        return nullptr;
+    }
+    return &m_queue[m_currentIndex];
+}
+
+void MusicQueue::shuffleFromStart() {
+    if (m_queue.empty()) return;
+
+    m_shuffleEnabled = true;
+    m_shuffleOrder.clear();
+    m_shuffleOrder.reserve(m_queue.size());
+    for (int i = 0; i < (int)m_queue.size(); i++) m_shuffleOrder.push_back(i);
+
+    for (int i = (int)m_shuffleOrder.size() - 1; i > 0; i--) {
+        int j = m_rng() % (i + 1);
+        std::swap(m_shuffleOrder[i], m_shuffleOrder[j]);
+    }
+
+    // Nothing is playing yet, so the front of the shuffled order becomes the
+    // current track rather than being inserted after one.
+    m_shufflePosition = 0;
+    m_currentIndex = m_shuffleOrder[0];
+
+    brls::Logger::info("MusicQueue: shuffled from the start, opening on {} - {}",
+                       m_currentIndex, m_queue[m_currentIndex].title);
+    notifyQueueChanged();
+}
+
+void MusicQueue::shuffleKeepingCurrent() {
+    if (m_queue.empty()) {
+        m_shuffleEnabled = true;
+        m_shuffleOrder.clear();
+        m_shufflePosition = -1;
+        return;
+    }
+    // Nothing is current, so there is nothing to keep in front — that is
+    // shuffleFromStart's job, and it also avoids putting -1 in the order.
+    if (m_currentIndex < 0 || m_currentIndex >= (int)m_queue.size()) {
+        shuffleFromStart();
+        return;
+    }
+
+    m_shuffleEnabled = true;
+
+    // Build shuffle order: current track first, then all others shuffled
+    m_shuffleOrder.clear();
+    m_shuffleOrder.push_back(m_currentIndex);
+
+    // Collect all other indices
+    std::vector<int> others;
+    for (int i = 0; i < (int)m_queue.size(); i++) {
+        if (i != m_currentIndex) {
+            others.push_back(i);
+        }
+    }
+
+    // Fisher-Yates shuffle the remaining tracks
+    for (int i = (int)others.size() - 1; i > 0; i--) {
+        int j = m_rng() % (i + 1);
+        std::swap(others[i], others[j]);
+    }
+
+    // Append shuffled tracks after current
+    m_shuffleOrder.insert(m_shuffleOrder.end(), others.begin(), others.end());
+    m_shufflePosition = 0;
+
+    brls::Logger::info("MusicQueue: shuffled, keeping {} in front", m_currentIndex);
+    notifyQueueChanged();
+}
+
+void MusicQueue::setShuffle(bool enabled) {
+    // Toggle semantics: this is the user flipping the button, so an unchanged
+    // state is genuinely nothing to do. Setting a *new queue* up for shuffle
+    // must not go through here — it would no-op on a queue that inherited the
+    // flag from the last one. Call shuffleKeepingCurrent/shuffleFromStart.
+    if (m_shuffleEnabled == enabled) return;
+
+    if (enabled) {
+        shuffleKeepingCurrent();
+        return;
+    }
+
+    m_shuffleEnabled = false;
+    m_shuffleOrder.clear();
+    m_shufflePosition = -1;
+
+    brls::Logger::info("MusicQueue: Shuffle disabled");
+    notifyQueueChanged();
+}
+
+void MusicQueue::reshuffle() {
+    if (!m_shuffleEnabled || m_queue.empty()) return;
+
+    generateShuffleOrder();
+    m_shufflePosition = -1;
+
+    brls::Logger::debug("MusicQueue: Reshuffled queue");
+}
+
+void MusicQueue::generateShuffleOrder() {
+    m_shuffleOrder.clear();
+    m_shuffleOrder.reserve(m_queue.size());
+
+    for (int i = 0; i < (int)m_queue.size(); i++) {
+        m_shuffleOrder.push_back(i);
+    }
+
+    // Fisher-Yates shuffle
+    for (int i = (int)m_shuffleOrder.size() - 1; i > 0; i--) {
+        int j = m_rng() % (i + 1);
+        std::swap(m_shuffleOrder[i], m_shuffleOrder[j]);
+    }
+}
+
+void MusicQueue::setRepeatMode(RepeatMode mode) {
+    m_repeatMode = mode;
+
+    const char* modeStr = "OFF";
+    if (mode == RepeatMode::ONE) modeStr = "ONE";
+    else if (mode == RepeatMode::ALL) modeStr = "ALL";
+
+    brls::Logger::info("MusicQueue: Repeat mode set to {}", modeStr);
+    notifyQueueChanged();
+}
+
+void MusicQueue::cycleRepeatMode() {
+    switch (m_repeatMode) {
+        case RepeatMode::OFF:
+            setRepeatMode(RepeatMode::ALL);
+            break;
+        case RepeatMode::ALL:
+            setRepeatMode(RepeatMode::ONE);
+            break;
+        case RepeatMode::ONE:
+            setRepeatMode(RepeatMode::OFF);
+            break;
+    }
+}
+
+void MusicQueue::onTrackEnded() {
+    brls::Logger::debug("MusicQueue: Track ended, checking for next");
+
+    const QueueItem* nextTrack = nullptr;
+
+    if (playNext()) {
+        nextTrack = getCurrentTrack();
+    }
+
+    if (m_trackEndedCallback) {
+        m_trackEndedCallback(nextTrack);
+    }
+}
+
+void MusicQueue::notifyQueueChanged() {
+    ++m_version;
+    if (m_queueChangedCallback) {
+        m_queueChangedCallback();
+    }
+}
+
+void MusicQueue::saveState() {
+    std::ofstream file(queueStateFile());
+    if (!file.is_open()) {
+        brls::Logger::warning("MusicQueue: Could not save queue state");
+        return;
+    }
+
+    // Save settings
+    file << "shuffle=" << (m_shuffleEnabled ? 1 : 0) << "\n";
+    file << "repeat=" << (int)m_repeatMode << "\n";
+    file << "current=" << m_currentIndex << "\n";
+    file << "count=" << m_queue.size() << "\n";
+
+    // Save queue items (just rating keys for now)
+    for (const auto& item : m_queue) {
+        file << "track=" << item.ratingKey << "\n";
+    }
+
+    file.close();
+    brls::Logger::debug("MusicQueue: State saved");
+}
+
+void MusicQueue::loadState() {
+    std::ifstream file(queueStateFile());
+    if (!file.is_open()) {
+        return;
+    }
+
+    std::string line;
+    while (std::getline(file, line)) {
+        size_t eq = line.find('=');
+        if (eq == std::string::npos) continue;
+
+        std::string key = line.substr(0, eq);
+        std::string value = line.substr(eq + 1);
+
+        if (key == "shuffle") {
+            m_shuffleEnabled = (value == "1");
+        } else if (key == "repeat") {
+            m_repeatMode = static_cast<RepeatMode>(std::stoi(value));
+        } else if (key == "current") {
+            m_currentIndex = std::stoi(value);
+        }
+        // Note: We don't restore the actual tracks here - that would require
+        // fetching metadata from Plex. The queue is typically rebuilt when
+        // playing an album or playlist.
+    }
+
+    file.close();
+    brls::Logger::debug("MusicQueue: State loaded (shuffle={}, repeat={})",
+                       m_shuffleEnabled, (int)m_repeatMode);
+}
+
+// ============================================================================
+// Server-side play queue sync
+// ============================================================================
+
+void MusicQueue::syncToServer(int playQueueID) {
+    m_playQueueID = playQueueID;
+    brls::Logger::info("MusicQueue: Synced to server play queue {}", playQueueID);
+}
+
+void MusicQueue::clearServerSync() {
+    m_playQueueID = 0;
+    brls::Logger::info("MusicQueue: Cleared server sync");
+}
+
+int MusicQueue::getCurrentPlayQueueItemID() const {
+    const QueueItem* track = getCurrentTrack();
+    if (track) return track->playQueueItemID;
+    return 0;
+}
+
+void MusicQueue::setFromPlayQueue(const PlexClient::PlayQueueContainer& pq, bool isShuffled) {
+    m_queue.clear();
+    m_shuffleOrder.clear();
+    m_shufflePosition = -1;
+    m_shuffleEnabled = isShuffled;
+
+    m_queue.reserve(pq.items.size());
+    int selectedIdx = 0;
+
+    for (size_t i = 0; i < pq.items.size(); i++) {
+        const auto& pqItem = pq.items[i];
+        QueueItem qi;
+        qi.ratingKey = pqItem.ratingKey;
+        qi.title = pqItem.title;
+        qi.artist = pqItem.grandparentTitle;
+        qi.album = pqItem.parentTitle;
+        qi.thumb = pqItem.thumb;
+        if (qi.thumb.empty()) qi.thumb = pqItem.parentThumb;
+        if (qi.thumb.empty()) qi.thumb = pqItem.grandparentThumb;
+        qi.duration = pqItem.duration / 1000;  // ms to seconds
+        qi.userRating = pqItem.userRating;
+        qi.mediaType = pqItem.mediaType;
+        qi.index = (int)i;
+        qi.playQueueItemID = pqItem.playQueueItemID;
+        m_queue.push_back(qi);
+
+        if (pqItem.playQueueItemID == pq.playQueueSelectedItemID) {
+            selectedIdx = (int)i;
+        }
+    }
+
+    m_currentIndex = selectedIdx;
+    m_playQueueID = pq.playQueueID;
+
+    // If shuffled, the server already gave us shuffled order - items are in play order
+    if (isShuffled) {
+        m_shuffleOrder.reserve(m_queue.size());
+        for (int i = 0; i < (int)m_queue.size(); i++) {
+            m_shuffleOrder.push_back(i);
+        }
+        m_shufflePosition = selectedIdx;
+    }
+
+    notifyQueueChanged();
+    brls::Logger::info("MusicQueue: Loaded {} items from server PQ {} (selected={})",
+                       m_queue.size(), m_playQueueID, m_currentIndex);
+}
+
+} // namespace vitaplex

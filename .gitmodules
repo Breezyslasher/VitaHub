@@ -1,0 +1,10 @@
+[submodule "lib/borealis"]
+	path = lib/borealis
+	url = https://github.com/dragonflylee/borealis.git
+	# patches/borealis/* are copied into the submodule at configure time.
+	ignore = dirty
+[submodule "lib/libdatachannel"]
+	path = lib/libdatachannel
+	url = https://github.com/paullouisageneau/libdatachannel.git
+	# patches/deps/* are copied into the submodule at configure time.
+	ignore = dirty

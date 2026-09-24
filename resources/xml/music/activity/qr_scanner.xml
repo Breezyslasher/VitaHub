@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- QR scanner: full-screen camera preview with a scan frame and status. -->
+<brls:Box
+    width="100%"
+    height="100%"
+    axis="column"
+    justifyContent="center"
+    alignItems="center"
+    backgroundColor="#0b0e13">
+
+    <brls:Label
+        id="qr/title"
+        text="Scan Remote ID"
+        fontSize="20"
+        marginBottom="10"
+        horizontalAlign="center"
+        textColor="#eef2f6ff"/>
+
+    <!-- The live camera preview view is inserted here from code -->
+    <brls:Box
+        id="qr/preview_holder"
+        width="560"
+        height="420"
+        axis="column"
+        justifyContent="center"
+        alignItems="center"
+        cornerRadius="14"
+        backgroundColor="#12161dff"
+        borderColor="#283240ff"
+        borderThickness="1"
+        focusable="true"
+        highlightCornerRadius="14"/>
+
+    <brls:Label
+        id="qr/status"
+        text="Point the camera at the Remote ID QR code"
+        fontSize="13"
+        marginTop="12"
+        horizontalAlign="center"
+        textColor="#93a0aeff"/>
+
+</brls:Box>

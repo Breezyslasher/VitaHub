@@ -1,0 +1,6417 @@
+/**
+ * VitaPlex - Plex API Client implementation
+ */
+
+#include "app/plex_client.hpp"
+#include "app/application.hpp"
+#include "utils/http_client.hpp"
+#include "utils/http_cache.hpp"
+#include "platform/platform.hpp"
+
+#include <borealis.hpp>
+#include <cstdint>
+#include <cstring>
+#include <ctime>
+#include <algorithm>
+#include <cstdio>
+#include <cstdlib>
+#include <sstream>
+#include <set>
+#include <string_view>
+
+namespace vitaplex {
+
+// Redact JSON/XML "authToken": "<value>" pairs before dumping a response
+// body to the log. Login and PIN-verify responses embed the long-lived
+// account token in the body; any debug log that prints the body verbatim
+// would otherwise persist that token in on-device logs / crash reports.
+static std::string redactBodyForLog(const std::string& body) {
+    static const char* const keys[] = {
+        "\"authToken\"", "\"AuthToken\"", "authenticationToken=",
+        "X-Plex-Token=",
+    };
+    std::string out = body;
+    for (const char* k : keys) {
+        size_t pos = 0;
+        while ((pos = out.find(k, pos)) != std::string::npos) {
+            // Find the start of the value (first quote or '=' after the key).
+            size_t cursor = pos + strlen(k);
+            // Skip ':' / whitespace / '='
+            while (cursor < out.size() &&
+                   (out[cursor] == ':' || out[cursor] == ' ' || out[cursor] == '=' ||
+                    out[cursor] == '"' || out[cursor] == '\t')) {
+                cursor++;
+            }
+            size_t valEnd = out.find_first_of("\",&}<\n\r", cursor);
+            if (valEnd == std::string::npos) valEnd = out.size();
+            if (valEnd > cursor) {
+                out.replace(cursor, valEnd - cursor, "[redacted]");
+            }
+            pos = cursor + sizeof("[redacted]") - 1;
+        }
+    }
+    return out;
+}
+
+// Encode one code point as UTF-8. Shared by the JSON and lyrics decoders,
+// which both turn a numeric escape back into characters.
+static void appendUtf8(std::string& s, uint32_t cp) {
+    // Lone surrogates are not characters; a document carrying one is already
+    // broken, so it gets the replacement glyph rather than an encoding no
+    // renderer accepts.
+    if (cp >= 0xD800 && cp <= 0xDFFF) cp = 0xFFFD;
+    if (cp < 0x80) {
+        s += (char)cp;
+    } else if (cp < 0x800) {
+        s += (char)(0xC0 | (cp >> 6));
+        s += (char)(0x80 | (cp & 0x3F));
+    } else if (cp < 0x10000) {
+        s += (char)(0xE0 | (cp >> 12));
+        s += (char)(0x80 | ((cp >> 6) & 0x3F));
+        s += (char)(0x80 | (cp & 0x3F));
+    } else {
+        s += (char)(0xF0 | (cp >> 18));
+        s += (char)(0x80 | ((cp >> 12) & 0x3F));
+        s += (char)(0x80 | ((cp >> 6) & 0x3F));
+        s += (char)(0x80 | (cp & 0x3F));
+    }
+}
+
+// --- Zero-copy JSON field extraction for the EPG grid parse ---
+// The grid response is ~0.5MB with ~550 program objects. The original
+// parse substr()'d every metadata/media object out of the body and
+// re-allocated a quoted needle (and the value) for every field lookup —
+// ~19k heap allocations and ~13MB of rescanning per guide load, which
+// is where the multi-second "parse/other" LTVPROF bucket went on Vita.
+// These helpers scan string_view slices of the response in place; only
+// the fields that actually get stored are copied into std::strings.
+
+// Find the value of quotedKey (pass it WITH quotes, e.g. "\"title\"")
+// inside obj. Returns an empty view when missing or null.
+//
+// String values come back as the raw, still-escaped slice between the
+// quotes, because a view cannot own the decoded text. That is deliberate
+// and it is why this is not the function to reach for by default: use
+// jsonFieldString for anything stored or displayed, jsonFieldEquals to
+// compare against decoded text, and this one only where the slice is
+// parsed as a number or tested against a literal like "true".
+static std::string_view jsonFieldView(std::string_view obj, std::string_view quotedKey) {
+    size_t keyPos = obj.find(quotedKey);
+    if (keyPos == std::string_view::npos) return {};
+    size_t colonPos = obj.find(':', keyPos + quotedKey.size());
+    if (colonPos == std::string_view::npos) return {};
+    size_t valueStart = obj.find_first_not_of(" \t\n\r", colonPos + 1);
+    if (valueStart == std::string_view::npos) return {};
+
+    if (obj[valueStart] == '"') {
+        size_t valueEnd = valueStart + 1;
+        while (valueEnd < obj.size()) {
+            if (obj[valueEnd] == '"' && obj[valueEnd - 1] != '\\') break;
+            valueEnd++;
+        }
+        if (valueEnd >= obj.size()) return {};
+        return obj.substr(valueStart + 1, valueEnd - valueStart - 1);
+    }
+    if (obj.compare(valueStart, 4, "null") == 0) return {};
+    size_t valueEnd = obj.find_first_of(",}]", valueStart);
+    if (valueEnd == std::string_view::npos) return {};
+    std::string_view value = obj.substr(valueStart, valueEnd - valueStart);
+    while (!value.empty() && (value.back() == ' ' || value.back() == '\n' || value.back() == '\r'))
+        value.remove_suffix(1);
+    return value;
+}
+
+// Turn a raw JSON string slice into the text it stands for.
+//
+// A track called
+//     Intro (Main Theme) (from "Naruto")
+// travels as
+//     "Intro (Main Theme) (from \"Naruto\")"
+// and the slice above still carries the backslashes, so the escapes have to
+// come off before anything displays or compares it. Decoding lives here, at
+// the one point a slice becomes a string, which is what lets the view stay
+// zero-copy.
+//
+// A value with no backslash in it — nearly all of them — costs one scan and
+// the same single allocation the caller was already making. That matters:
+// the EPG parse runs this over thousands of fields on a Vita.
+static std::string jsonUnescape(std::string_view v) {
+    if (v.find('\\') == std::string_view::npos) return std::string(v);
+
+    auto hex4 = [](std::string_view s, size_t at, uint32_t& out) {
+        if (at + 4 > s.size()) return false;
+        out = 0;
+        for (size_t i = at; i < at + 4; i++) {
+            const char c = s[i];
+            out <<= 4;
+            if      (c >= '0' && c <= '9') out |= (uint32_t)(c - '0');
+            else if (c >= 'a' && c <= 'f') out |= (uint32_t)(c - 'a' + 10);
+            else if (c >= 'A' && c <= 'F') out |= (uint32_t)(c - 'A' + 10);
+            else return false;
+        }
+        return true;
+    };
+
+    std::string out;
+    out.reserve(v.size());
+    for (size_t i = 0; i < v.size(); i++) {
+        if (v[i] != '\\' || i + 1 >= v.size()) { out += v[i]; continue; }
+        const char e = v[i + 1];
+        switch (e) {
+            case '"':  out += '"';  i++; break;
+            case '\\': out += '\\'; i++; break;
+            case '/':  out += '/';  i++; break;
+            case 'b':  out += '\b'; i++; break;
+            case 'f':  out += '\f'; i++; break;
+            case 'n':  out += '\n'; i++; break;
+            case 'r':  out += '\r'; i++; break;
+            case 't':  out += '\t'; i++; break;
+            case 'u': {
+                uint32_t cp = 0;
+                if (!hex4(v, i + 2, cp)) { out += v[i]; break; }
+                i += 5;
+                // A code point above the BMP is written as a surrogate pair,
+                // and the two halves only mean anything together.
+                if (cp >= 0xD800 && cp <= 0xDBFF && i + 6 < v.size() &&
+                    v[i + 1] == '\\' && v[i + 2] == 'u') {
+                    uint32_t low = 0;
+                    if (hex4(v, i + 3, low) && low >= 0xDC00 && low <= 0xDFFF) {
+                        cp = 0x10000 + ((cp - 0xD800) << 10) + (low - 0xDC00);
+                        i += 6;
+                    }
+                }
+                appendUtf8(out, cp);
+                break;
+            }
+            // Not an escape JSON defines. Kept as written rather than
+            // guessed at — losing a character is worse than showing one.
+            default: out += v[i]; break;
+        }
+    }
+    return out;
+}
+
+// jsonFieldView plus the decode, for the fields that get stored rather than
+// compared.
+static std::string jsonFieldString(std::string_view obj, std::string_view quotedKey) {
+    return jsonUnescape(jsonFieldView(obj, quotedKey));
+}
+
+// Compare a raw slice against text that has already been decoded.
+//
+// The two sides of the EPG's channel matching come from different places —
+// one is a stored field, the other a slice read back out of the grid — so
+// they have to be compared in the same alphabet or a channel with an escape
+// in its name silently loses its programmes. A call sign holding a backslash
+// is close to unheard of, and that is the point: the common path stays a
+// plain view comparison that allocates nothing.
+static bool jsonFieldEquals(std::string_view raw, const std::string& decoded) {
+    if (raw.find('\\') == std::string_view::npos) return raw == decoded;
+    return jsonUnescape(raw) == decoded;
+}
+
+// atoll for a non-NUL-terminated slice (string_view has no c_str()).
+static int64_t svToInt64(std::string_view v) {
+    int64_t out = 0;
+    bool neg = false;
+    size_t i = 0;
+    if (i < v.size() && (v[i] == '-' || v[i] == '+')) { neg = (v[i] == '-'); i++; }
+    for (; i < v.size() && v[i] >= '0' && v[i] <= '9'; i++)
+        out = out * 10 + (v[i] - '0');
+    return neg ? -out : out;
+}
+
+PlexClient& PlexClient::getInstance() {
+    static PlexClient instance;
+    return instance;
+}
+
+std::string PlexClient::buildApiUrl(const std::string& endpoint) {
+    std::string url = m_serverUrl;
+
+    // Remove trailing slash
+    while (!url.empty() && url.back() == '/') {
+        url.pop_back();
+    }
+
+    url += endpoint;
+
+    // Add token
+    if (!m_authToken.empty()) {
+        if (endpoint.find('?') != std::string::npos) {
+            url += "&X-Plex-Token=" + m_authToken;
+        } else {
+            url += "?X-Plex-Token=" + m_authToken;
+        }
+    }
+
+    return url;
+}
+
+MediaType PlexClient::parseMediaType(const std::string& typeStr) {
+    if (typeStr == "movie") return MediaType::MOVIE;
+    if (typeStr == "show") return MediaType::SHOW;
+    if (typeStr == "season") return MediaType::SEASON;
+    if (typeStr == "episode") return MediaType::EPISODE;
+    if (typeStr == "artist") return MediaType::MUSIC_ARTIST;
+    if (typeStr == "album") return MediaType::MUSIC_ALBUM;
+    if (typeStr == "track") return MediaType::MUSIC_TRACK;
+    if (typeStr == "clip") return MediaType::CLIP;
+    if (typeStr == "photo") return MediaType::PHOTO;
+    return MediaType::UNKNOWN;
+}
+
+std::string PlexClient::extractJsonValue(const std::string& json, const std::string& key) {
+    std::string searchKey = "\"" + key + "\"";
+    size_t keyPos = json.find(searchKey);
+    if (keyPos == std::string::npos) return "";
+
+    size_t colonPos = json.find(':', keyPos);
+    if (colonPos == std::string::npos) return "";
+
+    size_t valueStart = json.find_first_not_of(" \t\n\r", colonPos + 1);
+    if (valueStart == std::string::npos) return "";
+
+    if (json[valueStart] == '"') {
+        // Find closing quote, skipping escaped quotes
+        size_t valueEnd = valueStart + 1;
+        while (valueEnd < json.length()) {
+            if (json[valueEnd] == '"' && json[valueEnd - 1] != '\\') break;
+            valueEnd++;
+        }
+        if (valueEnd >= json.length()) return "";
+        return jsonUnescape(std::string_view(json).substr(valueStart + 1, valueEnd - valueStart - 1));
+    } else if (json[valueStart] == 'n' && json.substr(valueStart, 4) == "null") {
+        return "";
+    } else {
+        size_t valueEnd = json.find_first_of(",}]", valueStart);
+        if (valueEnd == std::string::npos) return "";
+        std::string value = json.substr(valueStart, valueEnd - valueStart);
+        while (!value.empty() && (value.back() == ' ' || value.back() == '\n' || value.back() == '\r')) {
+            value.pop_back();
+        }
+        return value;
+    }
+}
+
+int PlexClient::extractJsonInt(const std::string& json, const std::string& key) {
+    std::string value = extractJsonValue(json, key);
+    if (value.empty()) return 0;
+    return atoi(value.c_str());
+}
+
+float PlexClient::extractJsonFloat(const std::string& json, const std::string& key) {
+    std::string value = extractJsonValue(json, key);
+    if (value.empty()) return 0.0f;
+    return (float)atof(value.c_str());
+}
+
+bool PlexClient::extractJsonBool(const std::string& json, const std::string& key) {
+    std::string value = extractJsonValue(json, key);
+    return (value == "true" || value == "1");
+}
+
+// In-place extraction: searches within [start, end) of json without creating a substring.
+std::string PlexClient::extractJsonValueRange(const std::string& json, size_t start, size_t end, const std::string& key) {
+    std::string searchKey = "\"" + key + "\"";
+    size_t keyPos = json.find(searchKey, start);
+    if (keyPos == std::string::npos || keyPos >= end) return "";
+
+    size_t colonPos = json.find(':', keyPos);
+    if (colonPos == std::string::npos || colonPos >= end) return "";
+
+    size_t valueStart = colonPos + 1;
+    while (valueStart < end && (json[valueStart] == ' ' || json[valueStart] == '\t' ||
+           json[valueStart] == '\n' || json[valueStart] == '\r')) {
+        valueStart++;
+    }
+    if (valueStart >= end) return "";
+
+    if (json[valueStart] == '"') {
+        size_t valueEnd = valueStart + 1;
+        while (valueEnd < end) {
+            if (json[valueEnd] == '"' && json[valueEnd - 1] != '\\') break;
+            valueEnd++;
+        }
+        if (valueEnd >= end) return "";
+        return jsonUnescape(std::string_view(json).substr(valueStart + 1, valueEnd - valueStart - 1));
+    } else if (valueStart + 4 <= end && json[valueStart] == 'n' &&
+               json[valueStart+1] == 'u' && json[valueStart+2] == 'l' && json[valueStart+3] == 'l') {
+        return "";
+    } else {
+        size_t valueEnd = valueStart;
+        while (valueEnd < end && json[valueEnd] != ',' && json[valueEnd] != '}' && json[valueEnd] != ']') {
+            valueEnd++;
+        }
+        std::string value = json.substr(valueStart, valueEnd - valueStart);
+        while (!value.empty() && (value.back() == ' ' || value.back() == '\n' || value.back() == '\r')) {
+            value.pop_back();
+        }
+        return value;
+    }
+}
+
+int PlexClient::extractJsonIntRange(const std::string& json, size_t start, size_t end, const std::string& key) {
+    std::string value = extractJsonValueRange(json, start, end, key);
+    if (value.empty()) return 0;
+    return atoi(value.c_str());
+}
+
+float PlexClient::extractJsonFloatRange(const std::string& json, size_t start, size_t end, const std::string& key) {
+    std::string value = extractJsonValueRange(json, start, end, key);
+    if (value.empty()) return 0.0f;
+    return (float)atof(value.c_str());
+}
+
+std::string PlexClient::base64Encode(const std::string& input) {
+    static const char* base64_chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    std::string output;
+    int val = 0, valb = -6;
+
+    for (unsigned char c : input) {
+        val = (val << 8) + c;
+        valb += 8;
+        while (valb >= 0) {
+            output.push_back(base64_chars[(val >> valb) & 0x3F]);
+            valb -= 6;
+        }
+    }
+
+    if (valb > -6) {
+        output.push_back(base64_chars[((val << 8) >> (valb + 8)) & 0x3F]);
+    }
+
+    while (output.size() % 4) {
+        output.push_back('=');
+    }
+
+    return output;
+}
+
+int PlexClient::extractXmlAttr(const std::string& xml, const std::string& attr) {
+    // Extract integer attribute from XML like: attr="123"
+    std::string search = attr + "=\"";
+    size_t pos = xml.find(search);
+    if (pos == std::string::npos) return 0;
+    pos += search.length();
+    size_t end = xml.find("\"", pos);
+    if (end == std::string::npos) return 0;
+    return atoi(xml.substr(pos, end - pos).c_str());
+}
+
+std::string PlexClient::extractXmlAttrStr(const std::string& xml, const std::string& attr) {
+    // Extract string attribute from XML like: attr="value"
+    std::string search = attr + "=\"";
+    size_t pos = xml.find(search);
+    if (pos == std::string::npos) return "";
+    pos += search.length();
+    size_t end = xml.find("\"", pos);
+    if (end == std::string::npos) return "";
+    return xml.substr(pos, end - pos);
+}
+
+bool PlexClient::login(const std::string& username, const std::string& password) {
+    brls::Logger::info("Attempting login for user: {}", username);
+
+    HttpClient client;
+    HttpRequest req;
+    req.url = "https://plex.tv/api/v2/users/signin";
+    req.method = "POST";
+    req.headers["Accept"] = "application/json";
+    req.headers["Content-Type"] = "application/x-www-form-urlencoded";
+    {
+        const auto& vc = platform::getVideoConstraints();
+        req.headers["X-Plex-Client-Identifier"] = PLEX_CLIENT_ID;
+        req.headers["X-Plex-Product"] = PLEX_CLIENT_NAME;
+        req.headers["X-Plex-Version"] = PLEX_CLIENT_VERSION;
+        req.headers["X-Plex-Platform"] = vc.plexPlatform;
+        req.headers["X-Plex-Device"] = vc.plexDevice;
+    }
+
+    req.body = "login=" + HttpClient::urlEncode(username) + "&password=" + HttpClient::urlEncode(password);
+
+    HttpResponse resp = client.request(req);
+
+    if (resp.statusCode == 201 || resp.statusCode == 200) {
+        m_authToken = extractJsonValue(resp.body, "authToken");
+        if (!m_authToken.empty()) {
+            brls::Logger::info("Login successful");
+            m_reauthTriggered = false;  // Reset reauth guard on successful login
+            Application::getInstance().setAuthToken(m_authToken);
+            return true;
+        }
+    }
+
+    brls::Logger::error("Login failed: {}", resp.statusCode);
+    return false;
+}
+
+bool PlexClient::requestPin(PinAuth& pinAuth) {
+    brls::Logger::info("Requesting PIN for plex.tv/link authentication");
+
+    HttpClient client;
+    HttpRequest req;
+    req.url = "https://plex.tv/api/v2/pins";
+    req.method = "POST";
+    req.headers["Accept"] = "application/json";
+    req.headers["Content-Type"] = "application/x-www-form-urlencoded";
+    {
+        const auto& vc = platform::getVideoConstraints();
+        req.headers["X-Plex-Client-Identifier"] = PLEX_CLIENT_ID;
+        req.headers["X-Plex-Product"] = PLEX_CLIENT_NAME;
+        req.headers["X-Plex-Version"] = PLEX_CLIENT_VERSION;
+        req.headers["X-Plex-Platform"] = vc.plexPlatform;
+        req.headers["X-Plex-Device"] = vc.plexDevice;
+    }
+
+    req.body = "strong=false";
+
+    HttpResponse resp = client.request(req);
+    pinAuth.offline = (resp.statusCode == 0);
+
+    if (resp.statusCode == 201 || resp.statusCode == 200) {
+        pinAuth.id = extractJsonInt(resp.body, "id");
+        pinAuth.code = extractJsonValue(resp.body, "code");
+        pinAuth.expiresIn = extractJsonInt(resp.body, "expiresIn");
+        pinAuth.expired = false;
+
+        brls::Logger::info("PIN requested: {}", pinAuth.code);
+        return !pinAuth.code.empty();
+    }
+
+    brls::Logger::error("PIN request failed: {}", resp.statusCode);
+    return false;
+}
+
+bool PlexClient::checkPin(PinAuth& pinAuth) {
+    HttpClient client;
+    HttpRequest req;
+    req.url = "https://plex.tv/api/v2/pins/" + std::to_string(pinAuth.id);
+    req.method = "GET";
+    req.headers["Accept"] = "application/json";
+    req.headers["X-Plex-Client-Identifier"] = PLEX_CLIENT_ID;
+
+    HttpResponse resp = client.request(req);
+
+    // statusCode 0 means curl never got a response — plex.tv is unreachable,
+    // not "the user has not confirmed yet". Both return false, so record which.
+    pinAuth.offline = (resp.statusCode == 0);
+
+    if (resp.statusCode == 200) {
+        pinAuth.authToken = extractJsonValue(resp.body, "authToken");
+        pinAuth.expired = extractJsonBool(resp.body, "expired");
+
+        if (!pinAuth.authToken.empty()) {
+            m_authToken = pinAuth.authToken;
+            m_reauthTriggered = false;  // Reset reauth guard on successful login
+            Application::getInstance().setAuthToken(m_authToken);
+            brls::Logger::info("PIN authenticated successfully");
+            return true;
+        }
+    }
+
+    return false;
+}
+
+bool PlexClient::fetchHomeUsers(const std::string& masterToken,
+                                std::vector<HomeUser>& users) {
+    users.clear();
+    if (masterToken.empty()) {
+        brls::Logger::error("fetchHomeUsers: missing master token");
+        return false;
+    }
+
+    HttpClient client;
+    HttpRequest req;
+    req.url = "https://plex.tv/api/v2/home/users";
+    req.method = "GET";
+    req.headers["Accept"] = "application/json";
+    req.headers["X-Plex-Token"] = masterToken;
+    req.headers["X-Plex-Client-Identifier"] = PLEX_CLIENT_ID;
+    req.timeout = 15;
+
+    HttpResponse resp = client.request(req);
+    // 401 here usually means the account doesn't have Plex Home enabled
+    // (regular single-user account). Treat as "no managed users" rather
+    // than an error — caller will fall back to using the master token.
+    if (resp.statusCode == 401 || resp.statusCode == 403) {
+        brls::Logger::info("fetchHomeUsers: account has no Plex Home (HTTP {})",
+                           resp.statusCode);
+        return true;
+    }
+    if (resp.statusCode != 200 || resp.body.empty()) {
+        brls::Logger::error("fetchHomeUsers: HTTP {} body={}",
+                            resp.statusCode,
+                            resp.body.empty() ? "(empty)" : resp.body.substr(0, 200));
+        return false;
+    }
+
+    // Response shape is {"id":N, "name":"...", ..., "users":[ {user1}, {user2}, ... ]}
+    // The previous naive object walker scooped up the *outer* wrapper as a
+    // single match (it contains uuid/title from users[0] when scanning the
+    // whole body) and stopped, so a Home with N members reported "got 1".
+    // Find the "users" array first and only walk the objects inside it.
+    const std::string& body = resp.body;
+    brls::Logger::debug("fetchHomeUsers: body ({} bytes), first 600: {}",
+                        body.length(), body.substr(0, 600));
+
+    size_t arrStart = std::string::npos;
+    size_t arrEnd   = std::string::npos;
+    size_t usersKey = body.find("\"users\"");
+    if (usersKey != std::string::npos) {
+        size_t open = body.find('[', usersKey);
+        if (open != std::string::npos) {
+            int depth = 1;
+            size_t scan = open + 1;
+            while (depth > 0 && scan < body.length()) {
+                if (body[scan] == '[') depth++;
+                else if (body[scan] == ']') depth--;
+                scan++;
+            }
+            if (depth == 0) {
+                arrStart = open;
+                arrEnd   = scan;
+            }
+        }
+    }
+    // Fallback for endpoints that return a bare array.
+    if (arrStart == std::string::npos) {
+        arrStart = body.find('[');
+        if (arrStart != std::string::npos) {
+            int depth = 1;
+            size_t scan = arrStart + 1;
+            while (depth > 0 && scan < body.length()) {
+                if (body[scan] == '[') depth++;
+                else if (body[scan] == ']') depth--;
+                scan++;
+            }
+            if (depth == 0) arrEnd = scan;
+        }
+    }
+    if (arrStart == std::string::npos || arrEnd == std::string::npos) {
+        brls::Logger::error("fetchHomeUsers: no users array found in response");
+        return false;
+    }
+
+    size_t pos = arrStart + 1;
+    while (pos < arrEnd) {
+        size_t objStart = body.find('{', pos);
+        if (objStart == std::string::npos || objStart >= arrEnd) break;
+
+        int depth = 1;
+        size_t objEnd = objStart + 1;
+        while (depth > 0 && objEnd < body.length()) {
+            if (body[objEnd] == '{') depth++;
+            else if (body[objEnd] == '}') depth--;
+            objEnd++;
+        }
+        if (depth != 0) break;
+        std::string obj = body.substr(objStart, objEnd - objStart);
+        pos = objEnd;
+
+        HomeUser u;
+        u.uuid     = extractJsonValue(obj, "uuid");
+        u.id       = extractJsonValue(obj, "id");
+        u.title    = extractJsonValue(obj, "title");
+        u.username = extractJsonValue(obj, "username");
+        u.thumb    = extractJsonValue(obj, "thumb");
+        // "protected" is the only field that means a PIN is required at
+        // /switch time. "restricted" just means content-restrictions
+        // (kid accounts) — those users may or may not have a PIN, so
+        // OR'ing them in here was prompting unprotected restricted users
+        // for a PIN that doesn't exist.
+        u.hasPin   = extractJsonBool(obj, "protected");
+        u.admin    = extractJsonBool(obj, "admin") ||
+                     extractJsonBool(obj, "homeAdmin");
+
+        if (!u.uuid.empty() && !u.title.empty()) {
+            users.push_back(std::move(u));
+        }
+    }
+
+    brls::Logger::info("fetchHomeUsers: got {} users", users.size());
+    return true;
+}
+
+bool PlexClient::switchHomeUser(const std::string& masterToken,
+                                const std::string& userUuid,
+                                const std::string& pin,
+                                std::string& outToken) {
+    outToken.clear();
+    if (masterToken.empty() || userUuid.empty()) return false;
+
+    HttpClient client;
+    HttpRequest req;
+    req.url = "https://plex.tv/api/v2/home/users/" + userUuid + "/switch";
+    req.method = "POST";
+    req.headers["Accept"] = "application/json";
+    // plex.tv's nginx rejects empty-body POSTs that don't declare a
+    // content type — that's the 400 Bad Request the original version
+    // hit. Encode the PIN (empty when the user isn't protected) into a
+    // form body so the request always has a real Content-Type + body.
+    req.headers["Content-Type"] = "application/x-www-form-urlencoded";
+    req.headers["X-Plex-Token"] = masterToken;
+    // The full X-Plex-* identification block is what every other
+    // plex.tv POST in this client sends; without it the API often
+    // 401s or 400s on /home/users/{uuid}/switch.
+    {
+        const auto& vc = platform::getVideoConstraints();
+        req.headers["X-Plex-Client-Identifier"] = PLEX_CLIENT_ID;
+        req.headers["X-Plex-Product"] = PLEX_CLIENT_NAME;
+        req.headers["X-Plex-Version"] = PLEX_CLIENT_VERSION;
+        req.headers["X-Plex-Platform"] = vc.plexPlatform;
+        req.headers["X-Plex-Device"] = vc.plexDevice;
+    }
+    req.body = pin.empty() ? std::string("pin=")
+                            : ("pin=" + HttpClient::urlEncode(pin));
+    req.timeout = 15;
+
+    HttpResponse resp = client.request(req);
+    if (resp.statusCode != 200 && resp.statusCode != 201) {
+        brls::Logger::error("switchHomeUser: HTTP {} body={}",
+                            resp.statusCode,
+                            resp.body.empty() ? "(empty)" : resp.body.substr(0, 200));
+        return false;
+    }
+
+    outToken = extractJsonValue(resp.body, "authToken");
+    if (outToken.empty()) {
+        brls::Logger::error("switchHomeUser: response missing authToken (body={})",
+                            resp.body.substr(0, 200));
+        return false;
+    }
+    brls::Logger::info("switchHomeUser: switched to user {}", userUuid);
+    return true;
+}
+
+void PlexClient::useHomeUserTokens(const std::string& accountToken) {
+    if (accountToken.empty()) return;
+
+    const std::string machineId = m_currentServer.machineIdentifier;
+
+    // Temporarily fly the account token so fetchServers (a plex.tv call)
+    // authorises and returns THIS user's per-server access tokens.
+    m_authToken = accountToken;
+
+    std::string serverToken;
+    if (!machineId.empty()) {
+        std::vector<PlexServer> servers;
+        if (fetchServers(servers)) {
+            for (const auto& s : servers) {
+                if (s.machineIdentifier == machineId && !s.accessToken.empty()) {
+                    serverToken = s.accessToken;
+                    break;
+                }
+            }
+        }
+        if (serverToken.empty()) {
+            brls::Logger::warning(
+                "useHomeUserTokens: no per-server token for machine {} — "
+                "falling back to the account token (server may 401 if this "
+                "user has no access)", machineId);
+        }
+    }
+
+    // Server requests use the per-server token when we found one; otherwise the
+    // account token (owner / own-server, where the two are identical).
+    m_authToken = serverToken.empty() ? accountToken : serverToken;
+    Application::getInstance().setAuthToken(m_authToken);
+    brls::Logger::info("useHomeUserTokens: adopted {} token for server requests",
+                       serverToken.empty() ? "account" : "per-server access");
+}
+
+bool PlexClient::refreshToken() {
+    // Legacy Plex tokens don't expire, but they can be revoked.
+    // Validate the current token against plex.tv; if invalid, trigger reauth.
+    if (validateToken()) {
+        brls::Logger::info("Token is still valid");
+        return true;
+    }
+    brls::Logger::error("Token validation failed - token may have been revoked");
+    return false;
+}
+
+bool PlexClient::validateToken() {
+    if (m_authToken.empty()) return false;
+
+    // Check token validity by hitting plex.tv/api/v2/user
+    HttpClient client;
+    HttpRequest req;
+    req.url = "https://plex.tv/api/v2/user";
+    req.method = "GET";
+    req.headers["Accept"] = "application/json";
+    req.headers["X-Plex-Token"] = m_authToken;
+    req.headers["X-Plex-Client-Identifier"] = PLEX_CLIENT_ID;
+    req.timeout = 10;
+
+    HttpResponse resp = client.request(req);
+
+    if (resp.statusCode == 200) {
+        return true;
+    }
+
+    brls::Logger::error("Token validation returned status {}", resp.statusCode);
+    return false;
+}
+
+void PlexClient::handleUnauthorized() {
+    if (m_reauthTriggered) {
+        // Already handling reauth, don't recurse
+        return;
+    }
+    m_reauthTriggered = true;
+
+    brls::Logger::error("Authentication failed (401) - clearing session and redirecting to login");
+
+    // Clear auth state
+    logout();
+
+    // Redirect to login on the UI thread
+    brls::sync([]() {
+        Application::getInstance().pushLoginActivity();
+    });
+}
+
+bool PlexClient::fetchServers(std::vector<PlexServer>& servers, bool* offline) {
+    brls::Logger::info("Fetching user's servers from plex.tv");
+
+    if (offline) *offline = false;
+
+    if (m_authToken.empty()) {
+        brls::Logger::error("No auth token - please login first");
+        return false;
+    }
+
+    HttpClient client;
+    HttpRequest req;
+    req.url = "https://plex.tv/api/v2/resources?includeHttps=1&includeRelay=1&includeIPv6=0";
+    req.method = "GET";
+    req.headers["Accept"] = "application/json";
+    req.headers["X-Plex-Token"] = m_authToken;
+    req.headers["X-Plex-Client-Identifier"] = PLEX_CLIENT_ID;
+
+    HttpResponse resp = client.request(req);
+
+    brls::Logger::debug("Servers response: {} - {} bytes", resp.statusCode, resp.body.length());
+
+    if (resp.statusCode != 200) {
+        brls::Logger::error("Failed to fetch servers: {}", resp.statusCode);
+        // statusCode 0 == no response reached us at all.
+        if (offline) *offline = (resp.statusCode == 0);
+        if (isAuthError(resp.statusCode)) handleUnauthorized();
+        return false;
+    }
+
+    servers.clear();
+
+    // Parse server resources - look for devices that provide "server" Response is an array of resources
+    size_t pos = 0;
+    while ((pos = resp.body.find("\"name\"", pos)) != std::string::npos) {
+        // Find the start of this object (go back to find opening brace)
+        size_t objStart = resp.body.rfind('{', pos);
+        if (objStart == std::string::npos) {
+            pos++;
+            continue;
+        }
+
+        // Find end of object
+        int braceCount = 1;
+        size_t objEnd = objStart + 1;
+        while (braceCount > 0 && objEnd < resp.body.length()) {
+            if (resp.body[objEnd] == '{') braceCount++;
+            else if (resp.body[objEnd] == '}') braceCount--;
+            objEnd++;
+        }
+
+        std::string obj = resp.body.substr(objStart, objEnd - objStart);
+
+        // Check if this resource provides "server"
+        if (obj.find("\"provides\"") != std::string::npos &&
+            obj.find("\"server\"") != std::string::npos) {
+
+            PlexServer server;
+            server.name             = extractJsonValue(obj, "name");
+            server.machineIdentifier = extractJsonValue(obj, "clientIdentifier");
+            // Per-user, per-server access token. For an owned server this equals
+            // the account token, but for a managed/shared user it's a distinct
+            // token — the only one the server will accept (see useHomeUserTokens).
+            server.accessToken      = extractJsonValue(obj, "accessToken");
+            // owned + version + sourceTitle drive the new server-picker
+            // card: gold tint + "OWNED" chip for owned, "Shared by …"
+            // line for friends, and a version readout next to the
+            // address. All three are scalar fields on the resource
+            // object, so extractJsonValue / extractJsonBool reach them.
+            server.owned       = extractJsonBool(obj, "owned");
+            server.version     = extractJsonValue(obj, "productVersion");
+            server.sourceTitle = extractJsonValue(obj, "sourceTitle");
+
+            // Parse connections array - store ALL connections for fallback
+            size_t connPos = obj.find("\"connections\"");
+            if (connPos != std::string::npos) {
+                // Find the connections array start
+                size_t arrStart = obj.find('[', connPos);
+                if (arrStart != std::string::npos) {
+                    // Parse each connection object in the array
+                    size_t connObjPos = arrStart;
+                    while ((connObjPos = obj.find('{', connObjPos)) != std::string::npos) {
+                        // Find end of this connection object
+                        int connBraceCount = 1;
+                        size_t connObjEnd = connObjPos + 1;
+                        while (connBraceCount > 0 && connObjEnd < obj.length()) {
+                            if (obj[connObjEnd] == '{') connBraceCount++;
+                            else if (obj[connObjEnd] == '}') connBraceCount--;
+                            connObjEnd++;
+                        }
+
+                        std::string connObj = obj.substr(connObjPos, connObjEnd - connObjPos);
+                        std::string uri = extractJsonValue(connObj, "uri");
+                        bool isLocal = (connObj.find("\"local\":true") != std::string::npos ||
+                                       connObj.find("\"local\": true") != std::string::npos);
+                        bool isRelay = (connObj.find("\"relay\":true") != std::string::npos ||
+                                       connObj.find("\"relay\": true") != std::string::npos);
+
+                        if (!uri.empty()) {
+                            ServerConnection conn;
+                            conn.uri = uri;
+                            conn.local = isLocal;
+                            conn.relay = isRelay;
+                            server.connections.push_back(conn);
+                            brls::Logger::debug("Found connection: {} (local={}, relay={})",
+                                               uri, isLocal, isRelay);
+                        }
+
+                        connObjPos = connObjEnd;
+                    }
+                }
+            }
+
+            // Sort connections: local first, then non-relay remote, then relay
+            std::sort(server.connections.begin(), server.connections.end(),
+                     [](const ServerConnection& a, const ServerConnection& b) {
+                         // Local connections first
+                         if (a.local != b.local) return a.local;
+                         // Then non-relay connections
+                         if (a.relay != b.relay) return !a.relay;
+                         return false;
+                     });
+
+            // Set primary address to first (best) connection
+            if (!server.connections.empty()) {
+                server.address = server.connections[0].uri;
+            }
+
+            if (!server.name.empty() && !server.address.empty()) {
+                brls::Logger::info("Found server: {} with {} connections (primary: {})",
+                                   server.name, server.connections.size(), server.address);
+                servers.push_back(server);
+            }
+        }
+
+        pos = objEnd;
+    }
+
+    brls::Logger::info("Found {} servers", servers.size());
+    return !servers.empty();
+}
+
+// plex.direct hostnames encode the server's address in their first label:
+//   https://192-168-1-28.<hash>.plex.direct:32400  ->  192.168.1.28
+// Those names resolve only through Plex's public nameservers, so an
+// internet outage makes a server on the SAME LAN unreachable even though
+// nothing between the app and the server is actually down. Deriving the
+// LAN URL from the hostname itself (rather than from a stored address)
+// means sessions saved by older builds get the fallback too.
+//
+// Returns "" for anything that isn't a plex.direct name with an IPv4
+// label — plex.direct also encodes IPv6 with dashes, which is skipped
+// rather than mangled.
+static std::string plexDirectFallbackUrl(const std::string& url) {
+    const size_t schemeEnd = url.find("://");
+    if (schemeEnd == std::string::npos) return "";
+
+    const size_t hostStart = schemeEnd + 3;
+    const size_t hostEnd = url.find_first_of(":/", hostStart);
+    const std::string host = (hostEnd == std::string::npos)
+                                 ? url.substr(hostStart)
+                                 : url.substr(hostStart, hostEnd - hostStart);
+    if (host.find(".plex.direct") == std::string::npos) return "";
+
+    const size_t labelEnd = host.find('.');
+    if (labelEnd == std::string::npos) return "";
+    const std::string label = host.substr(0, labelEnd);
+
+    std::string ip;
+    int octet = -1, octets = 0;
+    for (size_t i = 0; i <= label.size(); i++) {
+        const char c = (i < label.size()) ? label[i] : '-';  // virtual terminator
+        if (c >= '0' && c <= '9') {
+            octet = (octet < 0 ? 0 : octet * 10) + (c - '0');
+            if (octet > 255) return "";
+        } else if (c == '-') {
+            if (octet < 0 || ++octets > 4) return "";
+            ip += std::to_string(octet);
+            if (i < label.size()) ip += '.';
+            octet = -1;
+        } else {
+            return "";  // hex digit or letter: IPv6 or an unexpected shape
+        }
+    }
+    if (octets != 4) return "";
+
+    // Port carries over; the scheme drops to http because a bare IP can
+    // never match the plex.direct certificate. PMS serves http on the LAN
+    // unless "Secure connections" is set to Required.
+    std::string port = "32400";
+    if (hostEnd != std::string::npos && url[hostEnd] == ':') {
+        const size_t portEnd = url.find('/', hostEnd + 1);
+        port = (portEnd == std::string::npos)
+                   ? url.substr(hostEnd + 1)
+                   : url.substr(hostEnd + 1, portEnd - hostEnd - 1);
+    }
+    if (port.empty()) return "";
+    return "http://" + ip + ":" + port;
+}
+
+bool PlexClient::connectToServer(const std::string& url) {
+    // Use connection timeout from settings (default 3 minutes for slow connections)
+    int timeout = Application::getInstance().getSettings().connectionTimeout;
+    if (timeout <= 0) timeout = 180;
+    return connectToServer(url, timeout);
+}
+
+bool PlexClient::connectToServer(const std::string& url, int timeoutSeconds) {
+    brls::Logger::info("Connecting to server: {} (timeout: {}s)", redactTokensInUrl(url),
+                       timeoutSeconds);
+
+    // Normalize URL - ensure http/https is lowercase
+    m_serverUrl = url;
+    if (m_serverUrl.length() > 7) {
+        size_t colonPos = m_serverUrl.find("://");
+        if (colonPos != std::string::npos && colonPos < 6) {
+            for (size_t i = 0; i < colonPos; i++) {
+                m_serverUrl[i] = tolower(m_serverUrl[i]);
+            }
+        }
+    }
+    Application::getInstance().setServerUrl(m_serverUrl);  // Use normalized URL
+
+    brls::Logger::debug("Connection timeout: {} seconds", timeoutSeconds);
+
+    // Probe one base URL. m_serverUrl is set before the call because
+    // buildApiUrl() reads it; a failed probe restores the previous value
+    // so a rejected fallback can't leave the client pointed at a dead host.
+    auto probe = [&](const std::string& base) -> bool {
+        const std::string previous = m_serverUrl;
+        m_serverUrl = base;
+
+        HttpClient client;
+        HttpRequest req;
+        req.url = buildApiUrl("/");
+        req.method = "GET";
+        req.headers["Accept"] = "application/json";
+        req.timeout = timeoutSeconds;
+
+        HttpResponse resp = client.request(req);
+        if (resp.statusCode == 200) {
+            m_currentServer.name = extractJsonValue(resp.body, "friendlyName");
+            m_currentServer.machineIdentifier = extractJsonValue(resp.body, "machineIdentifier");
+            m_currentServer.address = base;
+            return true;
+        }
+
+        m_serverUrl = previous;
+        brls::Logger::error("Connection failed: {} for {}", resp.statusCode, base);
+        return false;
+    };
+
+    bool connected = probe(m_serverUrl);
+
+    if (!connected) {
+        // The plex.direct name may simply be unresolvable — internet down,
+        // DNS blocked, or plex.tv's nameservers unreachable — while the
+        // server itself sits on the same LAN. Retry over its embedded IP.
+        const std::string fallback = plexDirectFallbackUrl(m_serverUrl);
+        if (!fallback.empty()) {
+            brls::Logger::info("Retrying over the LAN address {} (plex.direct name unreachable)",
+                               fallback);
+            connected = probe(fallback);
+            if (connected) {
+                // Deliberately NOT written back to Application's server URL:
+                // that one is persisted, and a LAN-only address would break
+                // the next launch away from home. The plex.direct name stays
+                // canonical and is retried first every time; this fallback
+                // is re-derived whenever it's needed again.
+                brls::Logger::info("Connected over LAN fallback (DNS for plex.direct failed)");
+            }
+        }
+    }
+
+    if (connected) {
+        brls::Logger::info("Connected to: {}", m_currentServer.name);
+
+        // Live TV availability (m_dvrId / m_epgProviderKey) is probed
+        // lazily by every consumer (fetchLiveTVChannels, fetchEPGGrid,
+        // tuneLiveTVChannel all call checkLiveTVAvailability when
+        // m_dvrId is empty), so don't block session restore on the
+        // /livetv/dvrs round trip here — hardware logs showed it taking
+        // 0.1-3.2s of app launch depending on server mood, and the
+        // first Live TV fetch runs on a worker thread anyway.
+
+        return true;
+    }
+
+    // Per-attempt failures were already logged inside probe().
+    brls::Logger::error("Connection failed: no reachable address for {}", m_serverUrl);
+    return false;
+}
+
+void PlexClient::logout() {
+    m_authToken.clear();
+    m_serverUrl.clear();
+    m_reauthTriggered = false;
+    Application::getInstance().setAuthToken("");
+    Application::getInstance().setServerUrl("");
+    // Drop the no-account session too, so a server that stops admitting
+    // this client without auth doesn't leave a stale flag behind.
+    Application::getInstance().getSettings().localServerMode = false;
+}
+
+bool PlexClient::fetchLibrarySections(std::vector<LibrarySection>& sections) {
+    brls::Logger::debug("fetchLibrarySections: serverUrl={}, hasToken={}",
+                        m_serverUrl, !m_authToken.empty());
+
+    std::string url = buildApiUrl("/library/sections");
+    brls::Logger::debug("Fetching: {}", redactBodyForLog(url));
+
+    // Cache check — library sections rarely change. Skipping the
+    // network entirely on a hit cuts a 100-500ms round-trip every time
+    // a tab that needs the section list is opened.
+    const int ttlSec = Application::getInstance().getSettings().cacheLifetimeMinutes * 60;
+    std::string body;
+    bool fromCache = HttpCache::get(url, ttlSec, body);
+
+    if (!fromCache) {
+        HttpClient client;
+        // Request JSON format (Plex returns XML by default)
+        HttpRequest req;
+        req.url = url;
+        req.method = "GET";
+        req.headers["Accept"] = "application/json";
+        HttpResponse resp = client.request(req);
+        brls::Logger::debug("Response: {} - {} bytes", resp.statusCode, resp.body.length());
+
+        if (resp.statusCode != 200) {
+            brls::Logger::error("Failed to fetch sections: {}", resp.statusCode);
+            if (isAuthError(resp.statusCode)) {
+                handleUnauthorized();
+            }
+            if (!resp.body.empty()) {
+                brls::Logger::debug("Body: {}", redactBodyForLog(resp.body.substr(0, 500)));
+            }
+            return false;
+        }
+        body = resp.body;
+        HttpCache::put(url, body, ttlSec);
+    }
+
+    // Log first part of response for debugging
+    brls::Logger::debug("Response body: {}", redactBodyForLog(body.substr(0, std::min((size_t)500, body.length()))));
+
+    sections.clear();
+
+    // Find all Directory entries - in JSON arrays
+    size_t pos = 0;
+    while ((pos = body.find("\"key\"", pos)) != std::string::npos) {
+        // Go back to find the start of this object
+        size_t objStart = body.rfind('{', pos);
+        if (objStart == std::string::npos) {
+            pos++;
+            continue;
+        }
+
+        // Check if we've already processed this object
+        std::string beforeObj = body.substr(objStart, pos - objStart);
+        if (beforeObj.find("\"key\"") != std::string::npos) {
+            pos++;
+            continue;
+        }
+
+        // Find end of object
+        int braceCount = 1;
+        size_t objEnd = objStart + 1;
+        while (braceCount > 0 && objEnd < body.length()) {
+            if (body[objEnd] == '{') braceCount++;
+            else if (body[objEnd] == '}') braceCount--;
+            objEnd++;
+        }
+
+        std::string obj = body.substr(objStart, objEnd - objStart);
+
+        // Check if this looks like a library section (has title and type)
+        if (obj.find("\"title\"") != std::string::npos &&
+            obj.find("\"type\"") != std::string::npos) {
+
+            LibrarySection section;
+            section.key = extractJsonValue(obj, "key");
+            section.title = extractJsonValue(obj, "title");
+            section.type = extractJsonValue(obj, "type");
+            section.art = extractJsonValue(obj, "art");
+            section.thumb = extractJsonValue(obj, "thumb");
+
+            if (!section.key.empty() && !section.title.empty()) {
+                brls::Logger::debug("Found section: {} ({})", section.title, section.type);
+                sections.push_back(section);
+            }
+        }
+
+        pos = objEnd;
+    }
+
+    brls::Logger::info("Found {} library sections", sections.size());
+    return !sections.empty();
+}
+
+bool PlexClient::fetchLibraryContent(const std::string& sectionKey, std::vector<MediaItem>& items, int metadataType, int limit, int offset, int* totalCount, const std::string& extraParams) {
+    brls::Logger::debug("fetchLibraryContent: section={} type={} limit={} offset={} extra={}", sectionKey, metadataType, limit, offset, extraParams);
+
+    HttpClient client;
+    std::string url = buildApiUrl("/library/sections/" + sectionKey + "/all");
+    if (metadataType > 0) {
+        url += "&type=" + std::to_string(metadataType);
+    }
+    // Caller-supplied sort / filter fragment (each token already '&'-prefixed).
+    if (!extraParams.empty()) {
+        url += extraParams;
+    }
+
+    // Server-side pagination: only fetch what we need to reduce response size.
+    // Default page size is platform-specific (60 on Vita, 500 on desktop/PS4,
+    // 200-300 on Switch/Android) so beefier platforms can load most libraries
+    // in a single page instead of chunking through 60-item calls.
+    int defaultPageSize = platform::getImageConstraints().libraryPageSize;
+    if (defaultPageSize <= 0) defaultPageSize = 60;
+    int fetchLimit = (limit > 0) ? limit : defaultPageSize;
+    url += "&X-Plex-Container-Start=" + std::to_string(offset) +
+           "&X-Plex-Container-Size=" + std::to_string(fetchLimit);
+
+    // Request JSON format
+    HttpRequest req;
+    req.url = url;
+    req.method = "GET";
+    req.headers["Accept"] = "application/json";
+    HttpResponse resp = client.request(req);
+
+    brls::Logger::debug("Response: {} - {} bytes", resp.statusCode, resp.body.length());
+
+    if (resp.statusCode != 200) {
+        brls::Logger::error("Failed to fetch content: {}", resp.statusCode);
+        if (isAuthError(resp.statusCode)) handleUnauthorized();
+        return false;
+    }
+
+    items.clear();
+    items.reserve(fetchLimit);
+
+    // Extract total count from Plex container metadata (for pagination)
+    if (totalCount) {
+        *totalCount = extractJsonInt(resp.body, "totalSize");
+        if (*totalCount <= 0) {
+            // Fallback: some Plex versions use "size" for container total
+            *totalCount = extractJsonInt(resp.body, "size");
+        }
+    }
+
+    // Parse items in-place without creating per-object substrings.
+    // Uses extractJsonValueRange to search within [objStart, objEnd) of resp.body.
+    size_t pos = 0;
+    while ((pos = resp.body.find("\"ratingKey\"", pos)) != std::string::npos) {
+        size_t objStart = resp.body.rfind('{', pos);
+        if (objStart == std::string::npos) {
+            pos++;
+            continue;
+        }
+
+        int braceCount = 1;
+        size_t objEnd = objStart + 1;
+        while (braceCount > 0 && objEnd < resp.body.length()) {
+            if (resp.body[objEnd] == '{') braceCount++;
+            else if (resp.body[objEnd] == '}') braceCount--;
+            objEnd++;
+        }
+
+        // Parse in-place - no substr copy of the object
+        MediaItem item;
+        item.ratingKey = extractJsonValueRange(resp.body, objStart, objEnd, "ratingKey");
+        item.key = extractJsonValueRange(resp.body, objStart, objEnd, "key");
+        item.title = extractJsonValueRange(resp.body, objStart, objEnd, "title");
+        item.thumb = extractJsonValueRange(resp.body, objStart, objEnd, "thumb");
+        item.type = extractJsonValueRange(resp.body, objStart, objEnd, "type");
+        item.mediaType = parseMediaType(item.type);
+        item.year = extractJsonIntRange(resp.body, objStart, objEnd, "year");
+        item.duration = extractJsonIntRange(resp.body, objStart, objEnd, "duration");
+        item.viewOffset = extractJsonIntRange(resp.body, objStart, objEnd, "viewOffset");
+        item.rating = extractJsonFloatRange(resp.body, objStart, objEnd, "rating");
+        item.audienceRating = extractJsonFloatRange(resp.body, objStart, objEnd, "audienceRating");
+        item.contentRating = extractJsonValueRange(resp.body, objStart, objEnd, "contentRating");
+        item.subtype = extractJsonValueRange(resp.body, objStart, objEnd, "subtype");
+        // Skip summary and art for grid display - saves ~200-500 bytes per item
+
+        if (!item.ratingKey.empty() && !item.title.empty()) {
+            items.push_back(std::move(item));
+        }
+
+        pos = objEnd;
+    }
+
+    brls::Logger::info("Found {} items in library section {}", items.size(), sectionKey);
+    return !items.empty() || resp.statusCode == 200;
+}
+
+bool PlexClient::fetchSectionRecentlyAdded(const std::string& sectionKey, std::vector<MediaItem>& items) {
+    brls::Logger::debug("fetchSectionRecentlyAdded: section={}", sectionKey);
+
+    HttpClient client;
+    // Correct endpoint: /library/sections/{key}/recentlyAdded (no /all)
+    std::string url = buildApiUrl("/library/sections/" + sectionKey + "/recentlyAdded");
+
+    HttpRequest req;
+    req.url = url;
+    req.method = "GET";
+    req.headers["Accept"] = "application/json";
+    HttpResponse resp = client.request(req);
+
+    brls::Logger::debug("RecentlyAdded response: {} - {} bytes", resp.statusCode, resp.body.length());
+
+    if (resp.statusCode != 200) {
+        brls::Logger::error("Failed to fetch recently added: {}", resp.statusCode);
+        if (isAuthError(resp.statusCode)) handleUnauthorized();
+        return false;
+    }
+
+    items.clear();
+
+    // Parse items by looking for objects with "ratingKey"
+    size_t pos = 0;
+    while ((pos = resp.body.find("\"ratingKey\"", pos)) != std::string::npos) {
+        size_t objStart = resp.body.rfind('{', pos);
+        if (objStart == std::string::npos) {
+            pos++;
+            continue;
+        }
+
+        int braceCount = 1;
+        size_t objEnd = objStart + 1;
+        while (braceCount > 0 && objEnd < resp.body.length()) {
+            if (resp.body[objEnd] == '{') braceCount++;
+            else if (resp.body[objEnd] == '}') braceCount--;
+            objEnd++;
+        }
+
+        std::string obj = resp.body.substr(objStart, objEnd - objStart);
+
+        MediaItem item;
+        item.ratingKey = extractJsonValue(obj, "ratingKey");
+        item.key = extractJsonValue(obj, "key");
+        item.title = extractJsonValue(obj, "title");
+        item.summary = extractJsonValue(obj, "summary");
+        item.thumb = extractJsonValue(obj, "thumb");
+        item.art = extractJsonValue(obj, "art");
+        item.type = extractJsonValue(obj, "type");
+        item.mediaType = parseMediaType(item.type);
+        item.year = extractJsonInt(obj, "year");
+        item.duration = extractJsonInt(obj, "duration");
+        item.viewOffset = extractJsonInt(obj, "viewOffset");
+
+        // Parse episode-specific fields for show cover
+        item.grandparentTitle = extractJsonValue(obj, "grandparentTitle");
+        item.grandparentThumb = extractJsonValue(obj, "grandparentThumb");
+        item.parentTitle = extractJsonValue(obj, "parentTitle");
+        item.parentThumb = extractJsonValue(obj, "parentThumb");
+        item.parentIndex = extractJsonInt(obj, "parentIndex");
+        item.index = extractJsonInt(obj, "index");
+
+        if (!item.ratingKey.empty() && !item.title.empty()) {
+            items.push_back(item);
+        }
+
+        pos = objEnd;
+    }
+
+    brls::Logger::info("Found {} recently added items in section {}", items.size(), sectionKey);
+    return true;
+}
+
+bool PlexClient::fetchChildren(const std::string& ratingKey, std::vector<MediaItem>& items) {
+    brls::Logger::debug("fetchChildren: ratingKey={}", ratingKey);
+
+    HttpClient client;
+    std::string url = buildApiUrl("/library/metadata/" + ratingKey + "/children");
+
+    // Request JSON format
+    HttpRequest req;
+    req.url = url;
+    req.method = "GET";
+    req.headers["Accept"] = "application/json";
+    HttpResponse resp = client.request(req);
+
+    brls::Logger::debug("Children response: {} - {} bytes", resp.statusCode, resp.body.length());
+
+    if (resp.statusCode != 200) {
+        brls::Logger::error("Failed to fetch children: {}", resp.statusCode);
+        if (isAuthError(resp.statusCode)) handleUnauthorized();
+        return false;
+    }
+
+    items.clear();
+
+    // Parse media items by looking for objects with ratingKey
+    size_t pos = 0;
+    while ((pos = resp.body.find("\"ratingKey\"", pos)) != std::string::npos) {
+        // Go back to find start of this object
+        size_t objStart = resp.body.rfind('{', pos);
+        if (objStart == std::string::npos) {
+            pos++;
+            continue;
+        }
+
+        // Find end of object
+        int braceCount = 1;
+        size_t objEnd = objStart + 1;
+        while (braceCount > 0 && objEnd < resp.body.length()) {
+            if (resp.body[objEnd] == '{') braceCount++;
+            else if (resp.body[objEnd] == '}') braceCount--;
+            objEnd++;
+        }
+
+        std::string obj = resp.body.substr(objStart, objEnd - objStart);
+
+        MediaItem item;
+        item.ratingKey = extractJsonValue(obj, "ratingKey");
+        item.key = extractJsonValue(obj, "key");
+        item.title = extractJsonValue(obj, "title");
+        item.summary = extractJsonValue(obj, "summary");
+        item.thumb = extractJsonValue(obj, "thumb");
+        item.art = extractJsonValue(obj, "art");
+        item.type = extractJsonValue(obj, "type");
+        item.mediaType = parseMediaType(item.type);
+        item.year = extractJsonInt(obj, "year");
+        item.duration = extractJsonInt(obj, "duration");
+        item.viewOffset = extractJsonInt(obj, "viewOffset");
+        item.rating = extractJsonFloat(obj, "rating");
+        item.userRating = extractJsonFloat(obj, "userRating");
+        item.audienceRating = extractJsonFloat(obj, "audienceRating");
+        item.contentRating = extractJsonValue(obj, "contentRating");
+        item.index = extractJsonInt(obj, "index");
+        item.parentIndex = extractJsonInt(obj, "parentIndex");
+        item.grandparentTitle = extractJsonValue(obj, "grandparentTitle");
+        item.parentTitle = extractJsonValue(obj, "parentTitle");
+        // The parent/grandparent keys, not just their titles. /children sends
+        // both, and PlayerActivity builds its server play queue from the album
+        // URI "if available" — which it never was for a track opened from an
+        // album, because this is where such a track is parsed and the field
+        // was dropped. The queue then named the single track instead of its
+        // album, so Plex returned a one-item queue.
+        item.parentRatingKey = extractJsonValue(obj, "parentRatingKey");
+        item.grandparentRatingKey = extractJsonValue(obj, "grandparentRatingKey");
+        item.leafCount = extractJsonInt(obj, "leafCount");
+        item.viewedLeafCount = extractJsonInt(obj, "viewedLeafCount");
+
+        // Extract subtype for albums (album, single, ep, compilation, soundtrack, live)
+        item.subtype = extractJsonValue(obj, "subtype");
+        if (item.subtype.empty()) {
+            // Try alternative field names
+            item.subtype = extractJsonValue(obj, "albumType");
+        }
+
+        if (!item.ratingKey.empty() && !item.title.empty()) {
+            items.push_back(item);
+        }
+
+        pos = objEnd;
+    }
+
+    brls::Logger::info("Found {} children", items.size());
+    return true;
+}
+
+bool PlexClient::fetchMediaDetails(const std::string& ratingKey, MediaItem& item) {
+    HttpClient client;
+    std::string url = buildApiUrl("/library/metadata/" + ratingKey);
+
+    // Request JSON format
+    HttpRequest req;
+    req.url = url;
+    req.method = "GET";
+    req.headers["Accept"] = "application/json";
+    HttpResponse resp = client.request(req);
+
+    if (resp.statusCode != 200) {
+        if (isAuthError(resp.statusCode)) handleUnauthorized();
+        return false;
+    }
+
+    item.ratingKey = extractJsonValue(resp.body, "ratingKey");
+    item.title = extractJsonValue(resp.body, "title");
+    item.summary = extractJsonValue(resp.body, "summary");
+    item.thumb = extractJsonValue(resp.body, "thumb");
+    item.art = extractJsonValue(resp.body, "art");
+    item.type = extractJsonValue(resp.body, "type");
+    item.mediaType = parseMediaType(item.type);
+    item.year = extractJsonInt(resp.body, "year");
+    item.duration = extractJsonInt(resp.body, "duration");
+    item.viewOffset = extractJsonInt(resp.body, "viewOffset");
+    item.rating = extractJsonFloat(resp.body, "rating");
+    item.userRating = extractJsonFloat(resp.body, "userRating");
+    item.contentRating = extractJsonValue(resp.body, "contentRating");
+    item.studio = extractJsonValue(resp.body, "studio");
+    // leafCount = track count for artists, episode count for shows/seasons.
+    item.leafCount = extractJsonInt(resp.body, "leafCount");
+
+    // Genres: Plex returns "Genre":[{"tag":"Anime"},{"tag":"J-Pop"}]. Pull the
+    // tag of each entry (used by the artist detail meta row). Bounded scan over
+    // the Genre array only, so it never picks up "tag" fields from other arrays.
+    {
+        size_t gPos = resp.body.find("\"Genre\":");
+        if (gPos != std::string::npos) {
+            size_t arrStart = resp.body.find('[', gPos);
+            size_t arrEnd   = resp.body.find(']', arrStart == std::string::npos ? gPos : arrStart);
+            if (arrStart != std::string::npos && arrEnd != std::string::npos && arrEnd > arrStart) {
+                std::string arr = resp.body.substr(arrStart, arrEnd - arrStart + 1);
+                size_t oPos = 0;
+                while ((oPos = arr.find('{', oPos)) != std::string::npos) {
+                    size_t oEnd = arr.find('}', oPos);
+                    if (oEnd == std::string::npos) break;
+                    std::string tag = extractJsonValue(arr.substr(oPos, oEnd - oPos + 1), "tag");
+                    if (!tag.empty()) item.genres.push_back(tag);
+                    oPos = oEnd + 1;
+                }
+            }
+        }
+    }
+
+    // Episode info
+    item.grandparentTitle = extractJsonValue(resp.body, "grandparentTitle");
+    item.parentTitle = extractJsonValue(resp.body, "parentTitle");
+    item.parentRatingKey = extractJsonValue(resp.body, "parentRatingKey");
+    item.grandparentRatingKey = extractJsonValue(resp.body, "grandparentRatingKey");
+    item.index = extractJsonInt(resp.body, "index");
+    item.parentIndex = extractJsonInt(resp.body, "parentIndex");
+
+    // Extract part path for downloads from Media[0].Part[0].key Look for "Part":[{"key":"/library/parts/...
+    size_t partPos = resp.body.find("\"Part\":");
+    if (partPos != std::string::npos) {
+        size_t partKeyPos = resp.body.find("\"key\":", partPos);
+        if (partKeyPos != std::string::npos && partKeyPos < partPos + 500) {
+            // Extract the part key value
+            size_t start = resp.body.find('"', partKeyPos + 6);
+            if (start != std::string::npos) {
+                size_t end = resp.body.find('"', start + 1);
+                if (end != std::string::npos) {
+                    item.partPath = resp.body.substr(start + 1, end - start - 1);
+                    brls::Logger::debug("fetchMediaDetails: partPath={}", item.partPath);
+                }
+            }
+        }
+
+        // Also try to get the file size
+        size_t sizePos = resp.body.find("\"size\":", partPos);
+        if (sizePos != std::string::npos && sizePos < partPos + 500) {
+            size_t numStart = sizePos + 7;
+            while (numStart < resp.body.length() && !isdigit(resp.body[numStart])) numStart++;
+            size_t numEnd = numStart;
+            while (numEnd < resp.body.length() && isdigit(resp.body[numEnd])) numEnd++;
+            if (numEnd > numStart) {
+                item.partSize = std::stoll(resp.body.substr(numStart, numEnd - numStart));
+                brls::Logger::debug("fetchMediaDetails: partSize={}", item.partSize);
+            }
+        }
+    }
+
+    // Parse markers (intro/credits) from "Marker" array in response
+    // Plex returns: "Marker":[{"type":"intro","startTimeOffset":0,"endTimeOffset":30000}, ...]
+    size_t markerArrayPos = resp.body.find("\"Marker\":");
+    if (markerArrayPos != std::string::npos) {
+        size_t arrStart = resp.body.find('[', markerArrayPos);
+        if (arrStart != std::string::npos) {
+            size_t arrEnd = resp.body.find(']', arrStart);
+            if (arrEnd != std::string::npos) {
+                std::string markerArr = resp.body.substr(arrStart, arrEnd - arrStart + 1);
+                // Parse each marker object in the array
+                size_t mPos = 0;
+                while ((mPos = markerArr.find('{', mPos)) != std::string::npos) {
+                    size_t mEnd = markerArr.find('}', mPos);
+                    if (mEnd == std::string::npos) break;
+                    std::string markerObj = markerArr.substr(mPos, mEnd - mPos + 1);
+
+                    MediaItem::Marker marker;
+                    marker.type = extractJsonValue(markerObj, "type");
+                    marker.startTimeMs = extractJsonInt(markerObj, "startTimeOffset");
+                    marker.endTimeMs = extractJsonInt(markerObj, "endTimeOffset");
+
+                    if (!marker.type.empty() && marker.endTimeMs > marker.startTimeMs) {
+                        item.markers.push_back(marker);
+                        brls::Logger::debug("fetchMediaDetails: marker type={} start={}ms end={}ms",
+                                           marker.type, marker.startTimeMs, marker.endTimeMs);
+                    }
+                    mPos = mEnd + 1;
+                }
+            }
+        }
+    }
+
+    // Library section id, so the detail view can browse a person's other
+    // titles within the same section ("more by this person").
+    {
+        int sid = extractJsonInt(resp.body, "librarySectionID");
+        if (sid > 0) item.librarySectionKey = std::to_string(sid);
+    }
+
+    // Parse cast & crew. The full metadata response carries "Role" (actors,
+    // each with a character "role" and a headshot "thumb"), plus "Director"
+    // and "Writer" tag arrays. Flatten them into item.cast for the detail view.
+    {
+        auto parsePeople = [&](const char* arrayKey, const std::string& jobLabel,
+                               const char* filterField) {
+            std::string needle = std::string("\"") + arrayKey + "\":";
+            size_t keyPos = resp.body.find(needle);
+            if (keyPos == std::string::npos) return;
+            size_t arrStart = resp.body.find('[', keyPos);
+            if (arrStart == std::string::npos) return;
+            // Walk to the matching close bracket for this array.
+            int depth = 1;
+            size_t i = arrStart + 1;
+            while (i < resp.body.size() && depth > 0) {
+                char c = resp.body[i];
+                if (c == '[') depth++;
+                else if (c == ']') depth--;
+                i++;
+            }
+            std::string arr = resp.body.substr(arrStart, i - arrStart);
+            size_t p = 0;
+            while ((p = arr.find('{', p)) != std::string::npos) {
+                int d = 1;
+                size_t e = p + 1;
+                while (e < arr.size() && d > 0) {
+                    if (arr[e] == '{') d++;
+                    else if (arr[e] == '}') d--;
+                    e++;
+                }
+                std::string obj = arr.substr(p, e - p);
+                MediaItem::Person person;
+                person.tag = extractJsonValue(obj, "tag");
+                person.role = jobLabel.empty() ? extractJsonValue(obj, "role") : jobLabel;
+                person.thumb = extractJsonValue(obj, "thumb");
+                // Prefer the server-provided filter ("actor=12345"); otherwise build it from the numeric tag id.
+                person.filter = extractJsonValue(obj, "filter");
+                if (person.filter.empty()) {
+                    int tagId = extractJsonInt(obj, "id");
+                    if (tagId > 0)
+                        person.filter = std::string(filterField) + "=" + std::to_string(tagId);
+                }
+                if (!person.tag.empty()) item.cast.push_back(person);
+                p = e;
+            }
+        };
+        parsePeople("Role", "", "actor");          // actors: role = character
+        parsePeople("Director", "Director", "director");
+        parsePeople("Writer", "Writer", "writer");
+        if (item.cast.size() > 30) item.cast.resize(30);
+    }
+
+    return true;
+}
+
+bool PlexClient::fetchByPersonFilter(const std::string& sectionKey, const std::string& filter,
+                                     std::vector<MediaItem>& items) {
+    items.clear();
+    if (sectionKey.empty() || filter.empty()) return false;
+
+    HttpClient client;
+    // e.g. /library/sections/2/all?actor=12345 — every title in this section the person is credited on.
+    std::string url = buildApiUrl("/library/sections/" + sectionKey + "/all?" + filter);
+
+    HttpRequest req;
+    req.url = url;
+    req.method = "GET";
+    req.headers["Accept"] = "application/json";
+    HttpResponse resp = client.request(req);
+
+    if (resp.statusCode != 200) {
+        brls::Logger::warning("fetchByPersonFilter: status {}", resp.statusCode);
+        if (isAuthError(resp.statusCode)) handleUnauthorized();
+        return false;
+    }
+
+    size_t pos = 0;
+    while ((pos = resp.body.find("\"ratingKey\"", pos)) != std::string::npos) {
+        size_t objStart = resp.body.rfind('{', pos);
+        if (objStart == std::string::npos) { pos++; continue; }
+
+        int braceCount = 1;
+        size_t objEnd = objStart + 1;
+        while (braceCount > 0 && objEnd < resp.body.length()) {
+            if (resp.body[objEnd] == '{') braceCount++;
+            else if (resp.body[objEnd] == '}') braceCount--;
+            objEnd++;
+        }
+
+        std::string obj = resp.body.substr(objStart, objEnd - objStart);
+
+        MediaItem item;
+        item.ratingKey = extractJsonValue(obj, "ratingKey");
+        item.key = extractJsonValue(obj, "key");
+        item.title = extractJsonValue(obj, "title");
+        item.thumb = extractJsonValue(obj, "thumb");
+        item.art = extractJsonValue(obj, "art");
+        item.type = extractJsonValue(obj, "type");
+        item.mediaType = parseMediaType(item.type);
+        item.year = extractJsonInt(obj, "year");
+        item.duration = extractJsonInt(obj, "duration");
+        item.viewOffset = extractJsonInt(obj, "viewOffset");
+        item.rating = extractJsonFloat(obj, "rating");
+        item.userRating = extractJsonFloat(obj, "userRating");
+        item.audienceRating = extractJsonFloat(obj, "audienceRating");
+        // Per-title role for the cast member, when the server includes it in the
+        // filtered listing (often absent for actors; present for some credits).
+        item.character = extractJsonValue(obj, "role");
+
+        bool playable = (item.mediaType == MediaType::MOVIE ||
+                         item.mediaType == MediaType::SHOW);
+        if (!item.ratingKey.empty() && !item.title.empty() && playable) {
+            bool dup = false;
+            for (const auto& e : items) {
+                if (e.ratingKey == item.ratingKey) { dup = true; break; }
+            }
+            if (!dup) items.push_back(item);
+        }
+
+        pos = objEnd;
+    }
+
+    brls::Logger::info("fetchByPersonFilter: {} items for {}", items.size(), filter);
+    return true;
+}
+
+bool PlexClient::fetchRelated(const std::string& ratingKey, std::vector<MediaItem>& items) {
+    brls::Logger::debug("fetchRelated: ratingKey={}", ratingKey);
+    items.clear();
+
+    HttpClient client;
+    // The server's "related" hubs (e.g. "Related Movies", "From the director").
+    std::string url = buildApiUrl("/hubs/metadata/" + ratingKey + "/related?excludeFields=summary");
+
+    HttpRequest req;
+    req.url = url;
+    req.method = "GET";
+    req.headers["Accept"] = "application/json";
+    HttpResponse resp = client.request(req);
+
+    if (resp.statusCode != 200) {
+        brls::Logger::warning("fetchRelated: status {}", resp.statusCode);
+        if (isAuthError(resp.statusCode)) handleUnauthorized();
+        return false;
+    }
+
+    // Flatten every Metadata item across the related hubs, de-duplicated and
+    // excluding the item itself. Each item is an object carrying "ratingKey".
+    size_t pos = 0;
+    while ((pos = resp.body.find("\"ratingKey\"", pos)) != std::string::npos) {
+        size_t objStart = resp.body.rfind('{', pos);
+        if (objStart == std::string::npos) { pos++; continue; }
+
+        int braceCount = 1;
+        size_t objEnd = objStart + 1;
+        while (braceCount > 0 && objEnd < resp.body.length()) {
+            if (resp.body[objEnd] == '{') braceCount++;
+            else if (resp.body[objEnd] == '}') braceCount--;
+            objEnd++;
+        }
+
+        std::string obj = resp.body.substr(objStart, objEnd - objStart);
+
+        MediaItem item;
+        item.ratingKey = extractJsonValue(obj, "ratingKey");
+        item.key = extractJsonValue(obj, "key");
+        item.title = extractJsonValue(obj, "title");
+        item.thumb = extractJsonValue(obj, "thumb");
+        item.art = extractJsonValue(obj, "art");
+        item.type = extractJsonValue(obj, "type");
+        item.mediaType = parseMediaType(item.type);
+        item.year = extractJsonInt(obj, "year");
+        item.duration = extractJsonInt(obj, "duration");
+        item.viewOffset = extractJsonInt(obj, "viewOffset");
+        item.rating = extractJsonFloat(obj, "rating");
+        item.userRating = extractJsonFloat(obj, "userRating");
+        item.audienceRating = extractJsonFloat(obj, "audienceRating");
+
+        bool playable = (item.mediaType == MediaType::MOVIE ||
+                         item.mediaType == MediaType::SHOW);
+        if (!item.ratingKey.empty() && !item.title.empty() &&
+            item.ratingKey != ratingKey && playable) {
+            bool dup = false;
+            for (const auto& e : items) {
+                if (e.ratingKey == item.ratingKey) { dup = true; break; }
+            }
+            if (!dup) items.push_back(item);
+        }
+
+        pos = objEnd;
+    }
+
+    // Keep the carousel light.
+    if (items.size() > 24) items.resize(24);
+    brls::Logger::info("fetchRelated: {} related items", items.size());
+    return true;
+}
+
+bool PlexClient::fetchExtras(const std::string& ratingKey, std::vector<MediaItem>& items) {
+    brls::Logger::debug("fetchExtras: ratingKey={}", ratingKey);
+
+    HttpClient client;
+    std::string url = buildApiUrl("/library/metadata/" + ratingKey + "/extras");
+
+    HttpRequest req;
+    req.url = url;
+    req.method = "GET";
+    req.headers["Accept"] = "application/json";
+    HttpResponse resp = client.request(req);
+
+    brls::Logger::debug("Extras response: {} - {} bytes", resp.statusCode, resp.body.length());
+
+    if (resp.statusCode != 200) {
+        brls::Logger::error("Failed to fetch extras: {}", resp.statusCode);
+        if (isAuthError(resp.statusCode)) handleUnauthorized();
+        return false;
+    }
+
+    items.clear();
+
+    // Parse media items by looking for objects with ratingKey
+    size_t pos = 0;
+    while ((pos = resp.body.find("\"ratingKey\"", pos)) != std::string::npos) {
+        size_t objStart = resp.body.rfind('{', pos);
+        if (objStart == std::string::npos) {
+            pos++;
+            continue;
+        }
+
+        int braceCount = 1;
+        size_t objEnd = objStart + 1;
+        while (braceCount > 0 && objEnd < resp.body.length()) {
+            if (resp.body[objEnd] == '{') braceCount++;
+            else if (resp.body[objEnd] == '}') braceCount--;
+            objEnd++;
+        }
+
+        std::string obj = resp.body.substr(objStart, objEnd - objStart);
+
+        MediaItem item;
+        item.ratingKey = extractJsonValue(obj, "ratingKey");
+        item.key = extractJsonValue(obj, "key");
+        item.title = extractJsonValue(obj, "title");
+        item.summary = extractJsonValue(obj, "summary");
+        item.thumb = extractJsonValue(obj, "thumb");
+        item.type = extractJsonValue(obj, "type");
+        item.mediaType = parseMediaType(item.type);
+        item.duration = extractJsonInt(obj, "duration");
+        item.subtype = extractJsonValue(obj, "subtype");
+
+        if (!item.ratingKey.empty() && !item.title.empty()) {
+            items.push_back(item);
+        }
+
+        pos = objEnd;
+    }
+
+    brls::Logger::info("Found {} extras", items.size());
+    return true;
+}
+
+bool PlexClient::fetchArtistHubs(const std::string& ratingKey, std::vector<Hub>& hubs) {
+    brls::Logger::debug("fetchArtistHubs: ratingKey={}", ratingKey);
+
+    HttpClient client;
+    std::string url = buildApiUrl("/hubs/metadata/" + ratingKey + "?count=999");
+
+    HttpRequest req;
+    req.url = url;
+    req.method = "GET";
+    req.headers["Accept"] = "application/json";
+    HttpResponse resp = client.request(req);
+
+    brls::Logger::debug("ArtistHubs response: {} - {} bytes", resp.statusCode, resp.body.length());
+
+    if (resp.statusCode != 200) {
+        brls::Logger::error("Failed to fetch artist hubs: {}", resp.statusCode);
+        if (isAuthError(resp.statusCode)) handleUnauthorized();
+        return false;
+    }
+
+    hubs.clear();
+
+    // Parse hubs - look for objects with "hubIdentifier" field
+    size_t pos = 0;
+    while ((pos = resp.body.find("\"hubIdentifier\"", pos)) != std::string::npos) {
+        size_t hubStart = resp.body.rfind('{', pos);
+        if (hubStart == std::string::npos) {
+            pos++;
+            continue;
+        }
+
+        int braceCount = 1;
+        size_t hubEnd = hubStart + 1;
+        while (braceCount > 0 && hubEnd < resp.body.length()) {
+            if (resp.body[hubEnd] == '{') braceCount++;
+            else if (resp.body[hubEnd] == '}') braceCount--;
+            hubEnd++;
+        }
+
+        std::string hubObj = resp.body.substr(hubStart, hubEnd - hubStart);
+
+        Hub hub;
+        hub.title = extractJsonValue(hubObj, "title");
+        hub.type = extractJsonValue(hubObj, "type");
+        hub.hubIdentifier = extractJsonValue(hubObj, "hubIdentifier");
+        hub.key = extractJsonValue(hubObj, "key");
+        hub.more = extractJsonBool(hubObj, "more");
+
+        // Parse items inside the hub
+        size_t itemPos = 0;
+        while ((itemPos = hubObj.find("\"ratingKey\"", itemPos)) != std::string::npos) {
+            size_t itemStart = hubObj.rfind('{', itemPos);
+            if (itemStart == std::string::npos) {
+                itemPos++;
+                continue;
+            }
+
+            int itemBraceCount = 1;
+            size_t itemEnd = itemStart + 1;
+            while (itemBraceCount > 0 && itemEnd < hubObj.length()) {
+                if (hubObj[itemEnd] == '{') itemBraceCount++;
+                else if (hubObj[itemEnd] == '}') itemBraceCount--;
+                itemEnd++;
+            }
+
+            std::string itemObj = hubObj.substr(itemStart, itemEnd - itemStart);
+
+            MediaItem item;
+            item.ratingKey = extractJsonValue(itemObj, "ratingKey");
+            item.title = extractJsonValue(itemObj, "title");
+            item.thumb = extractJsonValue(itemObj, "thumb");
+            item.art = extractJsonValue(itemObj, "art");
+            item.type = extractJsonValue(itemObj, "type");
+            item.mediaType = parseMediaType(item.type);
+            item.year = extractJsonInt(itemObj, "year");
+            item.summary = extractJsonValue(itemObj, "summary");
+            item.leafCount = extractJsonInt(itemObj, "leafCount");
+            item.viewedLeafCount = extractJsonInt(itemObj, "viewedLeafCount");
+            item.subtype = extractJsonValue(itemObj, "subtype");
+            item.parentTitle = extractJsonValue(itemObj, "parentTitle");
+            item.grandparentTitle = extractJsonValue(itemObj, "grandparentTitle");
+
+            if (!item.ratingKey.empty() && !item.title.empty()) {
+                hub.items.push_back(item);
+            }
+
+            itemPos = itemEnd;
+        }
+
+        if (!hub.title.empty() && !hub.items.empty()) {
+            hubs.push_back(hub);
+        }
+
+        pos = hubEnd;
+    }
+
+    brls::Logger::info("Found {} artist hubs", hubs.size());
+
+    // For hubs with more items available, fetch the full list using the hub's key
+    for (auto& hub : hubs) {
+        if (!hub.more || hub.key.empty()) continue;
+
+        brls::Logger::info("Fetching full hub '{}' ({} items so far, more=true)", hub.title, hub.items.size());
+
+        HttpClient hubClient;
+        std::string hubUrl = buildApiUrl(hub.key);
+        HttpRequest hubReq;
+        hubReq.url = hubUrl;
+        hubReq.method = "GET";
+        hubReq.headers["Accept"] = "application/json";
+        HttpResponse hubResp = hubClient.request(hubReq);
+
+        if (hubResp.statusCode != 200) {
+            brls::Logger::error("Failed to fetch full hub '{}': {}", hub.title, hubResp.statusCode);
+            continue;
+        }
+
+        // Parse all items from the full hub response
+        std::vector<MediaItem> fullItems;
+        size_t itemPos = 0;
+        while ((itemPos = hubResp.body.find("\"ratingKey\"", itemPos)) != std::string::npos) {
+            size_t itemStart = hubResp.body.rfind('{', itemPos);
+            if (itemStart == std::string::npos) {
+                itemPos++;
+                continue;
+            }
+
+            int itemBraceCount = 1;
+            size_t itemEnd = itemStart + 1;
+            while (itemBraceCount > 0 && itemEnd < hubResp.body.length()) {
+                if (hubResp.body[itemEnd] == '{') itemBraceCount++;
+                else if (hubResp.body[itemEnd] == '}') itemBraceCount--;
+                itemEnd++;
+            }
+
+            std::string itemObj = hubResp.body.substr(itemStart, itemEnd - itemStart);
+
+            MediaItem item;
+            item.ratingKey = extractJsonValue(itemObj, "ratingKey");
+            item.title = extractJsonValue(itemObj, "title");
+            item.thumb = extractJsonValue(itemObj, "thumb");
+            item.art = extractJsonValue(itemObj, "art");
+            item.type = extractJsonValue(itemObj, "type");
+            item.mediaType = parseMediaType(item.type);
+            item.year = extractJsonInt(itemObj, "year");
+            item.summary = extractJsonValue(itemObj, "summary");
+            item.leafCount = extractJsonInt(itemObj, "leafCount");
+            item.viewedLeafCount = extractJsonInt(itemObj, "viewedLeafCount");
+            item.subtype = extractJsonValue(itemObj, "subtype");
+            item.parentTitle = extractJsonValue(itemObj, "parentTitle");
+            item.grandparentTitle = extractJsonValue(itemObj, "grandparentTitle");
+
+            if (!item.ratingKey.empty() && !item.title.empty()) {
+                fullItems.push_back(item);
+            }
+
+            itemPos = itemEnd;
+        }
+
+        if (!fullItems.empty()) {
+            brls::Logger::info("Hub '{}': replaced {} items with {} from full fetch", hub.title, hub.items.size(), fullItems.size());
+            hub.items = std::move(fullItems);
+        }
+    }
+
+    return true;
+}
+
+bool PlexClient::fetchArtistAlbumsByFilter(const std::string& sectionKey,
+                                          const std::string& artistRatingKey,
+                                          const std::string& filter,
+                                          std::vector<MediaItem>& items) {
+    items.clear();
+    if (sectionKey.empty() || artistRatingKey.empty()) return false;
+
+    brls::Logger::debug("fetchArtistAlbumsByFilter: section={} artist={} filter={}",
+                        sectionKey, artistRatingKey, filter.empty() ? "(all)" : filter);
+
+    HttpClient client;
+    // Mirror the official client: a section query scoped to the artist (type=9
+    // = album) filtered by a release-type token (album.format=... for primary
+    // types like Single/EP, album.subformat=... for secondary types). No
+    // group=title here: an artist can have several distinct same-titled releases
+    // (e.g. multiple "Total Coverage" compilations) and grouping would collapse
+    // them into one.
+    // An empty filter returns every release type the artist owns (regular albums
+    // plus singles / EPs / compilations / soundtracks / …) in one query — used by
+    // playback and download to gather an artist's whole discography at once.
+    std::string url = buildApiUrl("/library/sections/" + sectionKey +
+        "/all?type=9&artist.id=" + artistRatingKey +
+        (filter.empty() ? "" : "&" + filter) +
+        "&sort=year:desc");
+
+    HttpRequest req;
+    req.url = url;
+    req.method = "GET";
+    req.headers["Accept"] = "application/json";
+    HttpResponse resp = client.request(req);
+
+    if (resp.statusCode != 200) {
+        brls::Logger::error("fetchArtistAlbumsByFilter failed: {}", resp.statusCode);
+        if (isAuthError(resp.statusCode)) handleUnauthorized();
+        return false;
+    }
+
+    size_t pos = 0;
+    while ((pos = resp.body.find("\"ratingKey\"", pos)) != std::string::npos) {
+        size_t objStart = resp.body.rfind('{', pos);
+        if (objStart == std::string::npos) { pos++; continue; }
+        int braceCount = 1;
+        size_t objEnd = objStart + 1;
+        while (braceCount > 0 && objEnd < resp.body.length()) {
+            if (resp.body[objEnd] == '{') braceCount++;
+            else if (resp.body[objEnd] == '}') braceCount--;
+            objEnd++;
+        }
+        std::string obj = resp.body.substr(objStart, objEnd - objStart);
+
+        MediaItem item;
+        item.ratingKey   = extractJsonValue(obj, "ratingKey");
+        item.key         = extractJsonValue(obj, "key");
+        item.title       = extractJsonValue(obj, "title");
+        item.thumb       = extractJsonValue(obj, "thumb");
+        item.art         = extractJsonValue(obj, "art");
+        item.type        = extractJsonValue(obj, "type");
+        item.mediaType   = parseMediaType(item.type);
+        item.year        = extractJsonInt(obj, "year");
+        item.parentTitle = extractJsonValue(obj, "parentTitle");
+        item.leafCount   = extractJsonInt(obj, "leafCount");
+
+        if (!item.ratingKey.empty() && !item.title.empty() &&
+            item.mediaType == MediaType::MUSIC_ALBUM) {
+            items.push_back(item);
+        }
+        pos = objEnd;
+    }
+
+    brls::Logger::info("fetchArtistAlbumsByFilter [{}]: {} albums", filter, items.size());
+    return true;
+}
+
+bool PlexClient::fetchHubs(std::vector<Hub>& hubs) {
+    brls::Logger::debug("fetchHubs: serverUrl={}", m_serverUrl);
+
+    std::string url = buildApiUrl("/hubs");
+
+    // Cache the Home hub bundle — biggest single response on the Home
+    // tab, fetched every time it gets focus. Stale by at most one TTL
+    // tick after the user adds new content; user can Clear Cache in
+    // Settings if they want the new items immediately.
+    const int ttlSec = Application::getInstance().getSettings().cacheLifetimeMinutes * 60;
+    std::string body;
+    bool fromCache = HttpCache::get(url, ttlSec, body);
+
+    if (!fromCache) {
+        HttpClient client;
+        // Request JSON format
+        HttpRequest req;
+        req.url = url;
+        req.method = "GET";
+        req.headers["Accept"] = "application/json";
+        HttpResponse resp = client.request(req);
+        brls::Logger::debug("Hubs response: {} - {} bytes", resp.statusCode, resp.body.length());
+
+        if (resp.statusCode != 200) {
+            brls::Logger::error("Failed to fetch hubs: {}", resp.statusCode);
+            if (isAuthError(resp.statusCode)) handleUnauthorized();
+            return false;
+        }
+        body = resp.body;
+        HttpCache::put(url, body, ttlSec);
+    }
+
+    hubs.clear();
+
+    // Parse hubs - look for objects with "hubIdentifier" field
+    size_t pos = 0;
+    while ((pos = body.find("\"hubIdentifier\"", pos)) != std::string::npos) {
+        // Go back to find start of this hub object
+        size_t hubStart = body.rfind('{', pos);
+        if (hubStart == std::string::npos) {
+            pos++;
+            continue;
+        }
+
+        // Find end of hub object
+        int braceCount = 1;
+        size_t hubEnd = hubStart + 1;
+        while (braceCount > 0 && hubEnd < body.length()) {
+            if (body[hubEnd] == '{') braceCount++;
+            else if (body[hubEnd] == '}') braceCount--;
+            hubEnd++;
+        }
+
+        std::string hubObj = body.substr(hubStart, hubEnd - hubStart);
+
+        Hub hub;
+        hub.title = extractJsonValue(hubObj, "title");
+        hub.type = extractJsonValue(hubObj, "type");
+        hub.hubIdentifier = extractJsonValue(hubObj, "hubIdentifier");
+        hub.key = extractJsonValue(hubObj, "key");
+        hub.more = extractJsonBool(hubObj, "more");
+
+        // Parse items inside the hub by looking for ratingKey
+        size_t itemPos = 0;
+        while ((itemPos = hubObj.find("\"ratingKey\"", itemPos)) != std::string::npos) {
+            // Go back to find start of this item object
+            size_t itemStart = hubObj.rfind('{', itemPos);
+            if (itemStart == std::string::npos) {
+                itemPos++;
+                continue;
+            }
+
+            // Find end of item object
+            int itemBraceCount = 1;
+            size_t itemEnd = itemStart + 1;
+            while (itemBraceCount > 0 && itemEnd < hubObj.length()) {
+                if (hubObj[itemEnd] == '{') itemBraceCount++;
+                else if (hubObj[itemEnd] == '}') itemBraceCount--;
+                itemEnd++;
+            }
+
+            std::string itemObj = hubObj.substr(itemStart, itemEnd - itemStart);
+
+            MediaItem item;
+            item.ratingKey = extractJsonValue(itemObj, "ratingKey");
+            item.title = extractJsonValue(itemObj, "title");
+            item.thumb = extractJsonValue(itemObj, "thumb");
+            item.type = extractJsonValue(itemObj, "type");
+            item.mediaType = parseMediaType(item.type);
+            item.year = extractJsonInt(itemObj, "year");
+            item.viewOffset = extractJsonInt(itemObj, "viewOffset");
+            item.rating = extractJsonFloat(itemObj, "rating");
+            item.audienceRating = extractJsonFloat(itemObj, "audienceRating");
+
+            if (!item.ratingKey.empty() && !item.title.empty()) {
+                hub.items.push_back(item);
+            }
+
+            itemPos = itemEnd;
+        }
+
+        if (!hub.title.empty()) {
+            hubs.push_back(hub);
+        }
+
+        pos = hubEnd;
+    }
+
+    brls::Logger::info("Found {} hubs", hubs.size());
+    return true;
+}
+
+bool PlexClient::fetchContinueWatching(std::vector<MediaItem>& items) {
+    brls::Logger::debug("fetchContinueWatching: serverUrl={}", m_serverUrl);
+
+    HttpClient client;
+    std::string url = buildApiUrl("/hubs/continueWatching");
+
+    // Request JSON format
+    HttpRequest req;
+    req.url = url;
+    req.method = "GET";
+    req.headers["Accept"] = "application/json";
+    HttpResponse resp = client.request(req);
+
+    brls::Logger::debug("ContinueWatching response: {} - {} bytes", resp.statusCode, resp.body.length());
+
+    if (resp.statusCode != 200) {
+        brls::Logger::error("Failed to fetch continue watching: {}", resp.statusCode);
+        if (isAuthError(resp.statusCode)) handleUnauthorized();
+        return false;
+    }
+
+    items.clear();
+
+    // Parse media items by looking for objects with ratingKey
+    size_t pos = 0;
+    while ((pos = resp.body.find("\"ratingKey\"", pos)) != std::string::npos) {
+        // Go back to find start of this object
+        size_t objStart = resp.body.rfind('{', pos);
+        if (objStart == std::string::npos) {
+            pos++;
+            continue;
+        }
+
+        // Find end of object
+        int braceCount = 1;
+        size_t objEnd = objStart + 1;
+        while (braceCount > 0 && objEnd < resp.body.length()) {
+            if (resp.body[objEnd] == '{') braceCount++;
+            else if (resp.body[objEnd] == '}') braceCount--;
+            objEnd++;
+        }
+
+        std::string obj = resp.body.substr(objStart, objEnd - objStart);
+
+        MediaItem item;
+        item.ratingKey = extractJsonValue(obj, "ratingKey");
+        item.key = extractJsonValue(obj, "key");
+        item.title = extractJsonValue(obj, "title");
+        item.summary = extractJsonValue(obj, "summary");
+        item.thumb = extractJsonValue(obj, "thumb");
+        item.art = extractJsonValue(obj, "art");
+        item.type = extractJsonValue(obj, "type");
+        item.mediaType = parseMediaType(item.type);
+        item.year = extractJsonInt(obj, "year");
+        item.duration = extractJsonInt(obj, "duration");
+        item.viewOffset = extractJsonInt(obj, "viewOffset");
+        item.grandparentTitle = extractJsonValue(obj, "grandparentTitle");
+        item.parentTitle = extractJsonValue(obj, "parentTitle");
+        item.grandparentThumb = extractJsonValue(obj, "grandparentThumb");
+        item.parentThumb = extractJsonValue(obj, "parentThumb");
+        item.index = extractJsonInt(obj, "index");
+        item.parentIndex = extractJsonInt(obj, "parentIndex");
+        item.rating = extractJsonFloat(obj, "rating");
+        item.userRating = extractJsonFloat(obj, "userRating");
+        item.audienceRating = extractJsonFloat(obj, "audienceRating");
+
+        if (!item.ratingKey.empty() && !item.title.empty()) {
+            items.push_back(item);
+        }
+
+        pos = objEnd;
+    }
+
+    brls::Logger::info("Found {} continue watching items", items.size());
+    return true;
+}
+
+bool PlexClient::fetchRecentlyAdded(std::vector<MediaItem>& items) {
+    brls::Logger::debug("fetchRecentlyAdded: serverUrl={}", m_serverUrl);
+
+    HttpClient client;
+    std::string url = buildApiUrl("/library/recentlyAdded");
+
+    // Request JSON format
+    HttpRequest req;
+    req.url = url;
+    req.method = "GET";
+    req.headers["Accept"] = "application/json";
+    HttpResponse resp = client.request(req);
+
+    brls::Logger::debug("RecentlyAdded response: {} - {} bytes", resp.statusCode, resp.body.length());
+
+    if (resp.statusCode != 200) {
+        brls::Logger::error("Failed to fetch recently added: {}", resp.statusCode);
+        if (isAuthError(resp.statusCode)) handleUnauthorized();
+        return false;
+    }
+
+    items.clear();
+
+    // Parse media items by looking for objects with ratingKey
+    size_t pos = 0;
+    while ((pos = resp.body.find("\"ratingKey\"", pos)) != std::string::npos) {
+        // Go back to find start of this object
+        size_t objStart = resp.body.rfind('{', pos);
+        if (objStart == std::string::npos) {
+            pos++;
+            continue;
+        }
+
+        // Find end of object
+        int braceCount = 1;
+        size_t objEnd = objStart + 1;
+        while (braceCount > 0 && objEnd < resp.body.length()) {
+            if (resp.body[objEnd] == '{') braceCount++;
+            else if (resp.body[objEnd] == '}') braceCount--;
+            objEnd++;
+        }
+
+        std::string obj = resp.body.substr(objStart, objEnd - objStart);
+
+        MediaItem item;
+        item.ratingKey = extractJsonValue(obj, "ratingKey");
+        item.key = extractJsonValue(obj, "key");
+        item.title = extractJsonValue(obj, "title");
+        item.summary = extractJsonValue(obj, "summary");
+        item.thumb = extractJsonValue(obj, "thumb");
+        item.art = extractJsonValue(obj, "art");
+        item.type = extractJsonValue(obj, "type");
+        item.mediaType = parseMediaType(item.type);
+        item.year = extractJsonInt(obj, "year");
+        item.duration = extractJsonInt(obj, "duration");
+        item.viewOffset = extractJsonInt(obj, "viewOffset");
+        item.rating = extractJsonFloat(obj, "rating");
+        item.userRating = extractJsonFloat(obj, "userRating");
+        item.audienceRating = extractJsonFloat(obj, "audienceRating");
+
+        if (!item.ratingKey.empty() && !item.title.empty()) {
+            items.push_back(item);
+        }
+
+        pos = objEnd;
+    }
+
+    brls::Logger::info("Found {} recently added items", items.size());
+    return true;
+}
+
+bool PlexClient::fetchRecentlyAddedByType(MediaType type, std::vector<MediaItem>& items) {
+    brls::Logger::debug("fetchRecentlyAddedByType: type={}", static_cast<int>(type));
+
+    // Plex API type codes: 1=movie, 2=show, 8=artist (music), 9=album, 10=track
+    int typeCode = 0;
+    std::string typeName;
+    switch (type) {
+        case MediaType::MOVIE:
+            typeCode = 1;
+            typeName = "movie";
+            break;
+        case MediaType::SHOW:
+        case MediaType::EPISODE:
+            typeCode = 2;
+            typeName = "show";
+            break;
+        case MediaType::MUSIC_ARTIST:
+            typeCode = 8;
+            typeName = "artist";
+            break;
+        case MediaType::MUSIC_ALBUM:
+            typeCode = 9;
+            typeName = "album";
+            break;
+        case MediaType::MUSIC_TRACK:
+            typeCode = 10;
+            typeName = "track";
+            break;
+        default:
+            return fetchRecentlyAdded(items);  // Fallback to all types
+    }
+
+    HttpClient client;
+    std::string url = buildApiUrl("/library/recentlyAdded?type=" + std::to_string(typeCode));
+
+    HttpRequest req;
+    req.url = url;
+    req.method = "GET";
+    req.headers["Accept"] = "application/json";
+    HttpResponse resp = client.request(req);
+
+    brls::Logger::debug("RecentlyAddedByType response: {} - {} bytes", resp.statusCode, resp.body.length());
+
+    if (resp.statusCode != 200) {
+        brls::Logger::error("Failed to fetch recently added by type: {}", resp.statusCode);
+        return false;
+    }
+
+    items.clear();
+
+    // Parse media items by looking for objects with ratingKey
+    size_t pos = 0;
+    while ((pos = resp.body.find("\"ratingKey\"", pos)) != std::string::npos) {
+        size_t objStart = resp.body.rfind('{', pos);
+        if (objStart == std::string::npos) {
+            pos++;
+            continue;
+        }
+
+        int braceCount = 1;
+        size_t objEnd = objStart + 1;
+        while (braceCount > 0 && objEnd < resp.body.length()) {
+            if (resp.body[objEnd] == '{') braceCount++;
+            else if (resp.body[objEnd] == '}') braceCount--;
+            objEnd++;
+        }
+
+        std::string obj = resp.body.substr(objStart, objEnd - objStart);
+
+        MediaItem item;
+        item.ratingKey = extractJsonValue(obj, "ratingKey");
+        item.key = extractJsonValue(obj, "key");
+        item.title = extractJsonValue(obj, "title");
+        item.summary = extractJsonValue(obj, "summary");
+        item.thumb = extractJsonValue(obj, "thumb");
+        item.art = extractJsonValue(obj, "art");
+        item.type = extractJsonValue(obj, "type");
+        item.mediaType = parseMediaType(item.type);
+        item.year = extractJsonInt(obj, "year");
+        item.duration = extractJsonInt(obj, "duration");
+        item.viewOffset = extractJsonInt(obj, "viewOffset");
+        item.rating = extractJsonFloat(obj, "rating");
+        item.userRating = extractJsonFloat(obj, "userRating");
+        item.audienceRating = extractJsonFloat(obj, "audienceRating");
+
+        if (!item.ratingKey.empty() && !item.title.empty()) {
+            items.push_back(item);
+        }
+
+        pos = objEnd;
+    }
+
+    brls::Logger::info("Found {} recently added {} items", items.size(), typeName);
+    return true;
+}
+
+bool PlexClient::search(const std::string& query, std::vector<MediaItem>& results) {
+    brls::Logger::debug("Searching for: {}", query);
+
+    HttpClient client;
+    // /hubs/search caps each hub (Movies, Episodes, …) at a small default (~3),
+    // so pass an explicit limit to return the full result set per type.
+    std::string url = buildApiUrl("/hubs/search?query=" + HttpClient::urlEncode(query) + "&limit=100");
+
+    // Request JSON format
+    HttpRequest req;
+    req.url = url;
+    req.method = "GET";
+    req.headers["Accept"] = "application/json";
+    HttpResponse resp = client.request(req);
+
+    brls::Logger::debug("Search response: {} - {} bytes", resp.statusCode, resp.body.length());
+
+    if (resp.statusCode != 200) {
+        brls::Logger::error("Search failed: {}", resp.statusCode);
+        if (isAuthError(resp.statusCode)) handleUnauthorized();
+        return false;
+    }
+
+    results.clear();
+
+    // Parse search results by looking for objects with ratingKey
+    size_t pos = 0;
+    while ((pos = resp.body.find("\"ratingKey\"", pos)) != std::string::npos) {
+        // Go back to find start of this object
+        size_t objStart = resp.body.rfind('{', pos);
+        if (objStart == std::string::npos) {
+            pos++;
+            continue;
+        }
+
+        // Find end of object
+        int braceCount = 1;
+        size_t objEnd = objStart + 1;
+        while (braceCount > 0 && objEnd < resp.body.length()) {
+            if (resp.body[objEnd] == '{') braceCount++;
+            else if (resp.body[objEnd] == '}') braceCount--;
+            objEnd++;
+        }
+
+        std::string obj = resp.body.substr(objStart, objEnd - objStart);
+
+        MediaItem item;
+        item.ratingKey = extractJsonValue(obj, "ratingKey");
+        item.key = extractJsonValue(obj, "key");
+        item.title = extractJsonValue(obj, "title");
+        item.summary = extractJsonValue(obj, "summary");
+        item.thumb = extractJsonValue(obj, "thumb");
+        item.art = extractJsonValue(obj, "art");
+        item.type = extractJsonValue(obj, "type");
+        item.mediaType = parseMediaType(item.type);
+        item.year = extractJsonInt(obj, "year");
+        item.duration = extractJsonInt(obj, "duration");
+        item.index = extractJsonInt(obj, "index");             // episode / track number
+        item.parentIndex = extractJsonInt(obj, "parentIndex"); // season number
+        item.grandparentTitle = extractJsonValue(obj, "grandparentTitle");
+        item.parentTitle = extractJsonValue(obj, "parentTitle");
+        item.parentThumb = extractJsonValue(obj, "parentThumb");
+        item.grandparentThumb = extractJsonValue(obj, "grandparentThumb");
+        item.rating = extractJsonFloat(obj, "rating");
+        item.userRating = extractJsonFloat(obj, "userRating");
+        item.audienceRating = extractJsonFloat(obj, "audienceRating");
+
+        if (!item.ratingKey.empty() && !item.title.empty()) {
+            results.push_back(item);
+        }
+
+        pos = objEnd;
+    }
+
+    brls::Logger::info("Found {} search results for '{}'", results.size(), query);
+    return true;
+}
+
+bool PlexClient::fetchCollections(const std::string& sectionKey, std::vector<MediaItem>& collections) {
+    brls::Logger::debug("Fetching collections for section: {}", sectionKey);
+
+    HttpClient client;
+    // Use proper Plex API: /library/sections/{key}/all?type=18 (18 = collection type)
+    // Also try /library/sections/{key}/collections as fallback
+    std::string url = buildApiUrl("/library/sections/" + sectionKey + "/all?type=18");
+
+    HttpRequest req;
+    req.url = url;
+    req.method = "GET";
+    req.headers["Accept"] = "application/json";
+    HttpResponse resp = client.request(req);
+
+    // Fallback to /collections endpoint if type=18 fails
+    if (resp.statusCode != 200) {
+        url = buildApiUrl("/library/sections/" + sectionKey + "/collections");
+        req.url = url;
+        resp = client.request(req);
+    }
+
+    if (resp.statusCode != 200) {
+        brls::Logger::error("Failed to fetch collections: {}", resp.statusCode);
+        return false;
+    }
+
+    collections.clear();
+
+    // Parse collections from JSON - look for Metadata entries
+    size_t pos = 0;
+    while ((pos = resp.body.find("\"ratingKey\"", pos)) != std::string::npos) {
+        size_t objStart = resp.body.rfind('{', pos);
+        if (objStart == std::string::npos) {
+            pos++;
+            continue;
+        }
+
+        int braceCount = 1;
+        size_t objEnd = objStart + 1;
+        while (braceCount > 0 && objEnd < resp.body.length()) {
+            if (resp.body[objEnd] == '{') braceCount++;
+            else if (resp.body[objEnd] == '}') braceCount--;
+            objEnd++;
+        }
+
+        std::string obj = resp.body.substr(objStart, objEnd - objStart);
+
+        MediaItem item;
+        item.ratingKey = extractJsonValue(obj, "ratingKey");
+        item.key = extractJsonValue(obj, "key");
+        item.title = extractJsonValue(obj, "title");
+        item.summary = extractJsonValue(obj, "summary");
+        item.thumb = extractJsonValue(obj, "thumb");
+        item.art = extractJsonValue(obj, "art");
+        item.type = "collection";
+        item.subtype = extractJsonValue(obj, "subtype");
+        item.mediaType = MediaType::UNKNOWN;  // Collections are containers
+        item.leafCount = extractJsonInt(obj, "childCount");
+        if (item.leafCount == 0) {
+            item.leafCount = extractJsonInt(obj, "ratingCount");
+        }
+
+        if (!item.ratingKey.empty() && !item.title.empty()) {
+            collections.push_back(item);
+        }
+
+        pos = objEnd;
+    }
+
+    brls::Logger::info("Found {} collections for section {}", collections.size(), sectionKey);
+    return true;
+}
+
+bool PlexClient::fetchPlaylists(std::vector<MediaItem>& playlists) {
+    brls::Logger::debug("Fetching playlists");
+
+    HttpClient client;
+    std::string url = buildApiUrl("/playlists");
+
+    HttpRequest req;
+    req.url = url;
+    req.method = "GET";
+    req.headers["Accept"] = "application/json";
+    HttpResponse resp = client.request(req);
+
+    if (resp.statusCode != 200) {
+        brls::Logger::error("Failed to fetch playlists: {}", resp.statusCode);
+        return false;
+    }
+
+    playlists.clear();
+
+    // Parse playlists from JSON
+    size_t pos = 0;
+    while ((pos = resp.body.find("\"ratingKey\"", pos)) != std::string::npos) {
+        size_t objStart = resp.body.rfind('{', pos);
+        if (objStart == std::string::npos) {
+            pos++;
+            continue;
+        }
+
+        int braceCount = 1;
+        size_t objEnd = objStart + 1;
+        while (braceCount > 0 && objEnd < resp.body.length()) {
+            if (resp.body[objEnd] == '{') braceCount++;
+            else if (resp.body[objEnd] == '}') braceCount--;
+            objEnd++;
+        }
+
+        std::string obj = resp.body.substr(objStart, objEnd - objStart);
+
+        MediaItem item;
+        item.ratingKey = extractJsonValue(obj, "ratingKey");
+        item.key = extractJsonValue(obj, "key");
+        item.title = extractJsonValue(obj, "title");
+        item.summary = extractJsonValue(obj, "summary");
+        item.thumb = extractJsonValue(obj, "composite");  // Playlists use composite image
+        if (item.thumb.empty()) {
+            item.thumb = extractJsonValue(obj, "thumb");
+        }
+        item.type = extractJsonValue(obj, "playlistType");  // video, audio, photo
+        item.mediaType = MediaType::UNKNOWN;
+        item.leafCount = extractJsonInt(obj, "leafCount");
+        item.duration = extractJsonInt(obj, "duration");
+
+        if (!item.ratingKey.empty() && !item.title.empty()) {
+            playlists.push_back(item);
+        }
+
+        pos = objEnd;
+    }
+
+    brls::Logger::info("Found {} playlists", playlists.size());
+    return true;
+}
+
+bool PlexClient::fetchGenres(const std::string& sectionKey, std::vector<std::string>& genres) {
+    brls::Logger::debug("Fetching genres for section: {}", sectionKey);
+
+    HttpClient client;
+    // Plex API: /library/sections/{key}/genre returns list of genres
+    std::string url = buildApiUrl("/library/sections/" + sectionKey + "/genre");
+
+    HttpRequest req;
+    req.url = url;
+    req.method = "GET";
+    req.headers["Accept"] = "application/json";
+    HttpResponse resp = client.request(req);
+
+    if (resp.statusCode != 200) {
+        brls::Logger::error("Failed to fetch genres: {}", resp.statusCode);
+        return false;
+    }
+
+    genres.clear();
+
+    // Parse genres - look for "title" fields in Directory entries
+    size_t pos = 0;
+    while ((pos = resp.body.find("\"title\"", pos)) != std::string::npos) {
+        std::string title = extractJsonValue(resp.body.substr(pos > 20 ? pos - 20 : 0, 300), "title");
+        if (!title.empty() && title != "genre" && title.find("MediaContainer") == std::string::npos) {
+            // Avoid duplicates
+            bool found = false;
+            for (const auto& g : genres) {
+                if (g == title) { found = true; break; }
+            }
+            if (!found) {
+                genres.push_back(title);
+            }
+        }
+        pos++;
+    }
+
+    brls::Logger::info("Found {} genres for section {}", genres.size(), sectionKey);
+    return true;
+}
+
+bool PlexClient::fetchFilterValues(const std::string& sectionKey,
+                                   const std::string& field,
+                                   std::vector<GenreItem>& values) {
+    brls::Logger::debug("Fetching filter '{}' values for section: {}", field, sectionKey);
+
+    HttpClient client;
+    // Plex exposes each filter's choices at /library/sections/{key}/{field}
+    // (genre, year, decade, contentRating, resolution, studio, country, …),
+    // each a Directory with a title and a key. The key is what feeds the
+    // matching ?{field}={key} query when filtering /all.
+    std::string url = buildApiUrl("/library/sections/" + sectionKey + "/" + field);
+
+    HttpRequest req;
+    req.url = url;
+    req.method = "GET";
+    req.headers["Accept"] = "application/json";
+    HttpResponse resp = client.request(req);
+
+    if (resp.statusCode != 200) {
+        brls::Logger::error("Failed to fetch filter '{}' values: {}", field, resp.statusCode);
+        return false;
+    }
+
+    values.clear();
+
+    // Parse Directory entries with "title", "key", and "fastKey"
+    size_t pos = 0;
+    while ((pos = resp.body.find("\"key\"", pos)) != std::string::npos) {
+        // Go back to find start of this object
+        size_t objStart = resp.body.rfind('{', pos);
+        if (objStart == std::string::npos) {
+            pos++;
+            continue;
+        }
+
+        // Find end of object
+        int braceCount = 1;
+        size_t objEnd = objStart + 1;
+        while (braceCount > 0 && objEnd < resp.body.length()) {
+            if (resp.body[objEnd] == '{') braceCount++;
+            else if (resp.body[objEnd] == '}') braceCount--;
+            objEnd++;
+        }
+
+        std::string obj = resp.body.substr(objStart, objEnd - objStart);
+
+        GenreItem item;
+        item.title = extractJsonValue(obj, "title");
+        item.key = extractJsonValue(obj, "key");
+        item.fastKey = extractJsonValue(obj, "fastKey");
+
+        // Skip container/meta entries (the wrapper's title is the field name)
+        if (!item.title.empty() && !item.key.empty() &&
+            item.title != field && item.title.find("MediaContainer") == std::string::npos) {
+            // Avoid duplicates
+            bool found = false;
+            for (const auto& g : values) {
+                if (g.title == item.title) { found = true; break; }
+            }
+            if (!found) {
+                values.push_back(item);
+            }
+        }
+
+        pos = objEnd;
+    }
+
+    brls::Logger::info("Found {} '{}' filter values for section {}", values.size(), field, sectionKey);
+    return true;
+}
+
+bool PlexClient::fetchGenreItems(const std::string& sectionKey, std::vector<GenreItem>& genres) {
+    return fetchFilterValues(sectionKey, "genre", genres);
+}
+
+bool PlexClient::fetchByGenre(const std::string& sectionKey, const std::string& genre, std::vector<MediaItem>& items, int metadataType) {
+    brls::Logger::debug("Fetching items by genre: {} in section {} type={}", genre, sectionKey, metadataType);
+
+    HttpClient client;
+    // Plex API: /library/sections/{key}/all?genre={genreId}&type={metadataType}
+    std::string url = buildApiUrl("/library/sections/" + sectionKey + "/all?genre=" + HttpClient::urlEncode(genre));
+    if (metadataType > 0) {
+        url += "&type=" + std::to_string(metadataType);
+    }
+
+    HttpRequest req;
+    req.url = url;
+    req.method = "GET";
+    req.headers["Accept"] = "application/json";
+    HttpResponse resp = client.request(req);
+
+    if (resp.statusCode != 200) {
+        brls::Logger::error("Failed to fetch by genre: {}", resp.statusCode);
+        return false;
+    }
+
+    items.clear();
+
+    // Parse items - same as fetchLibraryContent
+    size_t pos = 0;
+    while ((pos = resp.body.find("\"ratingKey\"", pos)) != std::string::npos) {
+        size_t objStart = resp.body.rfind('{', pos);
+        if (objStart == std::string::npos) {
+            pos++;
+            continue;
+        }
+
+        int braceCount = 1;
+        size_t objEnd = objStart + 1;
+        while (braceCount > 0 && objEnd < resp.body.length()) {
+            if (resp.body[objEnd] == '{') braceCount++;
+            else if (resp.body[objEnd] == '}') braceCount--;
+            objEnd++;
+        }
+
+        std::string obj = resp.body.substr(objStart, objEnd - objStart);
+
+        MediaItem item;
+        item.ratingKey = extractJsonValue(obj, "ratingKey");
+        item.key = extractJsonValue(obj, "key");
+        item.title = extractJsonValue(obj, "title");
+        item.summary = extractJsonValue(obj, "summary");
+        item.thumb = extractJsonValue(obj, "thumb");
+        item.art = extractJsonValue(obj, "art");
+        item.type = extractJsonValue(obj, "type");
+        item.mediaType = parseMediaType(item.type);
+        item.year = extractJsonInt(obj, "year");
+        item.duration = extractJsonInt(obj, "duration");
+        item.rating = extractJsonFloat(obj, "rating");
+        item.userRating = extractJsonFloat(obj, "userRating");
+        item.audienceRating = extractJsonFloat(obj, "audienceRating");
+
+        if (!item.ratingKey.empty() && !item.title.empty()) {
+            items.push_back(item);
+        }
+
+        pos = objEnd;
+    }
+
+    brls::Logger::info("Found {} items for genre '{}' in section {}", items.size(), genre, sectionKey);
+    return true;
+}
+
+bool PlexClient::fetchByGenreKey(const std::string& sectionKey, const std::string& genreKey, std::vector<MediaItem>& items, int metadataType) {
+    brls::Logger::debug("Fetching items by genre key: {} in section {} type={}", genreKey, sectionKey, metadataType);
+
+    HttpClient client;
+    // Plex API: Use the fastKey or construct filter with genre key/ID
+    // The genreKey is typically the numeric ID from the genre list
+    std::string url = buildApiUrl("/library/sections/" + sectionKey + "/all?genre=" + genreKey);
+    if (metadataType > 0) {
+        url += "&type=" + std::to_string(metadataType);
+    }
+
+    HttpRequest req;
+    req.url = url;
+    req.method = "GET";
+    req.headers["Accept"] = "application/json";
+    HttpResponse resp = client.request(req);
+
+    if (resp.statusCode != 200) {
+        brls::Logger::error("Failed to fetch by genre key: {}", resp.statusCode);
+        return false;
+    }
+
+    items.clear();
+
+    // Parse items
+    size_t pos = 0;
+    while ((pos = resp.body.find("\"ratingKey\"", pos)) != std::string::npos) {
+        size_t objStart = resp.body.rfind('{', pos);
+        if (objStart == std::string::npos) {
+            pos++;
+            continue;
+        }
+
+        int braceCount = 1;
+        size_t objEnd = objStart + 1;
+        while (braceCount > 0 && objEnd < resp.body.length()) {
+            if (resp.body[objEnd] == '{') braceCount++;
+            else if (resp.body[objEnd] == '}') braceCount--;
+            objEnd++;
+        }
+
+        std::string obj = resp.body.substr(objStart, objEnd - objStart);
+
+        MediaItem item;
+        item.ratingKey = extractJsonValue(obj, "ratingKey");
+        item.key = extractJsonValue(obj, "key");
+        item.title = extractJsonValue(obj, "title");
+        item.summary = extractJsonValue(obj, "summary");
+        item.thumb = extractJsonValue(obj, "thumb");
+        item.art = extractJsonValue(obj, "art");
+        item.type = extractJsonValue(obj, "type");
+        item.mediaType = parseMediaType(item.type);
+        item.year = extractJsonInt(obj, "year");
+        item.duration = extractJsonInt(obj, "duration");
+        item.rating = extractJsonFloat(obj, "rating");
+        item.userRating = extractJsonFloat(obj, "userRating");
+        item.audienceRating = extractJsonFloat(obj, "audienceRating");
+
+        if (!item.ratingKey.empty() && !item.title.empty()) {
+            items.push_back(item);
+        }
+
+        pos = objEnd;
+    }
+
+    brls::Logger::info("Found {} items for genre key '{}' in section {}", items.size(), genreKey, sectionKey);
+    return true;
+}
+
+bool PlexClient::getPlaybackUrl(const std::string& ratingKey, std::string& url) {
+    brls::Logger::debug("getPlaybackUrl: ratingKey={}", ratingKey);
+
+    // Fetch media details to get the Part key for streaming
+    HttpClient client;
+    std::string apiUrl = buildApiUrl("/library/metadata/" + ratingKey);
+
+    HttpRequest req;
+    req.url = apiUrl;
+    req.method = "GET";
+    req.headers["Accept"] = "application/json";
+    HttpResponse resp = client.request(req);
+
+    if (resp.statusCode != 200) {
+        brls::Logger::error("getPlaybackUrl: Failed to fetch metadata: {}", resp.statusCode);
+        if (isAuthError(resp.statusCode)) handleUnauthorized();
+        return false;
+    }
+
+    // Find the Part key in the response Look for "Part":[{"key":"/library/parts/..."
+    size_t partPos = resp.body.find("\"Part\"");
+    if (partPos == std::string::npos) {
+        brls::Logger::error("getPlaybackUrl: No Part found in metadata");
+        return false;
+    }
+
+    // Find the key within Part
+    size_t keyPos = resp.body.find("\"key\"", partPos);
+    if (keyPos == std::string::npos || keyPos > partPos + 500) {
+        brls::Logger::error("getPlaybackUrl: No key found in Part");
+        return false;
+    }
+
+    std::string partKey = extractJsonValue(resp.body.substr(keyPos, 200), "key");
+    if (partKey.empty()) {
+        brls::Logger::error("getPlaybackUrl: Part key is empty");
+        return false;
+    }
+
+    // Build stream URL from Part key The Part key is something like /library/parts/12345/1234567890/file.mkv
+    url = m_serverUrl + partKey + "?X-Plex-Token=" + m_authToken;
+
+    brls::Logger::info("getPlaybackUrl: Stream URL = {}", redactTokensInUrl(url));
+    return true;
+}
+
+bool PlexClient::fetchStreams(const std::string& ratingKey, std::vector<PlexStream>& streams, int& partId) {
+    HttpClient client;
+    std::string url = buildApiUrl("/library/metadata/" + ratingKey);
+
+    HttpRequest req;
+    req.url = url;
+    req.method = "GET";
+    req.headers["Accept"] = "application/json";
+    HttpResponse resp = client.request(req);
+
+    if (resp.statusCode != 200) {
+        brls::Logger::error("fetchStreams: Failed to fetch metadata: {}", resp.statusCode);
+        return false;
+    }
+
+    streams.clear();
+    partId = 0;
+
+    // Find Part section and extract part ID
+    size_t partPos = resp.body.find("\"Part\"");
+    if (partPos == std::string::npos) {
+        brls::Logger::error("fetchStreams: No Part found");
+        return false;
+    }
+
+    // Extract part id
+    partId = extractJsonInt(resp.body.substr(partPos, 500), "id");
+    brls::Logger::debug("fetchStreams: partId={}", partId);
+
+    // Find Stream array within Part
+    size_t streamPos = resp.body.find("\"Stream\"", partPos);
+    if (streamPos == std::string::npos) {
+        brls::Logger::info("fetchStreams: No streams found in Part");
+        return true;  // Valid - just no streams
+    }
+
+    // Find the stream array opening bracket
+    size_t arrayStart = resp.body.find('[', streamPos);
+    if (arrayStart == std::string::npos) return true;
+
+    // Find the matching closing bracket
+    int bracketCount = 1;
+    size_t arrayEnd = arrayStart + 1;
+    while (bracketCount > 0 && arrayEnd < resp.body.length()) {
+        if (resp.body[arrayEnd] == '[') bracketCount++;
+        else if (resp.body[arrayEnd] == ']') bracketCount--;
+        arrayEnd++;
+    }
+
+    std::string streamArray = resp.body.substr(arrayStart, arrayEnd - arrayStart);
+
+    // Parse individual stream objects
+    size_t objPos = 0;
+    while ((objPos = streamArray.find('{', objPos)) != std::string::npos) {
+        // Find end of this object
+        int braceCount = 1;
+        size_t objEnd = objPos + 1;
+        while (braceCount > 0 && objEnd < streamArray.length()) {
+            if (streamArray[objEnd] == '{') braceCount++;
+            else if (streamArray[objEnd] == '}') braceCount--;
+            objEnd++;
+        }
+
+        std::string obj = streamArray.substr(objPos, objEnd - objPos);
+
+        PlexStream stream;
+        stream.id = extractJsonInt(obj, "id");
+        stream.streamType = extractJsonInt(obj, "streamType");
+        stream.codec = extractJsonValue(obj, "codec");
+        stream.displayTitle = extractJsonValue(obj, "displayTitle");
+        stream.language = extractJsonValue(obj, "language");
+        stream.languageCode = extractJsonValue(obj, "languageCode");
+        stream.selected = extractJsonBool(obj, "selected");
+        stream.channels = extractJsonInt(obj, "channels");
+        stream.title = extractJsonValue(obj, "title");
+        stream.forced = extractJsonBool(obj, "forced");
+        stream.hearingImpaired = extractJsonBool(obj, "hearingImpaired");
+        // External (sidecar) subtitles carry a stream key; embedded don't. Track
+        // lyrics (streamType 4) always do — they are a separate file on the
+        // server, which is how they get loaded rather than transcoded in.
+        stream.key = extractJsonValue(obj, "key");
+        stream.external = !stream.key.empty();
+        // Only for lyrics: the field that actually addresses the file is not
+        // one the parser keeps, and this is what makes it visible.
+        if (stream.streamType == 4) stream.rawJson = obj;
+
+        // Lyrics streams are the one kind we cannot yet fetch: the documented
+        // /library/streams/{id}.{ext} answers 200 with an empty body for them,
+        // and the server advertises transcoderLyrics separately from
+        // transcoderSubtitles. Dump the whole object so the field that actually
+        // addresses the file is visible rather than guessed at.
+        if (stream.streamType == 4) {
+            brls::Logger::info("fetchStreams: lyrics stream object = {}", obj);
+        }
+
+        if (stream.id > 0 && stream.streamType > 0) {
+            streams.push_back(stream);
+            brls::Logger::debug("fetchStreams: type={} id={} codec={} title={}",
+                               stream.streamType, stream.id, stream.codec, stream.displayTitle);
+        }
+
+        objPos = objEnd;
+    }
+
+    brls::Logger::info("fetchStreams: Found {} streams for ratingKey {}", streams.size(), ratingKey);
+    return true;
+}
+
+namespace {
+
+// Parse a lyrics body. Three shapes reach us: LRC from a sidecar, SRT from the
+// transcoder (its documented response example is text/srt), and plain text.
+// Detected from the content rather than the extension, because the transcoder
+// converts and the extension no longer describes what came back.
+//
+// Every shape goes out through the same two steps — unescape, then flatten
+// whitespace — so a line that reaches a label has been through them once and
+// exactly once, whichever route it took. Escaped text in a transcoded SRT is
+// the transcoder's business, but it costs nothing to handle and a raw "&#34;"
+// on screen looks like a bug either way.
+std::vector<LyricLine> parseLyricsBody(const std::string& body) {
+    std::vector<LyricLine> out;
+
+    // Attribute values arrive escaped, and a lyric with an apostrophe or a
+    // quoted line in it is not rare.
+    //
+    // One left-to-right pass rather than a table swept repeatedly: a table can
+    // only hold the references someone thought of, and Plex's lyricfind
+    // documents write a double quote as "&#34;", which is not a name at all.
+    // Decoding "&#N;" and "&#xN;" by value covers every numeric form instead of
+    // the two that were guessed. A single pass is also what makes "&amp;#34;"
+    // come out as the literal "&#34;" rather than a quote — the "&" it produces
+    // is never looked at again.
+    auto xmlUnescape = [](const std::string& in) {
+        static const std::pair<const char*, const char*> kEnts[] = {
+            {"lt", "<"}, {"gt", ">"}, {"quot", "\""},
+            {"apos", "'"}, {"nbsp", " "}, {"amp", "&"},
+        };
+        std::string out;
+        out.reserve(in.size());
+        for (size_t i = 0; i < in.size(); i++) {
+            if (in[i] != '&') { out += in[i]; continue; }
+            const size_t semi = in.find(';', i + 1);
+            // A bare "&" is ordinary in a lyric, so a reference that does not
+            // close within a plausible span is text, not a broken entity.
+            if (semi == std::string::npos || semi - i > 10) { out += in[i]; continue; }
+            const std::string ent = in.substr(i + 1, semi - i - 1);
+
+            bool decoded = false;
+            if (ent.size() > 1 && ent[0] == '#') {
+                const bool hex = ent[1] == 'x' || ent[1] == 'X';
+                const char* digits = ent.c_str() + (hex ? 2 : 1);
+                char* end = nullptr;
+                const long cp = std::strtol(digits, &end, hex ? 16 : 10);
+                if (end && *end == '\0' && end != digits && cp > 0 && cp <= 0x10FFFF) {
+                    appendUtf8(out, (uint32_t)cp);
+                    decoded = true;
+                }
+            } else {
+                for (const auto& e : kEnts)
+                    if (ent == e.first) { out += e.second; decoded = true; break; }
+            }
+
+            // Anything unrecognised stays as written. "&notreal;" is more
+            // useful on screen than the nothing that swallowing it would leave.
+            if (!decoded) { out += in[i]; continue; }
+            i = semi;
+        }
+        return out;
+    };
+
+    // Trims, and flattens every run of whitespace to one space.
+    //
+    // The flattening is not cosmetic. A pretty-printed lyrics document puts a
+    // newline and an indent between <Line> and its <Span>, and that whitespace
+    // is character data like any other — it was reaching the label as a leading
+    // blank, and a line split across several spans came out stacked rather than
+    // joined.
+    auto squash = [](const std::string& t) {
+        std::string out;
+        out.reserve(t.size());
+        bool pendingSpace = false;
+        for (const char c : t) {
+            if (c == ' ' || c == '\t' || c == '\r' || c == '\n' || c == '\f' || c == '\v') {
+                pendingSpace = !out.empty();
+                continue;
+            }
+            if (pendingSpace) { out += ' '; pendingSpace = false; }
+            out += c;
+        }
+        return out;
+    };
+
+    // "mm:ss.xx" — the inside of a stamp, without its brackets. Same text
+    // whether it arrived in [] as a line stamp or in <> as a word stamp, so
+    // both readers below decide "is this a time?" the same way and neither
+    // mistakes "[ar: artist]" or an "<i>" for one.
+    auto parseTimeTag = [](const std::string& inside, int& outMs) -> bool {
+        const size_t colon = inside.find(':');
+        if (colon == std::string::npos || colon == 0) return false;
+        if (inside.find_first_not_of("0123456789") != colon) return false;
+        const std::string secs = inside.substr(colon + 1);
+        if (secs.empty() || secs.find_first_not_of("0123456789.,") != std::string::npos)
+            return false;
+        // atof wants a point; some writers use a comma for the fraction.
+        std::string dotted = secs;
+        for (char& c : dotted) if (c == ',') c = '.';
+        outMs = std::atoi(inside.substr(0, colon).c_str()) * 60000
+              + (int)(std::atof(dotted.c_str()) * 1000.0);
+        return true;
+    };
+
+    // "[mm:ss.xx]" leading stamps. Returns where the text begins.
+    auto lrcStamps = [&parseTimeTag](const std::string& line, std::vector<int>& outMs) -> size_t {
+        size_t pos = 0;
+        while (pos < line.size() && line[pos] == '[') {
+            const size_t close = line.find(']', pos);
+            if (close == std::string::npos) break;
+            int ms = 0;
+            if (!parseTimeTag(line.substr(pos + 1, close - pos - 1), ms)) break;
+            outMs.push_back(ms);
+            pos = close + 1;
+        }
+        return pos;
+    };
+
+    // Enhanced LRC ("A2") word stamps: the rest of the line reads
+    //
+    //     <00:12.34>I <00:12.61>would <00:12.90>never <00:13.40>
+    //
+    // — a stamp before each word, and often one more at the end marking where
+    // the last word stops. Returns the line with the stamps taken out, and
+    // fills outWords when it found any.
+    //
+    // The strip is not optional. A file like this already displayed its
+    // timestamps as part of the lyric, because nothing here knew what the
+    // angle brackets were.
+    auto lrcWordStamps = [&parseTimeTag, &squash, &xmlUnescape](
+                             const std::string& rest, std::vector<LyricWord>& outWords) {
+        std::string plain;
+        int pendingMs = -1;
+        size_t pos = 0;      // start of the text not yet taken
+        size_t search = 0;   // where to look for the next '<'
+        auto flush = [&](const std::string& raw) {
+            plain += raw;
+            // Whether a space actually separated this piece from the next. A
+            // file that stamps inside a word writes "Tum" then "ble ", and
+            // rendering those with a gap between them spells "Tum ble".
+            const bool spaceAfter = !raw.empty() &&
+                (raw.back() == ' '  || raw.back() == '\t' ||
+                 raw.back() == '\r' || raw.back() == '\n');
+            if (pendingMs < 0) {
+                // Whitespace outside any stamp still separates what surrounds
+                // it, so it belongs to the piece before.
+                if (spaceAfter && !outWords.empty()) outWords.back().spaceAfter = true;
+                return;
+            }
+            const std::string word = squash(xmlUnescape(raw));
+            if (!word.empty()) {
+                outWords.push_back(LyricWord{pendingMs, word, spaceAfter});
+            } else if (spaceAfter && !outWords.empty()) {
+                // A stamp with only whitespace after it: the trailing stamp
+                // that ends the last word rather than starting another.
+                outWords.back().spaceAfter = true;
+            }
+            pendingMs = -1;
+        };
+        while (search < rest.size()) {
+            const size_t lt = rest.find('<', search);
+            if (lt == std::string::npos) break;
+            const size_t gt = rest.find('>', lt);
+            if (gt == std::string::npos) break;
+            int ms = 0;
+            if (!parseTimeTag(rest.substr(lt + 1, gt - lt - 1), ms)) {
+                // Not a stamp — "<3" and the like stay in the lyric, so the
+                // search moves on but the text is left for the next flush.
+                search = lt + 1;
+                continue;
+            }
+            flush(rest.substr(pos, lt - pos));
+            pendingMs = ms;
+            pos = search = gt + 1;
+        }
+        flush(rest.substr(pos));
+        // One stamped word is just the line stamp again, and buys nothing but
+        // a pile of extra views.
+        if (outWords.size() < 2) outWords.clear();
+        return plain;
+    };
+
+    // "00:00:02,499 --> 00:00:06,416". Only the start time matters here: the
+    // list is a running transcript, not a timed overlay with an end.
+    auto srtStart = [](const std::string& line, int& outMs) -> bool {
+        const size_t arrow = line.find("-->");
+        if (arrow == std::string::npos) return false;
+        int h = 0, m = 0, sec = 0, ms = 0;
+        if (std::sscanf(line.c_str(), "%d:%d:%d,%d", &h, &m, &sec, &ms) != 4 &&
+            std::sscanf(line.c_str(), "%d:%d:%d.%d", &h, &m, &sec, &ms) != 4) return false;
+        outMs = ((h * 60 + m) * 60 + sec) * 1000 + ms;
+        return true;
+    };
+
+    // format=xml returns Plex's own lyrics document rather than the LRC the
+    // stream advertises, so this is tried first. Parsed by scanning for <Line>
+    // elements rather than with a real XML parser: the only two things needed
+    // are the start offset and the text, and the surrounding document shape is
+    // not something to depend on.
+    if (body.find("<Line") != std::string::npos) {
+        size_t pos = 0;
+        while ((pos = body.find("<Line", pos)) != std::string::npos) {
+            const size_t tagEnd = body.find('>', pos);
+            if (tagEnd == std::string::npos) break;
+            const std::string tag = body.substr(pos, tagEnd - pos);
+
+            int ms = -1;
+            for (const char* attr : {"startOffset=\"", "startTimeOffset=\""}) {
+                const size_t at = tag.find(attr);
+                if (at == std::string::npos) continue;
+                ms = std::atoi(tag.c_str() + at + strlen(attr));
+                break;
+            }
+
+            // The words, which live in one of two places depending on who wrote
+            // the document:
+            //
+            //   <Line startOffset="1000"><Span text="the words"/></Line>
+            //   <Line startOffset="1000"><Span>the words</Span></Line>
+            //
+            // Plex's lyricfind documents use the first — the text is an
+            // attribute and there is no character data at all. Reading only
+            // between the tags produced a line with a correct timestamp and no
+            // words, which rendered as an invisible row that still seeked when
+            // tapped. Both shapes are collected; a document that somehow used
+            // both would simply get both, in order.
+            // Each Span is collected with whatever offset it carries, so a
+            // document that stamps its Spans gives word-level timing for free.
+            // Whether Plex's lyricfind documents actually do could not be
+            // confirmed from anything published, so this reads the same two
+            // attribute names the Line above uses and does nothing at all when
+            // they are absent — the line still renders exactly as before.
+            const size_t close = body.find("</Line>", tagEnd);
+            std::vector<LyricWord> spans;
+            std::string text;
+            auto addSpan = [&](int spanMs, const std::string& raw) {
+                const std::string t = squash(xmlUnescape(raw));
+                if (t.empty()) return;                    // indentation between tags
+                if (!text.empty() && text.back() != ' ') text += ' ';
+                text += raw;
+                spans.push_back(LyricWord{spanMs, t});
+            };
+            if (close != std::string::npos) {
+                int pendingMs = -1;   // an opening tag's offset, for <Span>text</Span>
+                size_t i = tagEnd + 1;
+                while (i < close) {
+                    if (body[i] != '<') {
+                        const size_t nextTag = std::min(body.find('<', i), close);
+                        addSpan(pendingMs, body.substr(i, nextTag - i));
+                        pendingMs = -1;
+                        i = nextTag;
+                        continue;
+                    }
+                    const size_t tagStop = body.find('>', i);
+                    if (tagStop == std::string::npos || tagStop >= close) break;
+                    const std::string inner = body.substr(i, tagStop - i);
+
+                    int spanMs = -1;
+                    for (const char* attr : {"startOffset=\"", "startTimeOffset=\""}) {
+                        const size_t at = inner.find(attr);
+                        if (at == std::string::npos) continue;
+                        spanMs = std::atoi(inner.c_str() + at + strlen(attr));
+                        break;
+                    }
+
+                    // The words live in one of two places depending on who
+                    // wrote the document:
+                    //
+                    //   <Line startOffset="1000"><Span text="the words"/></Line>
+                    //   <Line startOffset="1000"><Span>the words</Span></Line>
+                    //
+                    // Plex's lyricfind documents use the first — the text is an
+                    // attribute and there is no character data at all. Reading
+                    // only between the tags produced a line with a correct
+                    // timestamp and no words, which rendered as an invisible row
+                    // that still seeked when tapped.
+                    const size_t at = inner.find("text=\"");
+                    if (at != std::string::npos) {
+                        const size_t valStart = at + 6;
+                        const size_t valEnd = inner.find('"', valStart);
+                        if (valEnd != std::string::npos)
+                            addSpan(spanMs, inner.substr(valStart, valEnd - valStart));
+                    } else {
+                        pendingMs = spanMs;   // text follows this tag
+                    }
+                    i = tagStop + 1;
+                }
+            }
+            text = squash(xmlUnescape(text));
+
+            LyricLine l;
+            l.timeMs = ms;
+            l.text = text;
+            // Only when every span is stamped: a run where some are not would
+            // stall the highlight partway through the line, which reads as a
+            // bug rather than as a line without word timing.
+            bool allStamped = spans.size() >= 2;
+            for (const auto& s : spans) if (s.timeMs < 0) allStamped = false;
+            if (allStamped) l.words = std::move(spans);
+            out.push_back(std::move(l));
+
+            pos = (close == std::string::npos) ? tagEnd : close + 7;
+        }
+        while (!out.empty() && out.back().text.empty()) out.pop_back();
+        return out;
+    }
+
+    const bool looksSrt = body.find("-->") != std::string::npos;
+
+    std::istringstream stream(body);
+    std::string raw;
+
+    if (looksSrt) {
+        int pending = -1;
+        std::string text;
+        auto flush = [&]() {
+            if (pending < 0) return;
+            LyricLine l;
+            l.timeMs = pending;
+            l.text = squash(xmlUnescape(text));
+            out.push_back(l);
+            pending = -1;
+            text.clear();
+        };
+        while (std::getline(stream, raw)) {
+            const std::string line = squash(raw);
+            int ms = 0;
+            if (srtStart(line, ms)) { flush(); pending = ms; continue; }
+            if (line.empty()) { flush(); continue; }
+            // A bare number on its own is the cue index, not a lyric.
+            if (pending < 0 && line.find_first_not_of("0123456789") == std::string::npos) continue;
+            if (pending >= 0) text += (text.empty() ? "" : " ") + line;
+        }
+        flush();
+        return out;
+    }
+
+    while (std::getline(stream, raw)) {
+        if (!raw.empty() && raw.back() == '\r') raw.pop_back();
+        std::vector<int> stamps;
+        const size_t textStart = lrcStamps(raw, stamps);
+        std::vector<LyricWord> words;
+        const std::string text =
+            squash(xmlUnescape(lrcWordStamps(raw.substr(textStart), words)));
+
+        if (stamps.empty()) {
+            if (!raw.empty() && raw[0] == '[') continue;   // an LRC metadata tag
+            if (text.empty() && out.empty()) continue;     // leading blank lines
+            LyricLine l;
+            l.timeMs = -1;
+            l.text = text;
+            // Word stamps without a line stamp are half a format; the line has
+            // nowhere to be placed, so its words have nothing to run against.
+            out.push_back(std::move(l));
+        } else {
+            // One source line can carry several stamps for a repeated phrase.
+            // The words belong to the first: they are absolute times, so
+            // replaying them against a later stamp would run the highlight
+            // backwards.
+            bool first = true;
+            for (int ms : stamps) {
+                LyricLine l;
+                l.timeMs = ms;
+                l.text = text;
+                if (first) { l.words = words; first = false; }
+                out.push_back(std::move(l));
+            }
+        }
+    }
+
+    std::stable_sort(out.begin(), out.end(),
+                     [](const LyricLine& a, const LyricLine& b) { return a.timeMs < b.timeMs; });
+    while (!out.empty() && out.back().text.empty() && out.back().timeMs < 0) out.pop_back();
+    return out;
+}
+
+}  // namespace
+
+bool PlexClient::fetchLyrics(const std::string& ratingKey, const PlexStream& stream, int partId,
+                             std::vector<LyricLine>& lines, std::string& status) {
+    (void)ratingKey; (void)partId;
+    lines.clear();
+    status.clear();
+    if (stream.id <= 0 || stream.key.empty()) {
+        status = "This track has no lyrics stream.";
+        return false;
+    }
+
+    // Where the lyrics live depends on where they came from, which the stream's
+    // own `provider` field says:
+    //
+    //  - com.plexapp.agents.localmedia — a file sitting next to the track.
+    //    /library/streams/{id}.{ext} serves it, and this is the route that
+    //    works today (3952 bytes, 101 lines, for an .lrc beside the file).
+    //  - com.plexapp.agents.lyricfind — fetched from Plex's licensed provider,
+    //    with nothing on disk. The extension route answers 200 with an empty
+    //    body for these; ?format=xml is what Plex Web itself asks for, caught
+    //    in the server log as
+    //      GET /library/streams/50400?format=xml -> 404
+    //
+    // Both are tried rather than branching on the provider string, since a
+    // server may hold either kind and the cost of a miss is one request.
+    //
+    // Ruled out, and deliberately not retried: the universal transcoder. It
+    // delivers "the selected subtitle", and PUT /library/parts/{id} accepts
+    // only audioStreamID and subtitleStreamID — a streamType 4 can never be
+    // selected, so it transcodes nothing and returns an empty 200.
+    std::vector<std::string> routes;
+    if (!stream.codec.empty()) routes.push_back(stream.key + "." + stream.codec);
+    routes.push_back(stream.key + "?format=xml");
+
+    HttpClient client;
+    std::string tried;
+
+    for (const std::string& path : routes) {
+        brls::Logger::debug("fetchLyrics: GET {}", path);
+        HttpResponse r = client.get(buildApiUrl(path));
+        tried += "\n  " + path + " -> " + std::to_string(r.statusCode)
+               + " (" + std::to_string(r.body.size()) + "B)";
+
+        if (r.statusCode != 200 || r.body.empty()) continue;
+
+        lines = parseLyricsBody(r.body);
+        if (!lines.empty()) {
+            brls::Logger::info("fetchLyrics: {} gave {} line(s), {}", path, lines.size(),
+                               lines.front().timeMs >= 0 ? "synced" : "unsynced");
+            return true;
+        }
+        brls::Logger::warning("fetchLyrics: {} body did not parse: {}",
+                              path, r.body.substr(0, 400));
+        status = "The server returned lyrics this build could not read.\n\nFirst bytes:\n"
+               + r.body.substr(0, 240);
+        return false;
+    }
+
+    status = "The server has no lyrics for this track.\n" + tried
+           + "\n\nThe provider is " + (stream.rawJson.find("lyricfind") != std::string::npos
+                                       ? "lyricfind, so the words come from Plex rather than "
+                                         "from a file — an empty answer here means the server "
+                                         "does not hold them, which is what Plex's own web "
+                                         "client also gets."
+                                       : "local, so a lyrics file should be sitting next to "
+                                         "the track. An empty answer suggests the server "
+                                         "cannot read it.");
+    brls::Logger::warning("fetchLyrics: no route returned lyrics:{}", tried);
+    return false;
+}
+
+bool PlexClient::setStreamSelection(int partId, int audioStreamID, int subtitleStreamID) {
+    // Plex API: PUT /library/parts/{partId}?audioStreamID=X&subtitleStreamID=Y
+    std::string endpoint = "/library/parts/" + std::to_string(partId) + "?allParts=1";
+
+    if (audioStreamID >= 0) {
+        endpoint += "&audioStreamID=" + std::to_string(audioStreamID);
+    }
+    if (subtitleStreamID >= 0) {
+        endpoint += "&subtitleStreamID=" + std::to_string(subtitleStreamID);
+    }
+
+    HttpClient client;
+    std::string url = buildApiUrl(endpoint);
+
+    HttpRequest req;
+    req.url = url;
+    req.method = "PUT";
+    HttpResponse resp = client.request(req);
+
+    if (resp.statusCode != 200) {
+        // The body carries the server's actual objection; a bare status code
+        // sent us looking in the wrong place more than once.
+        brls::Logger::error("setStreamSelection: Failed: {} body: {}",
+                            resp.statusCode, resp.body.substr(0, 300));
+        return false;
+    }
+
+    brls::Logger::info("setStreamSelection: partId={} audio={} sub={}", partId, audioStreamID, subtitleStreamID);
+    return true;
+}
+
+bool PlexClient::searchSubtitles(const std::string& ratingKey, const std::string& language,
+                                  std::vector<SubtitleResult>& results) {
+    HttpClient client;
+    std::string endpoint = "/library/metadata/" + ratingKey + "/subtitles?language=" + language;
+    std::string url = buildApiUrl(endpoint);
+
+    HttpRequest req;
+    req.url = url;
+    req.method = "GET";
+    req.headers["Accept"] = "application/json";
+    HttpResponse resp = client.request(req);
+
+    if (resp.statusCode != 200) {
+        // openapi.json marks GET /library/metadata/{ids}/subtitles as
+        // user_token:["admin"], so a non-owner account is expected to be
+        // refused here. Log the body — the status alone doesn't distinguish
+        // "not entitled" from "no results".
+        brls::Logger::error("searchSubtitles: Failed: HTTP {} body: {}",
+                            resp.statusCode, resp.body.substr(0, 200));
+        return false;
+    }
+
+    results.clear();
+
+    brls::Logger::debug("searchSubtitles: Response {} bytes, first 500: {}",
+                       resp.body.size(), resp.body.substr(0, 500));
+
+    // Try to find the subtitle entries array - Plex uses different keys depending on version
+    // Try "Metadata", "MediaContainer", or look for arrays with "key" fields
+    size_t arrayStart = std::string::npos;
+
+    // Try "Metadata" key first
+    size_t metaPos = resp.body.find("\"Metadata\"");
+    if (metaPos != std::string::npos) {
+        arrayStart = resp.body.find('[', metaPos);
+    }
+
+    // Try "Stream" key (some Plex versions return streams)
+    if (arrayStart == std::string::npos) {
+        size_t streamPos = resp.body.find("\"Stream\"");
+        if (streamPos != std::string::npos) {
+            arrayStart = resp.body.find('[', streamPos);
+        }
+    }
+
+    // Try to find any JSON array that contains subtitle data
+    if (arrayStart == std::string::npos) {
+        // Look for first array in the response that contains "key" fields
+        size_t searchPos = 0;
+        while (searchPos < resp.body.size()) {
+            size_t arrPos = resp.body.find('[', searchPos);
+            if (arrPos == std::string::npos) break;
+            // Check if this array contains subtitle-like objects
+            size_t keyCheck = resp.body.find("\"key\"", arrPos);
+            if (keyCheck != std::string::npos && keyCheck < arrPos + 500) {
+                arrayStart = arrPos;
+                break;
+            }
+            searchPos = arrPos + 1;
+        }
+    }
+
+    if (arrayStart == std::string::npos) {
+        brls::Logger::info("searchSubtitles: No subtitle array found in response");
+        return true;
+    }
+
+    // Find the matching closing bracket
+    int bracketCount = 1;
+    size_t arrayEnd = arrayStart + 1;
+    while (bracketCount > 0 && arrayEnd < resp.body.length()) {
+        if (resp.body[arrayEnd] == '[') bracketCount++;
+        else if (resp.body[arrayEnd] == ']') bracketCount--;
+        arrayEnd++;
+    }
+
+    std::string metaArray = resp.body.substr(arrayStart, arrayEnd - arrayStart);
+
+    size_t objPos = 0;
+    while ((objPos = metaArray.find('{', objPos)) != std::string::npos) {
+        int braceCount = 1;
+        size_t objEnd = objPos + 1;
+        while (braceCount > 0 && objEnd < metaArray.length()) {
+            if (metaArray[objEnd] == '{') braceCount++;
+            else if (metaArray[objEnd] == '}') braceCount--;
+            objEnd++;
+        }
+
+        std::string obj = metaArray.substr(objPos, objEnd - objPos);
+
+        SubtitleResult sub;
+        sub.id = extractJsonInt(obj, "id");
+        sub.key = extractJsonValue(obj, "key");
+        sub.codec = extractJsonValue(obj, "codec");
+        sub.displayTitle = extractJsonValue(obj, "displayTitle");
+        sub.language = extractJsonValue(obj, "language");
+        sub.languageCode = extractJsonValue(obj, "languageCode");
+        sub.provider = extractJsonValue(obj, "provider");
+        sub.score = extractJsonInt(obj, "score");
+        sub.hearingImpaired = extractJsonBool(obj, "hearingImpaired");
+        sub.forced = extractJsonBool(obj, "forced");
+
+        // Also try alternate field names
+        if (sub.displayTitle.empty()) {
+            sub.displayTitle = extractJsonValue(obj, "title");
+        }
+        if (sub.provider.empty()) {
+            sub.provider = extractJsonValue(obj, "providerTitle");
+        }
+
+        if (!sub.key.empty()) {
+            results.push_back(sub);
+            brls::Logger::debug("searchSubtitles: {} - {} [{}]",
+                               sub.displayTitle, sub.language, sub.provider);
+        }
+
+        objPos = objEnd;
+    }
+
+    brls::Logger::info("searchSubtitles: Found {} results for ratingKey {}", results.size(), ratingKey);
+    return true;
+}
+
+bool PlexClient::selectSearchedSubtitle(const std::string& ratingKey, int partId,
+                                         const std::string& subtitleKey) {
+    // Plex API: PUT /library/metadata/{id}/subtitles with key and partId as query parameters
+    brls::Logger::debug("selectSearchedSubtitle: ratingKey={} partId={} key={}", ratingKey, partId, subtitleKey);
+
+    HttpClient client;
+    std::string endpoint = "/library/metadata/" + ratingKey + "/subtitles"
+                          + "?key=" + HttpClient::urlEncode(subtitleKey)
+                          + "&partId=" + std::to_string(partId);
+    std::string url = buildApiUrl(endpoint);
+
+    HttpRequest req;
+    req.url = url;
+    req.method = "PUT";
+    HttpResponse resp = client.request(req);
+
+    brls::Logger::debug("selectSearchedSubtitle: response status={}", resp.statusCode);
+
+    if (resp.statusCode != 200 && resp.statusCode != 201) {
+        brls::Logger::error("selectSearchedSubtitle: Failed: {}", resp.statusCode);
+        return false;
+    }
+
+    brls::Logger::info("selectSearchedSubtitle: Selected subtitle key={}", subtitleKey);
+    return true;
+}
+
+void PlexClient::stopTranscode() {
+    if (m_lastSessionId.empty()) return;
+
+    HttpClient client;
+    std::string url = buildApiUrl("/video/:/transcode/universal/stop?session=" + m_lastSessionId);
+
+    HttpRequest req;
+    req.url = url;
+    req.method = "GET";
+    HttpResponse resp = client.request(req);
+
+    brls::Logger::debug("stopTranscode: session={} status={}", m_lastSessionId, resp.statusCode);
+    m_lastSessionId.clear();
+}
+
+bool PlexClient::getTranscodeUrl(const std::string& ratingKey, std::string& url, int offsetMs) {
+    std::string session;
+    if (!resolveTranscodeUrl(ratingKey, url, offsetMs, session)) return false;
+    m_lastSessionId = session;
+    return true;
+}
+
+bool PlexClient::getTranscodeUrlSpeculative(const std::string& ratingKey, std::string& url,
+                                            std::string& outSessionId) {
+    // Deliberately does not touch m_lastSessionId — see the header. The caller
+    // adopts the session only if it ends up playing this URL.
+    return resolveTranscodeUrl(ratingKey, url, 0, outSessionId);
+}
+
+bool PlexClient::resolveTranscodeUrl(const std::string& ratingKey, std::string& url,
+                                     int offsetMs, std::string& outSessionId) {
+    brls::Logger::debug("getTranscodeUrl: ratingKey={}, offsetMs={}", ratingKey, offsetMs);
+
+    // Fetch media details to get the Part key and determine if audio or video
+    HttpClient client;
+    std::string apiUrl = buildApiUrl("/library/metadata/" + ratingKey);
+
+    HttpRequest req;
+    req.url = apiUrl;
+    req.method = "GET";
+    req.headers["Accept"] = "application/json";
+    HttpResponse resp = client.request(req);
+
+    if (resp.statusCode != 200) {
+        brls::Logger::error("getTranscodeUrl: Failed to fetch metadata: {}", resp.statusCode);
+        return false;
+    }
+
+    // Find the Part key in the response
+    size_t partPos = resp.body.find("\"Part\"");
+    if (partPos == std::string::npos) {
+        brls::Logger::error("getTranscodeUrl: No Part found in metadata");
+        return false;
+    }
+
+    // Find the key within Part
+    size_t keyPos = resp.body.find("\"key\"", partPos);
+    if (keyPos == std::string::npos || keyPos > partPos + 500) {
+        brls::Logger::error("getTranscodeUrl: No key found in Part");
+        return false;
+    }
+
+    std::string partKey = extractJsonValue(resp.body.substr(keyPos, 200), "key");
+    if (partKey.empty()) {
+        brls::Logger::error("getTranscodeUrl: Part key is empty");
+        return false;
+    }
+
+    brls::Logger::debug("getTranscodeUrl: partKey={}", partKey);
+
+    // Detect if this is audio (track) or video
+    bool isAudio = (resp.body.find("\"type\":\"track\"") != std::string::npos);
+    brls::Logger::debug("getTranscodeUrl: isAudio={}", isAudio);
+
+    // Per official Plex API (developer.plex.tv/pms), X-Plex-* params
+    // must be sent as HTTP headers (in=header), not query params.
+    // transcodeType is a path param: "video", "music", or "audio".
+    std::string metadataPath = "/library/metadata/" + ratingKey;
+    std::string encodedPath = HttpClient::urlEncode(metadataPath);
+
+    // Generate a unique session ID. The counter matters: the next track is
+    // resolved while the current one is still playing, so the second alone is
+    // not enough to keep the two sessions apart.
+    char sessionBuf[48];
+    snprintf(sessionBuf, sizeof(sessionBuf), "%lu-%u",
+             (unsigned long)time(nullptr), ++m_sessionSeq);
+    std::string sessionId = sessionBuf;
+
+    // Build query string with query-type parameters (per official API spec)
+    AppSettings& settings = Application::getInstance().getSettings();
+
+    std::string queryParams;
+    queryParams += "path=" + encodedPath;
+    queryParams += "&mediaIndex=0&partIndex=0";
+
+    // directPlay/directStream based on settings
+    if (settings.directPlay && !settings.forceTranscode) {
+        queryParams += "&directPlay=1&directStream=1";
+    } else if (settings.forceTranscode) {
+        queryParams += "&directPlay=0&directStream=0";
+    } else {
+        queryParams += "&directPlay=0&directStream=1";
+    }
+    queryParams += "&directStreamAudio=1";
+    queryParams += "&hasMDE=1";
+    queryParams += "&location=lan";
+    queryParams += "&audioBoost=100";
+    queryParams += "&audioChannelCount=2";
+
+    char buf[256];
+
+    if (isAudio) {
+        // Audio: HTTP progressive download of mp3
+        queryParams += "&protocol=http";
+        queryParams += "&musicBitrate=320";
+#if defined(__vita__) || defined(__PS4__)
+        // These two decode a much narrower set of audio than mpv does on a
+        // desktop, and the audio profile we send says only "I can take an mp3
+        // transcode" — it declares no direct-play capability for the server to
+        // judge. Asking for direct play here invites a FLAC or ALAC the port
+        // cannot open, so tell the server not to offer it and take the mp3.
+        queryParams += "&directPlay=0";
+#endif
+    } else {
+        // Video: HLS (HTTP Live Streaming) with TS segments.
+        // This matches switchfin's proven Vita configuration:
+        // protocol=hls, container=mpegts, codec=h264, level<=4.0, max 720p
+        queryParams += "&protocol=hls";
+
+        const auto& vc = platform::getVideoConstraints();
+        int bitrate = settings.maxBitrate > 0 ? settings.maxBitrate : vc.defaultBitrate;
+        // Follows the chosen tier. It used to be the platform default always,
+        // so the quality picker moved the bitrate but never the frame size —
+        // picking 480p asked for 1080p at 2 Mbps, and 4K asked for 1080p at 40.
+        const char* resolution = Application::resolutionFor(settings.videoQuality);
+
+        snprintf(buf, sizeof(buf), "&videoBitrate=%d", bitrate);
+        queryParams += buf;
+        snprintf(buf, sizeof(buf), "&videoResolution=%s", resolution);
+        queryParams += buf;
+        queryParams += "&videoQuality=100";
+
+        // Subtitle handling based on settings
+        if (!settings.showSubtitles) {
+            queryParams += "&subtitles=none";
+        } else {
+            queryParams += "&subtitles=auto";
+        }
+    }
+
+    // Resume offset (in seconds)
+    if (offsetMs > 0) {
+        snprintf(buf, sizeof(buf), "&offset=%.1f", offsetMs / 1000.0);
+        queryParams += buf;
+    }
+
+    // Session ID
+    outSessionId = sessionId;
+    queryParams += "&session=" + sessionId;
+
+    // Auth token
+    queryParams += "&X-Plex-Token=" + m_authToken;
+
+    // Profile augmentation (per official API Profile Augmentations spec).
+    // Tell Plex exactly what transcode targets this client supports.
+    // Without this, the Generic profile may return generalDecisionCode=2000
+    // ("Neither direct play nor conversion is available").
+    std::string profileExtra;
+    if (isAudio) {
+        // Audio: transcode to mp3 via HTTP
+        profileExtra = "add-transcode-target(type=musicProfile"
+                       "&context=streaming&protocol=http"
+                       "&container=mp3&audioCodec=mp3)";
+    } else {
+        // Video: HLS with MPEG-TS segments, h264+aac.
+        // Platform-specific limits for resolution and H.264 level come
+        // from the platform abstraction layer instead of #defines.
+        const auto& vc = platform::getVideoConstraints();
+        int limW = 0, limH = 0;
+        Application::videoLimitFor(
+            Application::getInstance().getSettings().videoQuality, limW, limH);
+        char profileBuf[512];
+        snprintf(profileBuf, sizeof(profileBuf),
+            "add-transcode-target(type=videoProfile"
+            "&context=streaming&protocol=hls"
+            "&container=mpegts&videoCodec=h264"
+            "&audioCodec=aac"
+            "&subtitleCodec=srt)"
+            "+add-limitation(scope=videoCodec&scopeName=h264"
+            "&type=upperBound&name=video.level&value=%d)"
+            "+add-limitation(scope=videoCodec&scopeName=h264"
+            "&type=upperBound&name=video.width&value=%d)"
+            "+add-limitation(scope=videoCodec&scopeName=h264"
+            "&type=upperBound&name=video.height&value=%d)",
+            vc.maxVideoLevel, limW, limH);
+        profileExtra = profileBuf;
+    }
+
+    // Determine transcode type path segment
+    const char* transcodeType = isAudio ? "music" : "video";
+
+    // Step 1: Call /decision with X-Plex-* as HTTP headers
+    snprintf(buf, sizeof(buf), "/%s/:/transcode/universal/decision?", transcodeType);
+    std::string decisionUrl = m_serverUrl + buf + queryParams;
+    brls::Logger::info("getTranscodeUrl: Calling decision endpoint...");
+
+    HttpClient decisionClient;
+    HttpRequest decisionReq;
+    decisionReq.url = decisionUrl;
+    decisionReq.method = "GET";
+    decisionReq.headers["Accept"] = "application/json";
+    // Per official API: X-Plex-Client-Identifier is REQUIRED, in=header
+    {
+        const auto& vc = platform::getVideoConstraints();
+        decisionReq.headers["X-Plex-Client-Identifier"] = PLEX_CLIENT_NAME;
+        decisionReq.headers["X-Plex-Product"] = PLEX_CLIENT_NAME;
+        decisionReq.headers["X-Plex-Version"] = PLEX_CLIENT_VERSION;
+        decisionReq.headers["X-Plex-Platform"] = vc.plexPlatform;
+        decisionReq.headers["X-Plex-Device"] = vc.plexDevice;
+        decisionReq.headers["X-Plex-Device-Name"] = vc.plexDevice;
+    }
+    decisionReq.headers["X-Plex-Client-Profile-Name"] = "Generic";
+    decisionReq.headers["X-Plex-Client-Profile-Extra"] = profileExtra;
+    HttpResponse decisionResp = decisionClient.request(decisionReq);
+
+    brls::Logger::info("getTranscodeUrl: Decision response: {} body: {}",
+                      decisionResp.statusCode, redactBodyForLog(decisionResp.body.substr(0, 500)));
+
+    if (decisionResp.statusCode != 200) {
+        brls::Logger::warning("getTranscodeUrl: Decision returned {}, trying start anyway",
+                             decisionResp.statusCode);
+    }
+
+    // If the server chose DIRECT PLAY (the user enabled it and the file is
+    // compatible), stream the original file directly. The /start endpoints are
+    // transcode endpoints and 400 for a direct-play decision — you can't ask for
+    // an HLS playlist, or an mp3 transcode, of a file that is meant to be played
+    // as-is. mpv seeks the file via HTTP range requests, so no offset goes in
+    // the URL; the player detects the direct URL and seeks to the resume point
+    // itself.
+    //
+    // This used to be video-only. Audio fell through to start.mp3 and took the
+    // 400 the comment above describes — a track the server had judged directly
+    // playable simply would not start, which is what "music works on one device
+    // and not another" turns out to be: the same code, a different decision.
+    // The constrained ports opt out earlier by never asking for direct play.
+    if (settings.directPlay && !settings.forceTranscode &&
+        decisionResp.statusCode == 200 &&
+        (decisionResp.body.find("\"decision\":\"directplay\"") != std::string::npos ||
+         decisionResp.body.find("Direct play OK") != std::string::npos)) {
+        url = m_serverUrl + partKey + "?X-Plex-Token=" + m_authToken;
+        brls::Logger::info("getTranscodeUrl: Direct play — original file {}", partKey);
+        return true;
+    }
+
+    // Step 2: Build the /start URL for MPV to stream.
+    // Include X-Plex-* as query params AND MPV sends them as headers too.
+    std::string startQuery = queryParams;
+    {
+        const auto& vc = platform::getVideoConstraints();
+        startQuery += "&X-Plex-Client-Identifier=" + std::string(PLEX_CLIENT_NAME);
+        startQuery += "&X-Plex-Product=" + std::string(PLEX_CLIENT_NAME);
+        startQuery += "&X-Plex-Version=" + std::string(PLEX_CLIENT_VERSION);
+        startQuery += "&X-Plex-Platform=" + HttpClient::urlEncode(vc.plexPlatform);
+        startQuery += "&X-Plex-Device=" + HttpClient::urlEncode(vc.plexDevice);
+        startQuery += "&X-Plex-Device-Name=" + HttpClient::urlEncode(vc.plexDevice);
+    }
+    startQuery += "&X-Plex-Client-Profile-Name=Generic";
+    startQuery += "&X-Plex-Client-Profile-Extra=" + HttpClient::urlEncode(profileExtra);
+
+    // HLS playlist for video (m3u8), mp3 for audio
+    const char* container = isAudio ? "mp3" : "m3u8";
+    snprintf(buf, sizeof(buf), "/%s/:/transcode/universal/start.%s?", transcodeType, container);
+    url = m_serverUrl + buf + startQuery;
+    brls::Logger::info("getTranscodeUrl: Transcode URL = {}", redactTokensInUrl(url));
+
+    return true;
+}
+
+bool PlexClient::updatePlayProgress(const std::string& ratingKey, int timeMs) {
+    HttpClient client;
+    std::string url = buildApiUrl("/:/progress?key=" + ratingKey + "&time=" + std::to_string(timeMs) + "&identifier=com.plexapp.plugins.library");
+    HttpResponse resp = client.get(url);
+    return resp.statusCode == 200;
+}
+
+bool PlexClient::reportTimeline(const std::string& ratingKey, const std::string& key,
+                                const std::string& state, int timeMs, int durationMs,
+                                int playQueueItemID) {
+    HttpClient client;
+    std::string params = "/:/timeline?ratingKey=" + ratingKey +
+        "&key=" + key +
+        "&state=" + state +
+        "&time=" + std::to_string(timeMs) +
+        "&duration=" + std::to_string(durationMs);
+    if (playQueueItemID > 0) {
+        params += "&playQueueItemID=" + std::to_string(playQueueItemID);
+    }
+    std::string url = buildApiUrl(params);
+
+    HttpRequest req;
+    req.url = url;
+    req.method = "POST";
+    req.headers["X-Plex-Client-Identifier"] = PLEX_CLIENT_ID;
+    req.headers["X-Plex-Product"] = PLEX_CLIENT_NAME;
+
+    HttpResponse resp = client.request(req);
+    return resp.statusCode == 200;
+}
+
+bool PlexClient::reportLiveTimeline(const std::string& liveSessionUuid, int playbackTimeMs,
+                                    const std::string& state) {
+    if (liveSessionUuid.empty()) return false;
+
+    // Match the official Plex app's keep-alive call: GET /:/timeline with the
+    // live session path as `key=`. The server's parser fires
+    //   "[Now] Updated play state for /livetv/sessions/{uuid}"
+    // on receipt, which resets the rolling subscription's 300-sec stop-grab
+    // timer. The server *resolves* the playing item via ratingKey first,
+    // and 404s if it can't — so we must pass the live-session metadata id
+    // the tune created (captured into m_lastLiveRatingKey).
+    if (m_lastLiveRatingKey.empty()) {
+        brls::Logger::warning("reportLiveTimeline: no live ratingKey captured; skipping keep-alive");
+        return false;
+    }
+    std::string keyPath = "/livetv/sessions/" + liveSessionUuid;
+    std::string params = "/:/timeline?key=" + HttpClient::urlEncode(keyPath) +
+                         "&ratingKey=" + m_lastLiveRatingKey +
+                         "&duration=0" +
+                         "&time=0" +
+                         "&playbackTime=" + std::to_string(playbackTimeMs) +
+                         "&hasMDE=1" +
+                         "&state=" + state;
+
+    HttpRequest req;
+    req.url = buildApiUrl(params);
+    req.method = "GET";
+    req.headers["X-Plex-Client-Identifier"] = PLEX_CLIENT_ID;
+    req.headers["X-Plex-Product"] = PLEX_CLIENT_NAME;
+    // Bind the timeline to the same consumer the tune/decision used so the
+    // server attributes it to the right rolling subscription.
+    req.headers["X-Plex-Session-Identifier"] = PLEX_CLIENT_ID;
+    req.timeout = 10;
+
+    HttpClient client;
+    HttpResponse resp = client.request(req);
+    if (resp.statusCode != 200) {
+        brls::Logger::debug("reportLiveTimeline: status={} for /livetv/sessions/{}",
+                            resp.statusCode, liveSessionUuid);
+    }
+    return resp.statusCode == 200;
+}
+
+bool PlexClient::markAsWatched(const std::string& ratingKey) {
+    HttpClient client;
+    std::string url = buildApiUrl("/:/scrobble?key=" + ratingKey + "&identifier=com.plexapp.plugins.library");
+    HttpResponse resp = client.get(url);
+    return resp.statusCode == 200;
+}
+
+bool PlexClient::markAsUnwatched(const std::string& ratingKey) {
+    HttpClient client;
+    std::string url = buildApiUrl("/:/unscrobble?key=" + ratingKey + "&identifier=com.plexapp.plugins.library");
+    HttpResponse resp = client.get(url);
+    return resp.statusCode == 200;
+}
+
+bool PlexClient::rateItem(const std::string& ratingKey, float rating) {
+    if (ratingKey.empty()) return false;
+    if (rating < 0.0f) rating = 0.0f;
+    if (rating > 10.0f) rating = 10.0f;
+
+    char buf[16];
+    snprintf(buf, sizeof(buf), "%.1f", rating);
+
+    HttpClient client;
+    std::string url = buildApiUrl("/:/rate?key=" + ratingKey +
+                                  "&identifier=com.plexapp.plugins.library&rating=" + buf);
+    HttpRequest req;
+    req.url = url;
+    req.method = "PUT";
+    req.timeout = 10;
+    HttpResponse resp = client.request(req);
+    return resp.statusCode == 200;
+}
+
+bool PlexClient::probeLiveTV() {
+    if (m_dvrId.empty()) {
+        checkLiveTVAvailability();
+    }
+    return m_hasLiveTV;
+}
+
+void PlexClient::checkLiveTVAvailability() {
+    // Official Plex API: GET /livetv/dvrs Returns DVR list with key, lineup, uuid, Device array, and ChannelMapping
+    HttpClient client;
+    std::string url = buildApiUrl("/livetv/dvrs");
+    HttpRequest req;
+    req.url = url;
+    req.method = "GET";
+    req.headers["Accept"] = "application/json";
+    req.timeout = 10;
+
+    HttpResponse resp = client.request(req);
+
+    // NOT a proxy for "this server has Live TV": per openapi.json
+    // /livetv/dvrs answers 200 whether or not a DVR exists, and reports
+    // the absence as an empty MediaContainer (size 0, no Dvr array). The
+    // real answer is whether a DVR key falls out of the parse below, so
+    // m_hasLiveTV is decided at the end.
+    const bool dvrEndpointAnswered = (resp.statusCode == 200);
+
+    if (dvrEndpointAnswered && !resp.body.empty()) {
+        brls::Logger::debug("DVR response (first 1000): {}",
+                            resp.body.substr(0, 1000));
+
+        // Parse DVR key - the "key" field is the DVR ID (e.g., "28") Per openapi.json example: "key": "28"
+        std::string key = extractJsonValue(resp.body, "key");
+        if (!key.empty()) {
+            // Key may be just a number like "28" or a path like "/livetv/dvrs/28"
+            size_t lastSlash = key.rfind('/');
+            if (lastSlash != std::string::npos) {
+                m_dvrId = key.substr(lastSlash + 1);
+            } else {
+                m_dvrId = key;
+            }
+        }
+        brls::Logger::info("Live TV DVR ID: {}", m_dvrId.empty() ? "(none)" : m_dvrId);
+
+        // Parse lineup URI from DVR response
+        // Per openapi.json: "lineup": "lineup://tv.plex.providers.epg.onconnect/USA-HI51418-X"
+        m_lineupUri = extractJsonValue(resp.body, "lineup");
+        if (!m_lineupUri.empty()) {
+            brls::Logger::info("Live TV Lineup URI: {}", m_lineupUri);
+        }
+
+        // Parse Device array for device UUIDs
+        // Per openapi.json: Device items have "uuid" like "device://tv.plex.grabbers.hdhomerun/1053C0CA"
+        m_deviceIds.clear();
+        size_t pos = 0;
+        while ((pos = resp.body.find("\"uuid\"", pos)) != std::string::npos) {
+            std::string uuid = extractJsonValue(resp.body.substr(pos), "uuid");
+            if (!uuid.empty() && uuid.find("device://") != std::string::npos) {
+                bool found = false;
+                for (const auto& d : m_deviceIds) {
+                    if (d == uuid) { found = true; break; }
+                }
+                if (!found) {
+                    m_deviceIds.push_back(uuid);
+                    brls::Logger::info("Live TV Device UUID: {}", uuid);
+                }
+            }
+            pos++;
+        }
+
+        // Parse ChannelMapping to get available channel identifiers
+        // Per openapi.json: "channelKey", "deviceIdentifier", "enabled", "lineupIdentifier"
+        m_channelMappings.clear();
+        pos = 0;
+        while ((pos = resp.body.find("\"channelKey\"", pos)) != std::string::npos) {
+            std::string region = resp.body.substr(pos, std::min((size_t)300, resp.body.length() - pos));
+            std::string channelKey = extractJsonValue(region, "channelKey");
+            std::string deviceId = extractJsonValue(region, "deviceIdentifier");
+            std::string enabled = extractJsonValue(region, "enabled");
+
+            if (!channelKey.empty() && !deviceId.empty() && enabled != "0") {
+                ChannelMapping mapping;
+                mapping.channelKey = channelKey;
+                mapping.deviceIdentifier = deviceId;
+                mapping.lineupIdentifier = extractJsonValue(region, "lineupIdentifier");
+                m_channelMappings.push_back(mapping);
+            }
+            pos++;
+        }
+        brls::Logger::info("Live TV: Found {} channel mappings", m_channelMappings.size());
+
+        // Extract EPG provider key from the DVR response's "epgIdentifier" field
+        // This is the full provider key including DVR-specific suffix (e.g., "tv.plex.providers.epg.cloud:40")
+        // The grid endpoint uses this as: GET /{epgIdentifier}/grid
+        if (m_epgProviderKey.empty()) {
+            m_epgProviderKey = extractJsonValue(resp.body, "epgIdentifier");
+            if (!m_epgProviderKey.empty()) {
+                brls::Logger::info("Live TV EPG provider key (from epgIdentifier): {}", m_epgProviderKey);
+            }
+        }
+
+        // Fallback: derive from lineup URI if epgIdentifier not found
+        if (m_epgProviderKey.empty() && !m_lineupUri.empty()) {
+            size_t protoEnd = m_lineupUri.find("://");
+            if (protoEnd != std::string::npos) {
+                size_t hostStart = protoEnd + 3;
+                size_t hostEnd = m_lineupUri.find('/', hostStart);
+                if (hostEnd != std::string::npos) {
+                    m_epgProviderKey = m_lineupUri.substr(hostStart, hostEnd - hostStart);
+                } else {
+                    m_epgProviderKey = m_lineupUri.substr(hostStart);
+                }
+            }
+            if (!m_epgProviderKey.empty()) {
+                brls::Logger::info("Live TV EPG provider key (from lineup URI): {}", m_epgProviderKey);
+            }
+        }
+    }
+
+    // A DVR key is the thing that actually makes Live TV usable — without
+    // one there is no lineup, no EPG provider, and nothing to tune.
+    m_hasLiveTV = !m_dvrId.empty();
+
+    brls::Logger::info("Live TV availability check: {} (dvr: {}, devices: {}, lineup: {}, mappings: {}, epg: {})",
+                        m_hasLiveTV ? "available" : "not available",
+                        m_dvrId.empty() ? "(none)" : m_dvrId,
+                        m_deviceIds.size(),
+                        m_lineupUri.empty() ? "(none)" : "set",
+                        m_channelMappings.size(),
+                        m_epgProviderKey.empty() ? "(none)" : m_epgProviderKey);
+}
+
+bool PlexClient::fetchLiveTVChannels(std::vector<LiveTVChannel>& channels) {
+    HttpClient client;
+
+    // Ensure DVR info is loaded
+    if (m_dvrId.empty()) {
+        checkLiveTVAvailability();
+    }
+
+    channels.clear();
+
+    HttpRequest req;
+    req.method = "GET";
+    req.headers["Accept"] = "application/json";
+    req.timeout = 15;
+
+    // Shared by both channel-list sources below.
+    //
+    // A virtual channel number ("6.1") is both the display number and, for
+    // providers that hand out nothing better, the channel identifier.
+    auto applyVcn = [](LiveTVChannel& channel, const std::string& vcn) {
+        if (vcn.empty()) return;
+        channel.channelIdentifier = vcn;
+        size_t dotPos = vcn.find('.');
+        if (dotPos != std::string::npos) {
+            int major = atoi(vcn.substr(0, dotPos).c_str());
+            int minor = atoi(vcn.substr(dotPos + 1).c_str());
+            channel.channelNumber = major * 10 + minor;
+        } else {
+            channel.channelNumber = atoi(vcn.c_str()) * 10;
+        }
+    };
+
+    // Cross-reference a parsed EPG channel with ChannelMapping to (a) get the
+    // device identifier for tuning and (b) drop channels that aren't actually
+    // mapped to a tuner on this server. Without (b), the EPG was showing every
+    // channel the lineup *covers* (~106 on a typical OTA list) rather than the
+    // ones the user's DVR is set up to receive, so the grid was full of "No
+    // guide data" rows for channels the user can't tune anyway.
+    //
+    // Dedupe keys off the mapping's channelKey when one matched: two lineup
+    // entries can resolve to the *same* physical channel via different
+    // identifiers (lineup key vs lineupIdentifier), so channel.key alone left
+    // duplicates of 4.1 / 4.2 / 4.3, 22.3 / 22.4, etc.
+    std::set<std::string> seenChannelKeys;
+    auto commitChannel = [&](LiveTVChannel& channel, const std::string& identifier) {
+        const ChannelMapping* matchedMapping = nullptr;
+        for (const auto& mapping : m_channelMappings) {
+            if (!channel.key.empty() && channel.key == mapping.channelKey) {
+                matchedMapping = &mapping;
+                break;
+            }
+            if (!identifier.empty() && identifier == mapping.lineupIdentifier) {
+                matchedMapping = &mapping;
+                if (channel.key.empty()) channel.key = mapping.channelKey;
+                break;
+            }
+        }
+        if (matchedMapping) {
+            channel.channelIdentifier = matchedMapping->deviceIdentifier;
+        }
+
+        // If we have no ChannelMapping data at all (some EPG providers don't),
+        // fall back to the old behaviour so the EPG isn't empty.
+        if (!matchedMapping && !m_channelMappings.empty()) return;
+        if (channel.callSign.empty() && channel.title.empty()) return;
+
+        std::string dedupeKey = matchedMapping
+            ? matchedMapping->channelKey
+            : (!channel.key.empty()
+                ? channel.key
+                : (!channel.channelIdentifier.empty()
+                    ? channel.channelIdentifier
+                    : channel.callSign));
+        if (seenChannelKeys.insert(dedupeKey).second) {
+            channels.push_back(channel);
+        }
+    };
+
+    auto countWithLogos = [](const std::vector<LiveTVChannel>& list) {
+        size_t n = 0;
+        for (const auto& c : list) if (!c.thumb.empty()) n++;
+        return n;
+    };
+
+    // Official API: GET /livetv/epg/channels?lineup={lineupUri}
+    // Returns Channel array with: callSign, identifier, channelVcn, hd, thumb, title, key
+    if (!m_lineupUri.empty()) {
+        std::string url = buildApiUrl("/livetv/epg/channels");
+        url += "&lineup=" + HttpClient::urlEncode(m_lineupUri);
+        req.url = url;
+        brls::Logger::debug("fetchLiveTVChannels: GET /livetv/epg/channels?lineup={}", m_lineupUri);
+
+        // Cache the channels list — call signs, channel numbers, and
+        // station logos almost never change. This is the body the user
+        // specifically called out as worth caching ("EPG channel number
+        // and logo stay relatively consistent"). Programs themselves
+        // come from fetchEPGGrid below and aren't cached.
+        const int ttlSec = Application::getInstance().getSettings().cacheLifetimeMinutes * 60;
+        std::string respBody;
+        bool fromCache = HttpCache::get(url, ttlSec, respBody);
+        int statusCode = 200;
+        if (!fromCache) {
+            HttpResponse resp = client.request(req);
+            statusCode = resp.statusCode;
+            respBody = std::move(resp.body);
+            if (statusCode == 200 && !respBody.empty()) {
+                HttpCache::put(url, respBody, ttlSec);
+            }
+        }
+        // Shim — the rest of this block was written against `resp.body`
+        // and `resp.statusCode`. Re-expose them as a local without
+        // touching the parser.
+        struct { int statusCode; std::string body; } resp{statusCode, std::move(respBody)};
+        if (resp.statusCode == 200 && !resp.body.empty()) {
+            brls::Logger::debug("fetchLiveTVChannels: EPG channels response ({} bytes, first 500): {}",
+                                resp.body.length(), resp.body.substr(0, 500));
+
+            // Parse Channel array from response
+            // Per openapi.json schema: Channel objects have callSign, identifier, channelVcn, thumb, title, key
+            //
+            // The response can reference a single channel from more than
+            // one section of the JSON — once as the lineup's Channel
+            // object and again as a ChannelMapping's nested copy — and
+            // our "find every \"callSign\" then walk back to its
+            // enclosing object" parser catches all of them. commitChannel
+            // dedupes so the EPG doesn't show double rows for 4.1, 4.2,
+            // 4.3 etc.
+            size_t pos = 0;
+            while ((pos = resp.body.find("\"callSign\"", pos)) != std::string::npos) {
+                size_t objStart = resp.body.rfind('{', pos);
+                if (objStart == std::string::npos) { pos++; continue; }
+
+                int braceCount = 1;
+                size_t objEnd = objStart + 1;
+                while (braceCount > 0 && objEnd < resp.body.length()) {
+                    if (resp.body[objEnd] == '{') braceCount++;
+                    else if (resp.body[objEnd] == '}') braceCount--;
+                    objEnd++;
+                }
+
+                std::string obj = resp.body.substr(objStart, objEnd - objStart);
+
+                LiveTVChannel channel;
+                channel.callSign = extractJsonValue(obj, "callSign");
+                channel.key = extractJsonValue(obj, "key");
+                channel.title = extractJsonValue(obj, "title");
+                if (channel.title.empty()) {
+                    channel.title = channel.callSign;
+                }
+                channel.thumb = extractJsonValue(obj, "thumb");
+
+                // channelVcn is the virtual channel number like "2.1"
+                applyVcn(channel, extractJsonValue(obj, "channelVcn"));
+
+                // identifier field from EPG
+                std::string identifier = extractJsonValue(obj, "identifier");
+                if (!identifier.empty() && channel.channelIdentifier.empty()) {
+                    channel.channelIdentifier = identifier;
+                }
+
+                commitChannel(channel, identifier);
+
+                pos = objEnd;
+            }
+
+            if (!channels.empty()) {
+                brls::Logger::info("fetchLiveTVChannels: Found {} channels from EPG lineup ({} with logos)",
+                                   channels.size(), countWithLogos(channels));
+            }
+        } else {
+            // Worth its own line: on a non-owner account this comes back 403
+            // and the guide silently fell through to the ChannelMapping
+            // fallback below, which has no logos and no real channel titles.
+            brls::Logger::warning("fetchLiveTVChannels: /livetv/epg/channels returned HTTP {} ({} bytes)",
+                                  resp.statusCode, resp.body.length());
+        }
+    }
+
+    // Second source: GET /{epgProviderKey}/lineups/dvr/channels — documented in
+    // openapi.json as
+    //   /tv.plex.providers.epg.{identifier}:{deviceId}/lineups/dvr/channels
+    // with the same summary as /livetv/epg/channels above ("Get channels for a
+    // lineup within an EPG provider"), needing no lineup parameter, and
+    // carrying title / callSign / thumb plus vcn and gridKey.
+    //
+    // Why a second source at all: /livetv/epg/* is the DVR *setup* namespace —
+    // its neighbours are countries, languages, regions, lineups, channelmap —
+    // and it answers 403 for a non-owner account, which left the guide falling
+    // through to the ChannelMapping fallback below: no station logos, and
+    // "Ch 5.1" where the channel name should be. This path sits under the
+    // provider prefix the grid, watchnow, hub and search requests already use
+    // successfully on those same accounts.
+    //
+    // It runs only when the first source produced nothing, so an owner account
+    // — for which /livetv/epg/channels answers 200 — never reaches it.
+    if (channels.empty() && !m_epgProviderKey.empty()) {
+        std::string url = buildApiUrl("/" + m_epgProviderKey + "/lineups/dvr/channels");
+        req.url = url;
+        brls::Logger::debug("fetchLiveTVChannels: GET /{}/lineups/dvr/channels", m_epgProviderKey);
+
+        HttpResponse resp = client.request(req);
+        if (resp.statusCode == 200 && !resp.body.empty()) {
+            // Same "find every callSign, walk back to its enclosing object"
+            // parser as above; only the field names differ (vcn rather than
+            // channelVcn, gridKey/id rather than key/identifier). gridKey
+            // carries the same value as ChannelMapping.channelKey, so
+            // commitChannel's tuner cross-reference matches on it unchanged.
+            size_t pos = 0;
+            while ((pos = resp.body.find("\"callSign\"", pos)) != std::string::npos) {
+                size_t objStart = resp.body.rfind('{', pos);
+                if (objStart == std::string::npos) { pos++; continue; }
+
+                int braceCount = 1;
+                size_t objEnd = objStart + 1;
+                while (braceCount > 0 && objEnd < resp.body.length()) {
+                    if (resp.body[objEnd] == '{') braceCount++;
+                    else if (resp.body[objEnd] == '}') braceCount--;
+                    objEnd++;
+                }
+
+                std::string obj = resp.body.substr(objStart, objEnd - objStart);
+
+                LiveTVChannel channel;
+                channel.callSign = extractJsonValue(obj, "callSign");
+                channel.title    = extractJsonValue(obj, "title");
+                if (channel.title.empty()) channel.title = channel.callSign;
+                channel.thumb    = extractJsonValue(obj, "thumb");
+                channel.key      = extractJsonValue(obj, "gridKey");
+                if (channel.key.empty()) channel.key = extractJsonValue(obj, "id");
+
+                applyVcn(channel, extractJsonValue(obj, "vcn"));
+                commitChannel(channel, channel.key);
+
+                pos = objEnd;
+            }
+
+            brls::Logger::info("fetchLiveTVChannels: Found {} channels from EPG provider {} ({} with logos)",
+                               channels.size(), m_epgProviderKey, countWithLogos(channels));
+        } else {
+            brls::Logger::warning("fetchLiveTVChannels: /{}/lineups/dvr/channels returned HTTP {} ({} bytes)",
+                                  m_epgProviderKey, resp.statusCode, resp.body.length());
+        }
+    }
+
+    // Fallback: GET /livetv/dvrs/{dvrId} to get ChannelMapping and build channel list
+    if (channels.empty() && !m_dvrId.empty()) {
+        std::string url = buildApiUrl("/livetv/dvrs/" + m_dvrId);
+        req.url = url;
+        brls::Logger::debug("fetchLiveTVChannels: GET /livetv/dvrs/{}", m_dvrId);
+
+        HttpResponse resp = client.request(req);
+        if (resp.statusCode == 200 && !resp.body.empty()) {
+            brls::Logger::debug("fetchLiveTVChannels: DVR response ({} bytes, first 500): {}",
+                                resp.body.length(), resp.body.substr(0, 500));
+
+            // Build channels from ChannelMapping entries
+            size_t pos = 0;
+            while ((pos = resp.body.find("\"deviceIdentifier\"", pos)) != std::string::npos) {
+                size_t objStart = resp.body.rfind('{', pos);
+                if (objStart == std::string::npos) { pos++; continue; }
+
+                int braceCount = 1;
+                size_t objEnd = objStart + 1;
+                while (braceCount > 0 && objEnd < resp.body.length()) {
+                    if (resp.body[objEnd] == '{') braceCount++;
+                    else if (resp.body[objEnd] == '}') braceCount--;
+                    objEnd++;
+                }
+
+                std::string obj = resp.body.substr(objStart, objEnd - objStart);
+
+                std::string deviceId = extractJsonValue(obj, "deviceIdentifier");
+                std::string channelKey = extractJsonValue(obj, "channelKey");
+                std::string enabled = extractJsonValue(obj, "enabled");
+
+                if (!deviceId.empty() && enabled != "0") {
+                    LiveTVChannel channel;
+                    channel.channelIdentifier = deviceId;
+                    channel.key = channelKey;
+                    channel.title = "Ch " + deviceId;
+                    channel.callSign = deviceId;
+
+                    // Parse deviceIdentifier as channel number (e.g. "48.1")
+                    size_t dotPos = deviceId.find('.');
+                    if (dotPos != std::string::npos) {
+                        int major = atoi(deviceId.substr(0, dotPos).c_str());
+                        int minor = atoi(deviceId.substr(dotPos + 1).c_str());
+                        channel.channelNumber = major * 10 + minor;
+                    } else {
+                        channel.channelNumber = atoi(deviceId.c_str()) * 10;
+                    }
+
+                    channels.push_back(channel);
+                }
+
+                pos = objEnd;
+            }
+
+            if (!channels.empty()) {
+                // Last resort. ChannelMapping carries no thumb and no station
+                // name, so the guide ends up with blank logos and "Ch 5.1"
+                // titles — if you see this line, both EPG sources above failed.
+                brls::Logger::warning("fetchLiveTVChannels: Found {} channels from DVR ChannelMapping "
+                                      "— no logos or station names available from this source",
+                                      channels.size());
+            }
+        }
+    }
+
+    // Sort by channel number
+    std::sort(channels.begin(), channels.end(),
+              [](const LiveTVChannel& a, const LiveTVChannel& b) {
+                  return a.channelNumber < b.channelNumber;
+              });
+
+    brls::Logger::info("fetchLiveTVChannels: Found {} channels total", channels.size());
+    return true;
+}
+
+bool PlexClient::fetchEPGGrid(std::vector<LiveTVChannel>& channelsWithPrograms, int hoursAhead) {
+    brls::Logger::debug("fetchEPGGrid: fetching {} hours of programming", hoursAhead);
+
+    // LTVPROF: every phase of the guide load is timed and logged with an
+    // LTVPROF prefix — grep vitaplex.log for LTVPROF to see where Live TV
+    // tab-open time goes on hardware (network vs parse vs view build).
+    const int64_t profT0   = brls::getCPUTimeUsec();
+    int64_t profHttpUs = 0;   // wall time inside grid HTTP requests
+    int     profReqs   = 0;   // grid HTTP request count
+    int64_t profDvrUs  = 0;   // DVR availability check
+    int64_t profChanUs = 0;   // channel-list fetch (its own HTTP + parse)
+
+    // Ensure DVR info is loaded
+    if (m_dvrId.empty()) {
+        checkLiveTVAvailability();
+    }
+    profDvrUs = brls::getCPUTimeUsec() - profT0;
+
+    // First get channel list via official API
+    if (!fetchLiveTVChannels(channelsWithPrograms)) {
+        return false;
+    }
+    profChanUs = brls::getCPUTimeUsec() - profT0 - profDvrUs;
+    brls::Logger::info("LTVPROF channel list: {} channels in {}ms (dvr check {}ms)",
+                       channelsWithPrograms.size(), profChanUs / 1000, profDvrUs / 1000);
+
+    if (channelsWithPrograms.empty()) {
+        return false;
+    }
+
+    // Get current time for grid query
+    time_t now = time(nullptr);
+    time_t endTime = now + (hoursAhead * 3600);
+
+    HttpClient client;
+    HttpRequest req;
+    req.method = "GET";
+    req.headers["Accept"] = "application/json";
+    req.timeout = 30;
+
+    // Use EPG provider grid endpoint for program data
+    // The provider key comes from the lineup URI (e.g., "tv.plex.providers.epg.onconnect")
+    // Grid endpoint: GET /{epgProviderKey}/grid?type={type}&beginsAt<={end}&endsAt>={now}
+    bool gotProgramData = false;
+
+    bool skipPerChannel = false;
+    if (!m_epgProviderKey.empty()) {
+        // Attempt ONE type-less grid query first (gridType -1 omits the
+        // type parameter): if the server returns airings of every EPG type
+        // across all channels in a single response, the two type-filtered
+        // queries AND the channels x dates fallback below (32x2 sequential
+        // HTTPS requests, ~7s wall time on Vita per LTVPROF) are skipped
+        // entirely. Falls back to the old behaviour when the type-less
+        // response is thin.
+        for (int gridType : {-1, 4, 1}) {
+            std::string gridUrl = buildApiUrl("/" + m_epgProviderKey + "/grid");
+            if (gridType >= 0) gridUrl += "&type=" + std::to_string(gridType);
+            gridUrl += "&beginsAt%3C=" + std::to_string(endTime);
+            gridUrl += "&endsAt%3E=" + std::to_string(now);
+            req.url = gridUrl;
+
+            brls::Logger::debug("fetchEPGGrid: Trying grid endpoint: {}", redactBodyForLog(gridUrl));
+            const int64_t profReq0 = brls::getCPUTimeUsec();
+            HttpResponse resp = client.request(req);
+            profHttpUs += brls::getCPUTimeUsec() - profReq0;
+            profReqs++;
+            if (resp.statusCode == 200 && !resp.body.empty()) {
+                brls::Logger::debug("fetchEPGGrid: Grid response ({} bytes, type={}), first 1000: {}",
+                                    resp.body.length(), gridType, resp.body.substr(0, 1000));
+
+                // Parse Metadata array containing program entries.
+                // Zero-copy pass: objects are scanned as string_views
+                // into resp.body (see jsonFieldView) — only stored
+                // fields become std::strings.
+                size_t metaArrayPos = resp.body.find("\"Metadata\"");
+                if (metaArrayPos == std::string::npos) continue;
+
+                size_t arrayStart = resp.body.find('[', metaArrayPos);
+                if (arrayStart == std::string::npos) continue;
+
+                const std::string_view body(resp.body);
+
+                // Iterate through Metadata objects
+                size_t pos = arrayStart + 1;
+                while (pos < body.size()) {
+                    // Skip whitespace and commas
+                    while (pos < body.size() && (body[pos] == ' ' || body[pos] == ',' ||
+                           body[pos] == '\n' || body[pos] == '\r' || body[pos] == '\t')) {
+                        pos++;
+                    }
+                    if (pos >= body.size() || body[pos] == ']') break;
+                    if (body[pos] != '{') { pos++; continue; }
+
+                    // Extract Metadata object (a view into the body, no copy)
+                    size_t objStart = pos;
+                    int braceCount = 1;
+                    pos++;
+                    while (braceCount > 0 && pos < body.size()) {
+                        if (body[pos] == '{') braceCount++;
+                        else if (body[pos] == '}') braceCount--;
+                        pos++;
+                    }
+                    std::string_view metaObj = body.substr(objStart, pos - objStart);
+
+                    // Extract program title
+                    std::string_view progTitle = jsonFieldView(metaObj, "\"title\"");
+                    std::string_view grandparentTitle = jsonFieldView(metaObj, "\"grandparentTitle\"");
+                    if (progTitle.empty()) continue;
+
+                    std::string displayTitle;
+                    if (!grandparentTitle.empty() && gridType == 4) {
+                        displayTitle = jsonUnescape(grandparentTitle) + ": " + jsonUnescape(progTitle);
+                    } else {
+                        displayTitle = jsonUnescape(progTitle);
+                    }
+
+                    std::string progRatingKey = jsonFieldString(metaObj, "\"ratingKey\"");
+                    std::string progMetadataKey = jsonFieldString(metaObj, "\"key\"");
+                    // Pull summary + thumb so the Live TV hero can show the show's
+                    // description and poster, not just the title.
+                    std::string progSummary = jsonFieldString(metaObj, "\"summary\"");
+                    std::string_view progThumbV = jsonFieldView(metaObj, "\"thumb\"");
+                    if (progThumbV.empty()) progThumbV = jsonFieldView(metaObj, "\"grandparentThumb\"");
+                    if (progThumbV.empty()) progThumbV = jsonFieldView(metaObj, "\"parentThumb\"");
+                    if (progThumbV.empty()) progThumbV = jsonFieldView(metaObj, "\"art\"");
+                    std::string progThumb = jsonUnescape(progThumbV);
+
+                    // Parse Media array for channel + timing info
+                    size_t mediaPos = metaObj.find("\"Media\"");
+                    if (mediaPos == std::string_view::npos) continue;
+
+                    size_t mediaArrayStart = metaObj.find('[', mediaPos);
+                    if (mediaArrayStart == std::string_view::npos) continue;
+
+                    size_t mPos = mediaArrayStart + 1;
+                    while (mPos < metaObj.size()) {
+                        size_t mObjStart = metaObj.find('{', mPos);
+                        if (mObjStart == std::string_view::npos || mObjStart >= metaObj.size()) break;
+
+                        int mBraceCount = 1;
+                        size_t mObjEnd = mObjStart + 1;
+                        while (mBraceCount > 0 && mObjEnd < metaObj.size()) {
+                            if (metaObj[mObjEnd] == '{') mBraceCount++;
+                            else if (metaObj[mObjEnd] == '}') mBraceCount--;
+                            mObjEnd++;
+                        }
+                        std::string_view mediaObj = metaObj.substr(mObjStart, mObjEnd - mObjStart);
+                        mPos = mObjEnd;
+
+                        std::string_view beginsAtStr = jsonFieldView(mediaObj, "\"beginsAt\"");
+                        std::string_view endsAtStr = jsonFieldView(mediaObj, "\"endsAt\"");
+                        if (beginsAtStr.empty() || endsAtStr.empty()) continue;
+
+                        int64_t progStart = svToInt64(beginsAtStr);
+                        int64_t progEnd = svToInt64(endsAtStr);
+
+                        if (progEnd < (int64_t)now) continue;
+
+                        // Match to channel list using callSign, channelIdentifier, VCN, or key
+                        std::string_view chanCallSign = jsonFieldView(mediaObj, "\"channelCallSign\"");
+                        std::string_view chanId = jsonFieldView(mediaObj, "\"channelIdentifier\"");
+                        std::string_view chanVcn = jsonFieldView(mediaObj, "\"channelVcn\"");
+                        std::string_view chanTitle = jsonFieldView(mediaObj, "\"channelTitle\"");
+                        std::string_view chanShortTitle = jsonFieldView(mediaObj, "\"channelShortTitle\"");
+
+                        for (auto& channel : channelsWithPrograms) {
+                            bool matched = false;
+
+                            // Match by channelIdentifier == channel.key
+                            if (!matched && !chanId.empty() && !channel.key.empty()) {
+                                if (jsonFieldEquals(chanId, channel.key)) matched = true;
+                            }
+
+                            // Match by VCN == channelIdentifier
+                            if (!matched && !chanVcn.empty() && !channel.channelIdentifier.empty()) {
+                                if (jsonFieldEquals(chanVcn, channel.channelIdentifier)) matched = true;
+                            }
+
+                            // Match by exact callSign
+                            if (!matched && !chanCallSign.empty() && !channel.callSign.empty()) {
+                                if (jsonFieldEquals(chanCallSign, channel.callSign)) matched = true;
+                            }
+
+                            // Match by channel title
+                            if (!matched && !channel.title.empty()) {
+                                if ((!chanShortTitle.empty() && jsonFieldEquals(chanShortTitle, channel.title)) ||
+                                    (!chanTitle.empty() && jsonFieldEquals(chanTitle, channel.title))) {
+                                    matched = true;
+                                }
+                            }
+
+                            if (matched) {
+                                ChannelProgram prog;
+                                prog.title = displayTitle;
+                                prog.startTime = progStart;
+                                prog.endTime = progEnd;
+                                prog.ratingKey = progRatingKey;
+                                prog.metadataKey = progMetadataKey;
+                                prog.summary = progSummary;
+                                prog.thumb = progThumb;
+
+                                // Avoid duplicate programs
+                                bool duplicate = false;
+                                for (const auto& existing : channel.programs) {
+                                    if (existing.startTime == progStart && existing.title == displayTitle) {
+                                        duplicate = true;
+                                        break;
+                                    }
+                                }
+                                if (!duplicate) {
+                                    channel.programs.push_back(prog);
+                                    gotProgramData = true;
+                                }
+
+                                // Populate current/next program fields
+                                if (progStart <= (int64_t)now && progEnd > (int64_t)now) {
+                                    if (channel.currentProgram.empty()) {
+                                        channel.currentProgram = displayTitle;
+                                        channel.programStart = progStart;
+                                        channel.programEnd = progEnd;
+                                    }
+                                } else if (progStart >= (int64_t)now) {
+                                    if (channel.nextProgram.empty()) {
+                                        channel.nextProgram = displayTitle;
+                                    }
+                                }
+                                break;
+                            }
+                        }
+
+                        size_t nextComma = metaObj.find_first_of(",]", mPos);
+                        if (nextComma != std::string::npos && metaObj[nextComma] == ']') break;
+                    }
+                }
+            } else {
+                brls::Logger::debug("fetchEPGGrid: Grid endpoint returned {} for type={}",
+                                    resp.statusCode, gridType);
+            }
+
+            if (gridType < 0) {
+                int progs = 0;
+                for (const auto& ch : channelsWithPrograms) progs += (int)ch.programs.size();
+                // "Enough" = a few programs per channel on average; then the
+                // type-filtered and per-channel sweeps add nothing but time.
+                if (progs >= (int)channelsWithPrograms.size() * 3) {
+                    skipPerChannel = true;
+                    brls::Logger::info(
+                        "LTVPROF type-less grid: {} programs in ONE request — skipping type + per-channel queries",
+                        progs);
+                    break;
+                }
+                brls::Logger::info(
+                    "LTVPROF type-less grid: only {} programs — falling back to type + per-channel queries",
+                    progs);
+            }
+        }
+    }
+
+    // Per-channel grid. Mirrors what the official Plex apps do — they
+    // skip the type-filtered grid entirely and just query each channel's
+    // grid for the day:
+    //   GET /{provider}/grid?channelGridKey=<key>&date=YYYY-MM-DD
+    // which returns *every* airing for that channel regardless of EPG
+    // type. The type-filtered loop above only catches movies (1) and
+    // episodes (4); sports, news, and talk-shows tagged with other
+    // types would otherwise show up empty. Running this for every
+    // channel ensures parity with the official app.
+    if (!skipPerChannel && !m_epgProviderKey.empty()) {
+        // Build the list of calendar dates the lookahead window spans.
+        // The per-channel grid is keyed by `date=YYYY-MM-DD`, so a 12h
+        // window starting after noon will need both today *and*
+        // tomorrow to cover the whole range; querying only today drops
+        // everything past midnight.
+        auto formatLocalDate = [](time_t t) {
+            struct tm* lt = localtime(&t);
+            char buf[16];
+            strftime(buf, sizeof(buf), "%Y-%m-%d", lt);
+            return std::string(buf);
+        };
+        std::vector<std::string> dates;
+        {
+            std::string lastDate;
+            for (time_t t = (time_t)now; t <= (time_t)endTime; t += 12 * 3600) {
+                std::string d = formatLocalDate(t);
+                if (d != lastDate) { dates.push_back(d); lastDate = d; }
+            }
+            std::string endDate = formatLocalDate((time_t)endTime);
+            if (dates.empty() || dates.back() != endDate) dates.push_back(endDate);
+        }
+
+        for (auto& channel : channelsWithPrograms) {
+            if (channel.key.empty()) continue;
+
+            for (const std::string& date : dates) {
+                std::string url = buildApiUrl("/" + m_epgProviderKey + "/grid");
+                url += "&channelGridKey=" + HttpClient::urlEncode(channel.key);
+                url += "&date=" + date;
+                req.url = url;
+                const int64_t profReq0 = brls::getCPUTimeUsec();
+                HttpResponse resp = client.request(req);
+                profHttpUs += brls::getCPUTimeUsec() - profReq0;
+                profReqs++;
+                if (resp.statusCode != 200 || resp.body.empty()) continue;
+
+            size_t metaArrayPos = resp.body.find("\"Metadata\"");
+            if (metaArrayPos == std::string::npos) continue;
+            size_t arrayStart = resp.body.find('[', metaArrayPos);
+            if (arrayStart == std::string::npos) continue;
+
+            // Zero-copy scan, same as the type-less grid path above.
+            const std::string_view body(resp.body);
+
+            size_t pos = arrayStart + 1;
+            while (pos < body.size()) {
+                while (pos < body.size() && (body[pos] == ' ' || body[pos] == ',' ||
+                       body[pos] == '\n' || body[pos] == '\r' || body[pos] == '\t')) {
+                    pos++;
+                }
+                if (pos >= body.size() || body[pos] == ']') break;
+                if (body[pos] != '{') { pos++; continue; }
+
+                size_t objStart = pos;
+                int braceCount = 1;
+                pos++;
+                while (braceCount > 0 && pos < body.size()) {
+                    if (body[pos] == '{') braceCount++;
+                    else if (body[pos] == '}') braceCount--;
+                    pos++;
+                }
+                std::string_view metaObj = body.substr(objStart, pos - objStart);
+
+                std::string_view progTitle = jsonFieldView(metaObj, "\"title\"");
+                if (progTitle.empty()) continue;
+                std::string_view grandparentTitle = jsonFieldView(metaObj, "\"grandparentTitle\"");
+                std::string displayTitle = (!grandparentTitle.empty())
+                    ? jsonUnescape(grandparentTitle) + ": " + jsonUnescape(progTitle)
+                    : jsonUnescape(progTitle);
+
+                std::string progRatingKey = jsonFieldString(metaObj, "\"ratingKey\"");
+                std::string progMetadataKey = jsonFieldString(metaObj, "\"key\"");
+                std::string progSummary = jsonFieldString(metaObj, "\"summary\"");
+                std::string_view progThumbV = jsonFieldView(metaObj, "\"thumb\"");
+                if (progThumbV.empty()) progThumbV = jsonFieldView(metaObj, "\"grandparentThumb\"");
+                if (progThumbV.empty()) progThumbV = jsonFieldView(metaObj, "\"parentThumb\"");
+                if (progThumbV.empty()) progThumbV = jsonFieldView(metaObj, "\"art\"");
+                std::string progThumb = jsonUnescape(progThumbV);
+
+                size_t mediaPos = metaObj.find("\"Media\"");
+                if (mediaPos == std::string_view::npos) continue;
+                size_t mediaArrayStart = metaObj.find('[', mediaPos);
+                if (mediaArrayStart == std::string_view::npos) continue;
+
+                size_t mPos = mediaArrayStart + 1;
+                while (mPos < metaObj.size()) {
+                    size_t mObjStart = metaObj.find('{', mPos);
+                    if (mObjStart == std::string_view::npos || mObjStart >= metaObj.size()) break;
+
+                    int mBraceCount = 1;
+                    size_t mObjEnd = mObjStart + 1;
+                    while (mBraceCount > 0 && mObjEnd < metaObj.size()) {
+                        if (metaObj[mObjEnd] == '{') mBraceCount++;
+                        else if (metaObj[mObjEnd] == '}') mBraceCount--;
+                        mObjEnd++;
+                    }
+                    std::string_view mediaObj = metaObj.substr(mObjStart, mObjEnd - mObjStart);
+                    mPos = mObjEnd;
+
+                    std::string_view beginsAtStr = jsonFieldView(mediaObj, "\"beginsAt\"");
+                    std::string_view endsAtStr   = jsonFieldView(mediaObj, "\"endsAt\"");
+                    if (beginsAtStr.empty() || endsAtStr.empty()) continue;
+
+                    int64_t progStart = svToInt64(beginsAtStr);
+                    int64_t progEnd   = svToInt64(endsAtStr);
+                    if (progEnd < (int64_t)now) continue;
+
+                    // Channel is fixed by the channelGridKey query, so no cross-matching needed.
+                    bool duplicate = false;
+                    for (const auto& existing : channel.programs) {
+                        if (existing.startTime == progStart && existing.title == displayTitle) {
+                            duplicate = true; break;
+                        }
+                    }
+                    if (!duplicate) {
+                        ChannelProgram prog;
+                        prog.title       = displayTitle;
+                        prog.startTime   = progStart;
+                        prog.endTime     = progEnd;
+                        prog.ratingKey   = progRatingKey;
+                        prog.metadataKey = progMetadataKey;
+                        prog.summary     = progSummary;
+                        prog.thumb       = progThumb;
+                        channel.programs.push_back(prog);
+                        gotProgramData = true;
+                    }
+
+                    if (progStart <= (int64_t)now && progEnd > (int64_t)now) {
+                        if (channel.currentProgram.empty()) {
+                            channel.currentProgram = displayTitle;
+                            channel.programStart   = progStart;
+                            channel.programEnd     = progEnd;
+                        }
+                    } else if (progStart >= (int64_t)now) {
+                        if (channel.nextProgram.empty()) channel.nextProgram = displayTitle;
+                    }
+
+                    size_t nextComma = metaObj.find_first_of(",]", mPos);
+                    if (nextComma != std::string::npos && metaObj[nextComma] == ']') break;
+                }
+            }
+            }  // per-date loop
+        }
+    }
+
+    // Sort each channel's programs by start time
+    int programCount = 0;
+    for (auto& ch : channelsWithPrograms) {
+        if (!ch.programs.empty()) {
+            std::sort(ch.programs.begin(), ch.programs.end(),
+                      [](const ChannelProgram& a, const ChannelProgram& b) {
+                          return a.startTime < b.startTime;
+                      });
+            programCount++;
+        }
+    }
+    brls::Logger::info("fetchEPGGrid: Got {} channels, {} with program info", channelsWithPrograms.size(), programCount);
+    {
+        int totalPrograms = 0;
+        for (const auto& ch : channelsWithPrograms) totalPrograms += (int)ch.programs.size();
+        const int64_t totalUs = brls::getCPUTimeUsec() - profT0;
+        // parse/other = JSON scanning, channel matching, dedup and sorting —
+        // everything not spent waiting on the network. The dominant term
+        // tells us whether guide loading is network-bound (many sequential
+        // per-channel grid requests) or CPU-bound (string parsing).
+        brls::Logger::info(
+            "LTVPROF fetchEPGGrid total={}ms | grid http={}ms across {} reqs | parse/other={}ms | {} programs",
+            totalUs / 1000, profHttpUs / 1000, profReqs,
+            (totalUs - profHttpUs - profChanUs - profDvrUs) / 1000, totalPrograms);
+    }
+    return !channelsWithPrograms.empty();
+}
+
+// ── Live TV discovery rails ────────────────────────────────────────────
+// The server computes these itself (see LiveTVHub). We were synthesising a
+// "recent channels" list from the EPG grid instead, which was really just
+// the first N channels of the lineup in lineup order.
+
+// Walk the objects of the JSON array introduced by `arrayKey` and hand
+// each object's slice to fn. Shared by every hub walker below.
+//
+// String-aware on purpose: counting braces without tracking string
+// literals means a single '{' inside a title or summary ends the walk
+// early and silently drops every entry after it, and a single '}' closes
+// an entry early so its remaining fields read back empty. Programme
+// metadata is free text from the EPG provider, so both do occur.
+template <typename Fn>
+static void forEachJsonObject(std::string_view body, std::string_view arrayKey, Fn fn) {
+    size_t arrPos = body.find(arrayKey);
+    if (arrPos == std::string_view::npos) return;
+    size_t pos = body.find('[', arrPos);
+    if (pos == std::string_view::npos) return;
+
+    pos++;
+    while (pos < body.size()) {
+        // Between entries there is only whitespace and commas, so this scan needs no string tracking of its own.
+        while (pos < body.size() && body[pos] != '{' && body[pos] != ']') pos++;
+        if (pos >= body.size() || body[pos] == ']') break;
+
+        size_t objStart = pos;
+        int depth = 0;
+        bool inString = false;
+        for (; pos < body.size(); pos++) {
+            const char c = body[pos];
+            if (inString) {
+                if (c == '\\') { pos++; continue; }   // skip the escaped char
+                if (c == '"') inString = false;
+                continue;
+            }
+            if (c == '"') { inString = true; continue; }
+            if (c == '{') depth++;
+            else if (c == '}' && --depth == 0) { pos++; break; }
+        }
+        fn(body.substr(objStart, pos - objStart));
+    }
+}
+
+static std::string lowerOf(std::string_view s) {
+    std::string out;
+    out.reserve(s.size());
+    for (char c : s) out += (char)tolower((unsigned char)c);
+    return out;
+}
+
+// One MediaContainer.Directory[] entry of the Recent Channels hub ->
+// LiveTVChannel. This rail is channel-first: each entry IS a channel
+// (key, title, callSign, thumb, channelVcn) carrying a single Metadata
+// OBJECT for the programme currently on it. That is the opposite of the
+// programme-first shape the other Live TV hubs use (a Metadata ARRAY
+// whose channel fields are nested in Media[]), and walking it as if it
+// were programme-first lands on the first channel's Media[] — one entry,
+// always the same one, however many channels the rail holds.
+static LiveTVChannel parseRecentChannelDirectory(std::string_view dir) {
+    LiveTVChannel ch;
+    ch.key               = jsonFieldString(dir, "\"key\"");
+    ch.title             = jsonFieldString(dir, "\"title\"");
+    ch.callSign          = jsonFieldString(dir, "\"callSign\"");
+    ch.channelIdentifier = jsonFieldString(dir, "\"channelVcn\"");
+    if (ch.channelIdentifier.empty())
+        ch.channelIdentifier = jsonFieldString(dir, "\"identifier\"");
+    ch.thumb             = jsonFieldString(dir, "\"thumb\"");
+
+    // Read the programme from the nested object's own slice, so the
+    // channel's title and key can't shadow the programme's.
+    const size_t metaPos = dir.find("\"Metadata\"");
+    if (metaPos != std::string_view::npos) {
+        const std::string_view meta = dir.substr(metaPos);
+        ch.ratingKey      = jsonFieldString(meta, "\"ratingKey\"");
+        ch.currentProgram = jsonFieldString(meta, "\"grandparentTitle\"");
+        if (ch.currentProgram.empty())
+            ch.currentProgram = jsonFieldString(meta, "\"title\"");
+        // Airing window of whatever is on the channel now, from Media[].
+        ch.programStart   = svToInt64(jsonFieldView(meta, "\"beginsAt\""));
+        ch.programEnd     = svToInt64(jsonFieldView(meta, "\"endsAt\""));
+    }
+    return ch;
+}
+
+// One Metadata entry of a programme-first hub -> LiveTVChannel. The
+// channel fields sit in Media[]; channelIdentifier is the same value as
+// LiveTVChannel::key, which is what tuneChannel() resolves first.
+static LiveTVChannel parseLiveTVChannelEntry(std::string_view item) {
+    LiveTVChannel ch;
+    ch.ratingKey         = jsonFieldString(item, "\"ratingKey\"");
+    ch.key               = jsonFieldString(item, "\"channelIdentifier\"");
+    ch.callSign          = jsonFieldString(item, "\"channelCallSign\"");
+    ch.channelIdentifier = jsonFieldString(item, "\"channelVcn\"");
+    ch.title             = jsonFieldString(item, "\"channelTitle\"");
+    if (ch.title.empty()) ch.title = jsonFieldString(item, "\"channelShortTitle\"");
+    ch.thumb = jsonFieldString(item, "\"channelThumb\"");
+    if (ch.thumb.empty()) ch.thumb = jsonFieldString(item, "\"thumb\"");
+
+    // Programme currently on that channel — the rail's caption.
+    ch.currentProgram = jsonFieldString(item, "\"grandparentTitle\"");
+    if (ch.currentProgram.empty())
+        ch.currentProgram = jsonFieldString(item, "\"title\"");
+    if (ch.title.empty()) ch.title = ch.currentProgram;
+    return ch;
+}
+
+// Fill channels from a Recent Channels payload, whichever shape it
+// arrives in: channel-first Directory[] as this server sends it, falling
+// back to the programme-first Metadata[] the spec's watchnow example
+// documents.
+static void collectRecentChannels(std::string_view body, std::vector<LiveTVChannel>& out) {
+    forEachJsonObject(body, "\"Directory\"", [&out](std::string_view dir) {
+        LiveTVChannel ch = parseRecentChannelDirectory(dir);
+        if (!ch.key.empty()) out.push_back(std::move(ch));
+    });
+    if (!out.empty()) return;
+
+    forEachJsonObject(body, "\"Metadata\"", [&out](std::string_view item) {
+        LiveTVChannel ch = parseLiveTVChannelEntry(item);
+        if (!ch.key.empty() || !ch.channelIdentifier.empty() || !ch.title.empty())
+            out.push_back(std::move(ch));
+    });
+}
+
+// Collect {title, key, type} from the objects of a named array. Shared by
+// the watchnow response (MediaContainer.Type[]) and a provider's hub
+// response (MediaContainer.Hub[]) — both are arrays of objects carrying a
+// title and a ready-to-fetch key.
+static void collectLiveTVHubs(std::string_view body, std::string_view arrayKey,
+                              std::vector<LiveTVHub>& out) {
+    forEachJsonObject(body, arrayKey, [&out](std::string_view obj) {
+        LiveTVHub h;
+        h.title = jsonFieldString(obj, "\"title\"");
+        h.key   = jsonFieldString(obj, "\"key\"");
+        h.type  = jsonFieldString(obj, "\"type\"");
+        if (!h.title.empty() && !h.key.empty()) out.push_back(std::move(h));
+    });
+}
+
+bool PlexClient::fetchLiveTVWatchNowHubs(std::vector<LiveTVHub>& hubs) {
+    hubs.clear();
+    if (m_epgProviderKey.empty()) checkLiveTVAvailability();
+    if (m_epgProviderKey.empty()) return false;
+
+    HttpClient client;
+    HttpRequest req;
+    req.url = buildApiUrl("/" + m_epgProviderKey + "/watchnow");
+    req.method = "GET";
+    req.headers["Accept"] = "application/json";
+    req.timeout = 15;
+
+    HttpResponse resp = client.request(req);
+    if (resp.statusCode != 200 || resp.body.empty()) {
+        brls::Logger::debug("fetchLiveTVWatchNowHubs: HTTP {}", resp.statusCode);
+        return false;
+    }
+
+    collectLiveTVHubs(resp.body, "\"Type\"", hubs);
+    brls::Logger::info("fetchLiveTVWatchNowHubs: {} rails", hubs.size());
+    return !hubs.empty();
+}
+
+bool PlexClient::fetchLiveTVProviderHubs(std::vector<LiveTVHub>& hubs) {
+    hubs.clear();
+    if (m_epgProviderKey.empty()) checkLiveTVAvailability();
+    if (m_epgProviderKey.empty()) return false;
+
+    HttpClient client;
+    HttpRequest req;
+    req.method = "GET";
+    req.headers["Accept"] = "application/json";
+    req.timeout = 15;
+
+    // The DVR provider advertises its discovery hubs as
+    //   "hubKey": "/{epgProviderKey}/hubs/discover"
+    // on its content directory (see the Live TV & DVR provider block in
+    // the /media/providers example in openapi.json), so the path follows
+    // from the provider key and needs no extra lookup round trip.
+    const std::string hubKey = "/" + m_epgProviderKey + "/hubs/discover";
+    req.url = buildApiUrl(hubKey);
+    HttpResponse resp = client.request(req);
+    if (resp.statusCode != 200 || resp.body.empty()) {
+        brls::Logger::debug("fetchLiveTVProviderHubs: {} HTTP {}", hubKey, resp.statusCode);
+        return false;
+    }
+
+    collectLiveTVHubs(resp.body, "\"Hub\"", hubs);
+    brls::Logger::info("fetchLiveTVProviderHubs: {} hubs from {}", hubs.size(), hubKey);
+    return !hubs.empty();
+}
+
+bool PlexClient::fetchLiveTVHomeRails(LiveTVHomeRails& rails) {
+    std::vector<LiveTVChannel>& channels    = rails.recentChannels;
+    std::vector<MediaItem>*     showsOnNow  = &rails.showsOnNow;
+    std::vector<MediaItem>*     moviesOnNow = &rails.moviesOnNow;
+    std::vector<MediaItem>*     sportsOnNow = &rails.sportsOnNow;
+    channels.clear();
+    showsOnNow->clear();
+    moviesOnNow->clear();
+    sportsOnNow->clear();
+    if (m_epgProviderKey.empty()) checkLiveTVAvailability();
+    if (m_epgProviderKey.empty()) return false;
+
+    // The query string is the whole trick here. A bare /hubs/discover
+    // returns the programme rails only — Recent Channels is opt-in behind
+    // includeRecentChannels=1, which is why our earlier attempts came back
+    // with everything except the one hub we wanted. This is the request
+    // the official web client makes, taken verbatim from the server's own
+    // access log, so the response shape matches what that client renders.
+    const std::string dir = HttpClient::urlEncode(m_epgProviderKey);
+    const std::string path =
+        "/" + m_epgProviderKey + "/hubs/discover"
+        "?promoted=1&includeTypeFirst=1"
+        "&contentDirectoryID=" + dir +
+        "&pinnedContentDirectoryID=" + dir +
+        "&includeMeta=1&excludeFields=summary&count=12"
+        "&includeStations=1&includeLibraryPlaylists=1"
+        "&includeRecentChannels=1&excludeContinueWatching=1";
+
+    HttpClient client;
+    HttpRequest req;
+    req.url = buildApiUrl(path);
+    req.method = "GET";
+    req.headers["Accept"] = "application/json";
+    req.timeout = 20;
+
+    HttpResponse resp = client.request(req);
+    if (resp.statusCode != 200 || resp.body.empty()) {
+        brls::Logger::debug("fetchLiveTVHomeRails: HTTP {}", resp.statusCode);
+        return false;
+    }
+
+    // Plex hub responses carry each hub's Metadata inline, so one pass over
+    // MediaContainer.Hub[] fills all three Home rails: the channels the
+    // account actually watched, and the shows and movies on now beside them.
+    std::vector<std::string> seenTitles;
+    std::string recentKey;
+    int  recentSize  = 0;
+    int  recentTotal = 0;
+    bool recentMore  = false;
+    std::string showsKey,  moviesKey,  sportsKey;
+    bool        showsMore = false, moviesMore = false, sportsMore = false;
+
+    auto collectItems = [this](std::string_view hub, std::vector<MediaItem>& out) {
+        forEachJsonObject(hub, "\"Metadata\"", [&](std::string_view item) {
+            MediaItem mi = parseLiveTVHubItem(item);
+            if (!mi.ratingKey.empty() && !mi.title.empty()) out.push_back(std::move(mi));
+        });
+    };
+
+    forEachJsonObject(resp.body, "\"Hub\"", [&](std::string_view hub) {
+        const std::string title = lowerOf(jsonFieldString(hub, "\"title\""));
+        const std::string key   = lowerOf(jsonFieldString(hub, "\"key\""));
+        seenTitles.push_back(title);
+
+        // Every "… On Now" rail satisfies the generic on-now test, so a hub
+        // has to be classified before any one rail claims it — otherwise
+        // whichever is checked first swallows the others.
+        const bool isOnNow  = title.find("on now") != std::string::npos ||
+                              key.find("onnow") != std::string::npos;
+        const bool isMovies = title.find("movie") != std::string::npos ||
+                              key.find("onnow/movies") != std::string::npos;
+        const bool isSports = title.find("sport") != std::string::npos ||
+                              key.find("onnow/sports") != std::string::npos;
+
+        if (channels.empty() &&
+            title.find("recent") != std::string::npos &&
+            title.find("channel") != std::string::npos) {
+            // Hub.key is documented as "the key at which all of the
+            // content for this hub can be retrieved"; Hub.more says the
+            // hub holds more than this response carries. Hub.size counts
+            // what this response actually carries, so parsing fewer than
+            // size entries means we dropped some, not that the server
+            // withheld them.
+            recentKey   = jsonFieldString(hub, "\"key\"");
+            recentSize  = (int)svToInt64(jsonFieldView(hub, "\"size\""));
+            recentTotal = (int)svToInt64(jsonFieldView(hub, "\"totalSize\""));
+            recentMore  = jsonFieldView(hub, "\"more\"") == "true";
+            collectRecentChannels(hub, channels);
+            brls::Logger::debug("fetchLiveTVHomeRails: hub '{}' key={} size={} totalSize={} "
+                                "more={} parsed={}",
+                                jsonFieldView(hub, "\"title\""), recentKey, recentSize,
+                                recentTotal, recentMore, channels.size());
+        } else if (isOnNow) {
+            std::vector<MediaItem>* rail = showsOnNow;   // shows is the catch-all
+            std::string*            key  = &showsKey;
+            bool*                   more = &showsMore;
+            if (isMovies)      { rail = moviesOnNow; key = &moviesKey; more = &moviesMore; }
+            else if (isSports) { rail = sportsOnNow; key = &sportsKey; more = &sportsMore; }
+
+            if (rail->empty()) {
+                *key  = jsonFieldString(hub, "\"key\"");
+                *more = jsonFieldView(hub, "\"more\"") == "true";
+                collectItems(hub, *rail);
+            }
+        }
+    });
+
+    // /hubs/discover inlines a preview of each hub, not necessarily the
+    // whole rail — which is why the official client follows a hub's own
+    // key right after discover (its /hubs/onnow/shows request in the
+    // server log is exactly that). Do the same when the hub reports more
+    // than this response carried, and keep the inline set if the refetch
+    // doesn't do better.
+    const int recentWant = recentTotal > recentSize ? recentTotal : recentSize;
+    if (!recentKey.empty() && (recentMore || (int)channels.size() < recentWant)) {
+        HttpRequest hubReq;
+        hubReq.url = buildApiUrl(recentKey);
+        hubReq.method = "GET";
+        hubReq.headers["Accept"] = "application/json";
+        hubReq.timeout = 20;
+
+        std::vector<LiveTVChannel> full;
+        HttpResponse hubResp = client.request(hubReq);
+        if (hubResp.statusCode == 200 && !hubResp.body.empty())
+            collectRecentChannels(hubResp.body, full);
+
+        brls::Logger::debug("fetchLiveTVHomeRails: refetched {} -> HTTP {}, container size={}, "
+                            "{} parsed",
+                            recentKey, hubResp.statusCode,
+                            svToInt64(jsonFieldView(hubResp.body, "\"size\"")), full.size());
+        if (full.size() > channels.size()) channels = std::move(full);
+    }
+
+    // count=12 above caps every hub in the discover response, so each On Now
+    // rail arrives as a preview of what is actually broadcasting. Follow the
+    // hub's own key for the whole rail — the same second request the official
+    // client makes right after discover. Keep the preview if the refetch
+    // doesn't do better, so a failure never empties a rail.
+    auto fillRail = [this](const char* what, const std::string& key, bool more,
+                           std::vector<MediaItem>& rail) {
+        if (key.empty() || !more) return;
+        std::vector<MediaItem> everything;
+        fetchLiveTVHubItems(key, everything);
+        brls::Logger::debug("fetchLiveTVHomeRails: {} rail {} preview={} full={}",
+                            what, key, rail.size(), everything.size());
+        if (everything.size() > rail.size()) rail = std::move(everything);
+    };
+    fillRail("shows-on-now",  showsKey,  showsMore,  *showsOnNow);
+    fillRail("movies-on-now", moviesKey, moviesMore, *moviesOnNow);
+    fillRail("sports-on-now", sportsKey, sportsMore, *sportsOnNow);
+
+    // promoted=1 returns only the hubs the provider promotes, which on some
+    // servers is just Recent Channels and Shows On Now. The rest of the
+    // "… On Now" family is enumerated by /watchnow, whose Type[] entries are
+    // ready-to-fetch section queries. Ask for it only when a rail is
+    // actually missing, so a provider that promotes everything pays nothing,
+    // and dropping promoted=1 (14 rails inlined at 12 items each) stays off
+    // the table for the handhelds.
+    if (showsOnNow->empty() || moviesOnNow->empty() || sportsOnNow->empty()) {
+        std::vector<LiveTVHub> watchNow;
+        if (fetchLiveTVWatchNowHubs(watchNow)) {
+            for (const auto& h : watchNow) {
+                const std::string t = lowerOf(h.title);
+                // "All Channels" is a browse view, not an on-now rail.
+                if (t.find("on now") == std::string::npos) continue;
+
+                std::vector<MediaItem>* rail = nullptr;
+                if (t.find("movie") != std::string::npos)      rail = moviesOnNow;
+                else if (t.find("sport") != std::string::npos) rail = sportsOnNow;
+                else                                           rail = showsOnNow;
+
+                if (rail->empty()) fetchLiveTVHubItems(h.key, *rail);
+            }
+        }
+    }
+
+    // Which rails this provider actually serves. Lineups differ by region
+    // and provider, so this is the only way to know what a given server
+    // offers beyond the three Home renders — and it explains a missing
+    // rail without a second round trip.
+    {
+        std::string offered;
+        for (const auto& t : seenTitles) {
+            if (!offered.empty()) offered += ", ";
+            offered += t;
+        }
+        brls::Logger::debug("fetchLiveTVHomeRails: provider offers {} rails: {}",
+                            seenTitles.size(), offered);
+    }
+
+    brls::Logger::info("fetchLiveTVHomeRails: {} channels, {} shows, {} movies, {} sports on now",
+                       channels.size(), showsOnNow->size(), moviesOnNow->size(),
+                       sportsOnNow->size());
+    return !channels.empty() || !showsOnNow->empty() ||
+           !moviesOnNow->empty() || !sportsOnNow->empty();
+}
+
+MediaItem PlexClient::parseLiveTVHubItem(std::string_view obj) {
+    MediaItem item;
+    item.ratingKey   = jsonFieldString(obj, "\"ratingKey\"");
+    item.key         = jsonFieldString(obj, "\"key\"");
+    item.title       = jsonFieldString(obj, "\"title\"");
+    item.summary     = jsonFieldString(obj, "\"summary\"");
+    item.thumb       = jsonFieldString(obj, "\"thumb\"");
+    if (item.thumb.empty()) item.thumb = jsonFieldString(obj, "\"grandparentThumb\"");
+    item.art         = jsonFieldString(obj, "\"art\"");
+    item.type        = jsonFieldString(obj, "\"type\"");
+    item.mediaType   = parseMediaType(item.type);
+    item.year        = (int)svToInt64(jsonFieldView(obj, "\"year\""));
+    item.duration    = (int)svToInt64(jsonFieldView(obj, "\"duration\""));
+    item.viewOffset  = (int)svToInt64(jsonFieldView(obj, "\"viewOffset\""));
+    item.index       = (int)svToInt64(jsonFieldView(obj, "\"index\""));
+    item.parentIndex = (int)svToInt64(jsonFieldView(obj, "\"parentIndex\""));
+    // Airing window, nested in Media[]. The provider sends these as bare
+    // numbers on some endpoints and quoted strings on others; jsonFieldView
+    // hands back the digits either way.
+    item.airStartAt  = svToInt64(jsonFieldView(obj, "\"beginsAt\""));
+    item.airEndAt    = svToInt64(jsonFieldView(obj, "\"endsAt\""));
+    item.liveChannelKey   = jsonFieldString(obj, "\"channelIdentifier\"");
+    item.liveChannelTitle = jsonFieldString(obj, "\"channelTitle\"");
+    item.isLiveTV = true;
+    // The show's poster, kept separate from the episode still so a rail
+    // can render either shape (see MediaItemCell::setPreferPoster).
+    item.grandparentThumb = jsonFieldString(obj, "\"grandparentThumb\"");
+    // Live TV entries title themselves by episode ("Ick, A Bod") while
+    // the show name sits on grandparentTitle ("Elsbeth"). The official
+    // client's rails lead with the show, so promote it and keep the
+    // episode title alongside.
+    item.grandparentTitle = jsonFieldString(obj, "\"grandparentTitle\"");
+    if (!item.grandparentTitle.empty()) {
+        item.parentTitle = item.title;
+        item.title = item.grandparentTitle;
+    }
+    return item;
+}
+
+bool PlexClient::searchLiveTV(const std::string& query, std::vector<MediaItem>& results) {
+    results.clear();
+    // Deliberately no checkLiveTVAvailability() here: search fires on every
+    // keystroke, and forcing the DVR probe would make every server without
+    // Live TV pay for one per character. Home and the sidebar establish the
+    // provider key soon after launch; until then Live TV is simply absent
+    // from results.
+    if (m_epgProviderKey.empty() || query.empty()) return false;
+
+    HttpClient client;
+    HttpRequest req;
+    req.url = buildApiUrl("/" + m_epgProviderKey + "/hubs/search?query=" +
+                          HttpClient::urlEncode(query) + "&limit=25");
+    req.method = "GET";
+    req.headers["Accept"] = "application/json";
+    req.timeout = 15;
+
+    HttpResponse resp = client.request(req);
+    if (resp.statusCode != 200 || resp.body.empty()) {
+        brls::Logger::debug("searchLiveTV: HTTP {}", resp.statusCode);
+        return false;
+    }
+
+    // Same shape as the discovery rails: MediaContainer.Hub[], each with
+    // its Metadata inline. Programmes are what a search is for, so every
+    // hub's items are flattened into one list; the hub titles are logged
+    // so a provider returning something else is visible rather than
+    // silently dropped.
+    std::vector<std::string> hubTitles;
+    forEachJsonObject(resp.body, "\"Hub\"", [&](std::string_view hub) {
+        hubTitles.push_back(jsonFieldString(hub, "\"title\""));
+        forEachJsonObject(hub, "\"Metadata\"", [&](std::string_view obj) {
+            MediaItem item = parseLiveTVHubItem(obj);
+            if (!item.ratingKey.empty() && !item.title.empty())
+                results.push_back(std::move(item));
+        });
+    });
+
+    std::string offered;
+    for (const auto& t : hubTitles) {
+        if (!offered.empty()) offered += ", ";
+        offered += t;
+    }
+    brls::Logger::info("searchLiveTV: {} results for '{}' from hubs: {}",
+                       results.size(), query, offered);
+    return !results.empty();
+}
+
+bool PlexClient::fetchLiveTVHubItems(const std::string& key, std::vector<MediaItem>& items) {
+    items.clear();
+    if (key.empty()) return false;
+
+    HttpClient client;
+    HttpRequest req;
+    req.url = buildApiUrl(key);   // keys already carry their own query string
+    req.method = "GET";
+    req.headers["Accept"] = "application/json";
+    req.timeout = 20;
+
+    HttpResponse resp = client.request(req);
+    if (resp.statusCode != 200 || resp.body.empty()) {
+        brls::Logger::debug("fetchLiveTVHubItems: HTTP {} for {}", resp.statusCode, key);
+        return false;
+    }
+
+    const std::string_view body(resp.body);
+    size_t pos = 0;
+    while ((pos = resp.body.find("\"ratingKey\"", pos)) != std::string::npos) {
+        size_t objStart = resp.body.rfind('{', pos);
+        if (objStart == std::string::npos) break;
+
+        int depth = 1;
+        size_t objEnd = objStart + 1;
+        while (depth > 0 && objEnd < resp.body.size()) {
+            if (resp.body[objEnd] == '{') depth++;
+            else if (resp.body[objEnd] == '}') depth--;
+            objEnd++;
+        }
+        std::string_view obj = body.substr(objStart, objEnd - objStart);
+
+        MediaItem item = parseLiveTVHubItem(obj);
+        if (!item.ratingKey.empty() && !item.title.empty()) items.push_back(std::move(item));
+        pos = objEnd;
+    }
+
+    brls::Logger::info("fetchLiveTVHubItems: {} items from {}", items.size(), key);
+    return !items.empty();
+}
+
+bool PlexClient::tuneLiveTVChannel(const std::string& channelKey, std::string& streamUrl,
+                                   std::string& liveSessionUuid,
+                                   const std::string& programMetadataKey) {
+    liveSessionUuid.clear();
+    brls::Logger::info("tuneLiveTVChannel: channelKey={}, programMetadataKey={}", channelKey, programMetadataKey);
+
+    // Ensure we have DVR ID
+    if (m_dvrId.empty()) {
+        checkLiveTVAvailability();
+        if (m_dvrId.empty()) {
+            brls::Logger::error("tuneLiveTVChannel: No DVR ID available");
+            return false;
+        }
+    }
+
+    HttpClient client;
+
+    // Official API: POST /livetv/dvrs/{dvrId}/channels/{channel}/tune
+    // {channel} must be the full EPG channel key (<lineup>-<channelId>) that the
+    // device's channel map is keyed by; the VCN ("2.1") shown in the spec example
+    // is not recognized by the grabber and yields "device does not tune" errors.
+    // Returns Media with uuid (session ID) which can be used for HLS streaming
+    std::string tuneUrl = buildApiUrl("/livetv/dvrs/" + m_dvrId + "/channels/" + channelKey + "/tune");
+
+    HttpRequest tuneReq;
+    tuneReq.url = tuneUrl;
+    tuneReq.method = "POST";
+    tuneReq.headers["Accept"] = "application/json";
+    tuneReq.headers["X-Plex-Client-Identifier"] = PLEX_CLIENT_ID;
+    tuneReq.headers["X-Plex-Product"] = PLEX_CLIENT_NAME;
+    // Name the rolling-subscription session deterministically so the transcode
+    // decision (which passes the same X-Plex-Session-Identifier) resolves to
+    // this grab's consumer at /livetv/sessions/{uuid}/{sessionIdentifier}/...
+    tuneReq.headers["X-Plex-Session-Identifier"] = PLEX_CLIENT_ID;
+    // A successful tune starts a long-lived "rolling subscription": the server
+    // sends the MediaContainer (with the Media/session uuid we need) up front
+    // but then holds the chunked HTTP response open for the life of the
+    // recording (~5 min).  Reading to EOF therefore blocks until the request
+    // times out.  Stop as soon as the first complete top-level JSON object is
+    // received - that already contains everything we need.
+    tuneReq.stopAtJsonClose = true;
+    // Use longer timeout - tune can take time before it produces the metadata.
+    tuneReq.timeout = 30;
+
+    brls::Logger::debug("tuneLiveTVChannel: POST {}", tuneUrl);
+    HttpResponse tuneResp = client.request(tuneReq);
+
+    // programMetadataKey is no longer used for playback (the live session itself
+    // is the source); kept in the signature for callers. Reference it to avoid
+    // an unused-parameter warning.
+    (void)programMetadataKey;
+
+    std::string sessionUuid;
+    if (tuneResp.statusCode == 200 && !tuneResp.body.empty()) {
+        brls::Logger::debug("tuneLiveTVChannel: Tune response ({} bytes): {}",
+                            tuneResp.body.length(), tuneResp.body.substr(0, 500));
+
+        // Server returns 200 but with {"MediaContainer":{"status":-1,"message":"Could not tune..."}}
+        // when the tune genuinely fails (no tuner/antenna).
+        std::string tuneStatus = extractJsonValue(tuneResp.body, "status");
+        std::string tuneMessage = extractJsonValue(tuneResp.body, "message");
+        if (tuneStatus == "-1" || tuneResp.body.find("Could not tune") != std::string::npos) {
+            brls::Logger::warning("tuneLiveTVChannel: Server reported tune failure: {}", tuneMessage);
+            return false;
+        }
+
+        // The Media uuid is the live session id used as /livetv/sessions/{uuid}.
+        sessionUuid = extractJsonValue(tuneResp.body, "uuid");
+
+        // The first numeric ratingKey in the tune response is the live-session
+        // metadata item the server just created (e.g. "Added new metadata item
+        // (Live Session ...) with ID 17594"). /:/timeline needs this to
+        // resolve the playing item — without it the call 404s and the keep-
+        // alive never resets the rolling-subscription stop-grab timer.
+        // EPG/program ratingKeys are URL-encoded strings ("plex%3A%2F%2F..."),
+        // so we skip non-numeric matches when scanning.
+        m_lastLiveRatingKey.clear();
+        {
+            size_t scan = 0;
+            const std::string needle = "\"ratingKey\"";
+            while (true) {
+                size_t at = tuneResp.body.find(needle, scan);
+                if (at == std::string::npos) break;
+                size_t colon = tuneResp.body.find(':', at);
+                if (colon == std::string::npos) break;
+                size_t vs = tuneResp.body.find_first_not_of(" \t\n\r\"", colon + 1);
+                if (vs == std::string::npos) break;
+                if (tuneResp.body[vs] >= '0' && tuneResp.body[vs] <= '9') {
+                    size_t ve = vs;
+                    while (ve < tuneResp.body.length() &&
+                           tuneResp.body[ve] >= '0' && tuneResp.body[ve] <= '9') ve++;
+                    m_lastLiveRatingKey = tuneResp.body.substr(vs, ve - vs);
+                    break;
+                }
+                scan = at + needle.length();
+            }
+        }
+        brls::Logger::debug("tuneLiveTVChannel: live ratingKey = {}",
+                            m_lastLiveRatingKey.empty() ? "(none)" : m_lastLiveRatingKey);
+    } else if (tuneResp.statusCode == 0 || tuneResp.statusCode == -1) {
+        // Connection drop / partial read - try to recover the uuid if present.
+        brls::Logger::warning("tuneLiveTVChannel: Connection dropped (status {}), body so far ({} bytes): {}",
+                              tuneResp.statusCode, tuneResp.body.length(),
+                              tuneResp.body.empty() ? "(empty)" : tuneResp.body.substr(0, 300));
+        if (!tuneResp.body.empty()) {
+            sessionUuid = extractJsonValue(tuneResp.body, "uuid");
+        }
+    } else if (tuneResp.statusCode == 500) {
+        brls::Logger::error("tuneLiveTVChannel: Tune failed (500 - server error) for channel {}", channelKey);
+        return false;
+    } else {
+        brls::Logger::error("tuneLiveTVChannel: Tune returned {} for channel {}, body: {}",
+                            tuneResp.statusCode, channelKey,
+                            tuneResp.body.empty() ? "(empty)" : redactBodyForLog(tuneResp.body.substr(0, 200)));
+        return false;
+    }
+
+    if (sessionUuid.empty()) {
+        brls::Logger::error("tuneLiveTVChannel: No session UUID in tune response for channel {}", channelKey);
+        return false;
+    }
+
+    brls::Logger::info("tuneLiveTVChannel: Live session id = {}", sessionUuid);
+
+    // The raw tune session is mpeg2video; route it through transcode/universal
+    // (exactly as the official Plex app does) to get a playable h264 HLS URL.
+    if (buildLiveSessionStreamUrl(sessionUuid, streamUrl)) {
+        liveSessionUuid = sessionUuid;
+        return true;
+    }
+
+    brls::Logger::error("tuneLiveTVChannel: Failed to build stream URL for channel {}", channelKey);
+    return false;
+}
+
+bool PlexClient::buildLiveSessionStreamUrl(const std::string& liveSessionId, std::string& url) {
+    // Mirror the working video transcode flow (getTranscodeUrl) but feed the
+    // live tune session as the source path.  The official Plex app does the
+    // same: GET /video/:/transcode/universal/decision?path=/livetv/sessions/{id}
+    // followed by start.m3u8, then plays the universal session segments.
+    AppSettings& settings = Application::getInstance().getSettings();
+    const auto& vc = platform::getVideoConstraints();
+
+    std::string encodedPath = HttpClient::urlEncode("/livetv/sessions/" + liveSessionId);
+
+    // Unique transcode session id (the server keys the playback session on it).
+    char sessionBuf[48];
+    snprintf(sessionBuf, sizeof(sessionBuf), "vita-%lu", (unsigned long)time(nullptr));
+    std::string sessionId = sessionBuf;
+    m_lastSessionId = sessionId;
+
+    char buf[256];
+    int bitrate = settings.maxBitrate > 0 ? settings.maxBitrate : vc.defaultBitrate;
+
+    std::string q;
+    q += "path=" + encodedPath;
+    q += "&mediaIndex=0&partIndex=0";
+    // Live source is mpeg2video, so the video stream must be transcoded; audio can be direct-streamed.
+    q += "&directPlay=0&directStream=0&directStreamAudio=1";
+    q += "&protocol=hls&fastSeek=1&hasMDE=1&location=lan&audioBoost=100";
+    snprintf(buf, sizeof(buf), "&videoBitrate=%d", bitrate); q += buf;
+    snprintf(buf, sizeof(buf), "&videoResolution=%s",
+             Application::resolutionFor(settings.videoQuality)); q += buf;
+    q += "&videoQuality=100";
+    q += settings.showSubtitles ? "&subtitles=auto" : "&subtitles=none";
+    q += "&session=" + sessionId;
+    q += "&X-Plex-Token=" + m_authToken;
+
+    // Profile augmentation matches getTranscodeUrl's video branch so the server
+    // picks an h264/aac HLS target the player can handle.
+    int limW = 0, limH = 0;
+    Application::videoLimitFor(settings.videoQuality, limW, limH);
+    char profileBuf[512];
+    snprintf(profileBuf, sizeof(profileBuf),
+        "add-transcode-target(type=videoProfile&context=streaming&protocol=hls"
+        "&container=mpegts&videoCodec=h264&audioCodec=aac&subtitleCodec=srt)"
+        "+add-limitation(scope=videoCodec&scopeName=h264&type=upperBound&name=video.level&value=%d)"
+        "+add-limitation(scope=videoCodec&scopeName=h264&type=upperBound&name=video.width&value=%d)"
+        "+add-limitation(scope=videoCodec&scopeName=h264&type=upperBound&name=video.height&value=%d)",
+        vc.maxVideoLevel, limW, limH);
+    std::string profileExtra = profileBuf;
+
+    // Step 1: /decision with X-Plex-* as headers.  X-Plex-Session-Identifier
+    // must match the tune's client id so the server links this transcode to the
+    // live grab's consumer (/livetv/sessions/{id}/{sessionIdentifier}/...).
+    HttpClient decisionClient;
+    HttpRequest dReq;
+    dReq.url = m_serverUrl + "/video/:/transcode/universal/decision?" + q;
+    dReq.method = "GET";
+    dReq.headers["Accept"] = "application/json";
+    dReq.headers["X-Plex-Client-Identifier"] = PLEX_CLIENT_ID;
+    dReq.headers["X-Plex-Product"] = PLEX_CLIENT_NAME;
+    dReq.headers["X-Plex-Version"] = PLEX_CLIENT_VERSION;
+    dReq.headers["X-Plex-Platform"] = vc.plexPlatform;
+    dReq.headers["X-Plex-Device"] = vc.plexDevice;
+    dReq.headers["X-Plex-Device-Name"] = vc.plexDevice;
+    dReq.headers["X-Plex-Client-Profile-Name"] = "Generic";
+    dReq.headers["X-Plex-Client-Profile-Extra"] = profileExtra;
+    dReq.headers["X-Plex-Session-Identifier"] = PLEX_CLIENT_ID;
+    dReq.timeout = 20;
+    HttpResponse dResp = decisionClient.request(dReq);
+    brls::Logger::info("buildLiveSessionStreamUrl: decision {} body: {}",
+                       dResp.statusCode,
+                       dResp.body.empty() ? "(empty)" : redactBodyForLog(dResp.body.substr(0, 300)));
+
+    // Step 2: start.m3u8 - the player needs X-Plex-* as query params too, since
+    // it fetches the playlist/segments itself.
+    std::string startQuery = q;
+    startQuery += "&X-Plex-Client-Identifier=" + std::string(PLEX_CLIENT_ID);
+    startQuery += "&X-Plex-Product=" + std::string(PLEX_CLIENT_NAME);
+    startQuery += "&X-Plex-Version=" + std::string(PLEX_CLIENT_VERSION);
+    startQuery += "&X-Plex-Platform=" + HttpClient::urlEncode(vc.plexPlatform);
+    startQuery += "&X-Plex-Device=" + HttpClient::urlEncode(vc.plexDevice);
+    startQuery += "&X-Plex-Device-Name=" + HttpClient::urlEncode(vc.plexDevice);
+    startQuery += "&X-Plex-Client-Profile-Name=Generic";
+    startQuery += "&X-Plex-Client-Profile-Extra=" + HttpClient::urlEncode(profileExtra);
+    startQuery += "&X-Plex-Session-Identifier=" + std::string(PLEX_CLIENT_ID);
+
+    url = m_serverUrl + "/video/:/transcode/universal/start.m3u8?" + startQuery;
+    brls::Logger::info("buildLiveSessionStreamUrl: stream session={} path=/livetv/sessions/{}",
+                       sessionId, liveSessionId);
+    return true;
+}
+
+std::string PlexClient::getThumbnailUrl(const std::string& thumb, int width, int height) {
+    if (thumb.empty()) return "";
+
+    std::string url = buildApiUrl("/photo/:/transcode?url=" + HttpClient::urlEncode(thumb) +
+                                  "&width=" + std::to_string(width) +
+                                  "&height=" + std::to_string(height) +
+                                  "&minSize=1&upscale=1");
+    return url;
+}
+
+// ============================================================================
+// Playlist Management (Official Plex API from developer.plex.tv)
+// ============================================================================
+
+bool PlexClient::fetchMusicPlaylists(std::vector<Playlist>& playlists) {
+    playlists.clear();
+
+    // GET /playlists?playlistType=audio&smart=0 Returns non-smart (dumb) audio playlists
+    std::string url = buildApiUrl("/playlists?playlistType=audio");
+
+    HttpClient client;
+    std::string response;
+
+    if (!client.get(url, response, {{"Accept", "application/json"}})) {
+        brls::Logger::error("fetchMusicPlaylists: Request failed");
+        return false;
+    }
+
+    // Parse JSON response Look for "Metadata" array
+    size_t metadataPos = response.find("\"Metadata\"");
+    if (metadataPos == std::string::npos) {
+        brls::Logger::debug("fetchMusicPlaylists: No playlists found");
+        return true;  // Empty is valid
+    }
+
+    size_t arrStart = response.find('[', metadataPos);
+    if (arrStart == std::string::npos) return false;
+
+    size_t pos = arrStart + 1;
+    while (pos < response.size()) {
+        size_t objStart = response.find('{', pos);
+        if (objStart == std::string::npos) break;
+
+        // Find matching closing brace (accounting for nesting)
+        int depth = 1;
+        size_t objEnd = objStart + 1;
+        while (objEnd < response.size() && depth > 0) {
+            if (response[objEnd] == '{') depth++;
+            else if (response[objEnd] == '}') depth--;
+            objEnd++;
+        }
+
+        std::string objStr = response.substr(objStart, objEnd - objStart);
+
+        Playlist pl;
+        pl.ratingKey = extractJsonValue(objStr, "ratingKey");
+        pl.key = extractJsonValue(objStr, "key");
+        pl.title = extractJsonValue(objStr, "title");
+        pl.summary = extractJsonValue(objStr, "summary");
+        pl.thumb = extractJsonValue(objStr, "thumb");
+        pl.composite = extractJsonValue(objStr, "composite");
+        pl.playlistType = extractJsonValue(objStr, "playlistType");
+        pl.smart = extractJsonBool(objStr, "smart");
+        pl.leafCount = extractJsonInt(objStr, "leafCount");
+        pl.duration = extractJsonInt(objStr, "duration");
+        pl.addedAt = extractJsonInt(objStr, "addedAt");
+        pl.updatedAt = extractJsonInt(objStr, "updatedAt");
+
+        if (!pl.ratingKey.empty()) {
+            playlists.push_back(pl);
+        }
+
+        pos = objEnd;
+    }
+
+    brls::Logger::info("fetchMusicPlaylists: Found {} playlists", playlists.size());
+    return true;
+}
+
+bool PlexClient::fetchPlaylistItems(const std::string& playlistId, std::vector<PlaylistItem>& items) {
+    items.clear();
+
+    // GET /playlists/{playlistId}/items
+    std::string url = buildApiUrl("/playlists/" + playlistId + "/items");
+
+    HttpClient client;
+    std::string response;
+
+    if (!client.get(url, response, {{"Accept", "application/json"}})) {
+        brls::Logger::error("fetchPlaylistItems: Request failed for playlist {}", playlistId);
+        return false;
+    }
+
+    // Parse JSON response
+    size_t metadataPos = response.find("\"Metadata\"");
+    if (metadataPos == std::string::npos) {
+        brls::Logger::debug("fetchPlaylistItems: Playlist {} is empty", playlistId);
+        return true;
+    }
+
+    size_t arrStart = response.find('[', metadataPos);
+    if (arrStart == std::string::npos) return false;
+
+    size_t pos = arrStart + 1;
+    while (pos < response.size()) {
+        size_t objStart = response.find('{', pos);
+        if (objStart == std::string::npos) break;
+
+        int depth = 1;
+        size_t objEnd = objStart + 1;
+        while (objEnd < response.size() && depth > 0) {
+            if (response[objEnd] == '{') depth++;
+            else if (response[objEnd] == '}') depth--;
+            objEnd++;
+        }
+
+        std::string objStr = response.substr(objStart, objEnd - objStart);
+
+        PlaylistItem item;
+        item.playlistItemId = extractJsonValue(objStr, "playlistItemID");
+
+        // Parse media item
+        item.media.ratingKey = extractJsonValue(objStr, "ratingKey");
+        item.media.key = extractJsonValue(objStr, "key");
+        item.media.title = extractJsonValue(objStr, "title");
+        item.media.thumb = extractJsonValue(objStr, "thumb");
+        item.media.duration = extractJsonInt(objStr, "duration");
+        item.media.grandparentTitle = extractJsonValue(objStr, "grandparentTitle");  // Artist
+        item.media.parentTitle = extractJsonValue(objStr, "parentTitle");            // Album
+        item.media.parentThumb = extractJsonValue(objStr, "parentThumb");
+        item.media.grandparentThumb = extractJsonValue(objStr, "grandparentThumb");
+        item.media.index = extractJsonInt(objStr, "index");  // Track number
+        item.media.type = extractJsonValue(objStr, "type");
+        item.media.mediaType = parseMediaType(item.media.type);
+
+        if (!item.media.ratingKey.empty()) {
+            items.push_back(item);
+        }
+
+        pos = objEnd;
+    }
+
+    brls::Logger::info("fetchPlaylistItems: Playlist {} has {} items", playlistId, items.size());
+    return true;
+}
+
+bool PlexClient::createPlaylist(const std::string& title, const std::string& playlistType, Playlist& result) {
+    // POST /playlists?type=15&title={title}&smart=0&playlistType={type} type=15 is the Plex type for playlists
+    std::string url = buildApiUrl("/playlists?type=15&title=" + HttpClient::urlEncode(title) +
+                                  "&smart=0&playlistType=" + playlistType);
+
+    HttpClient client;
+    std::string response;
+
+    if (!client.post(url, "", response, {{"Accept", "application/json"}})) {
+        brls::Logger::error("createPlaylist: Failed to create playlist '{}'", title);
+        return false;
+    }
+
+    // Parse response to get new playlist info
+    size_t metadataPos = response.find("\"Metadata\"");
+    if (metadataPos == std::string::npos) {
+        brls::Logger::error("createPlaylist: Invalid response");
+        return false;
+    }
+
+    size_t objStart = response.find('{', metadataPos);
+    if (objStart == std::string::npos) return false;
+
+    int depth = 1;
+    size_t objEnd = objStart + 1;
+    while (objEnd < response.size() && depth > 0) {
+        if (response[objEnd] == '{') depth++;
+        else if (response[objEnd] == '}') depth--;
+        objEnd++;
+    }
+
+    std::string objStr = response.substr(objStart, objEnd - objStart);
+
+    result.ratingKey = extractJsonValue(objStr, "ratingKey");
+    result.key = extractJsonValue(objStr, "key");
+    result.title = extractJsonValue(objStr, "title");
+    result.playlistType = extractJsonValue(objStr, "playlistType");
+    result.smart = false;
+    result.leafCount = 0;
+
+    brls::Logger::info("createPlaylist: Created playlist '{}' with id {}", title, result.ratingKey);
+    return !result.ratingKey.empty();
+}
+
+bool PlexClient::createPlaylistWithItems(const std::string& title, const std::vector<std::string>& ratingKeys, Playlist& result) {
+    if (ratingKeys.empty()) {
+        return createPlaylist(title, "audio", result);
+    }
+
+    // Build URI: server://{machineId}/com.plexapp.plugins.library/library/metadata/{key1},{key2},...
+    std::string keysStr;
+    for (size_t i = 0; i < ratingKeys.size(); i++) {
+        if (i > 0) keysStr += ",";
+        keysStr += ratingKeys[i];
+    }
+
+    std::string uri = "server://" + m_currentServer.machineIdentifier +
+                      "/com.plexapp.plugins.library/library/metadata/" + keysStr;
+
+    // POST /playlists?type=15&title={title}&smart=0&playlistType=audio&uri={uri}
+    std::string url = buildApiUrl("/playlists?type=15&title=" + HttpClient::urlEncode(title) +
+                                  "&smart=0&playlistType=audio&uri=" + HttpClient::urlEncode(uri));
+
+    HttpClient client;
+    std::string response;
+
+    if (!client.post(url, "", response, {{"Accept", "application/json"}})) {
+        brls::Logger::error("createPlaylistWithItems: Failed to create playlist '{}'", title);
+        return false;
+    }
+
+    // Parse response
+    size_t metadataPos = response.find("\"Metadata\"");
+    if (metadataPos == std::string::npos) {
+        brls::Logger::error("createPlaylistWithItems: Invalid response");
+        return false;
+    }
+
+    size_t objStart = response.find('{', metadataPos);
+    if (objStart == std::string::npos) return false;
+
+    int depth = 1;
+    size_t objEnd = objStart + 1;
+    while (objEnd < response.size() && depth > 0) {
+        if (response[objEnd] == '{') depth++;
+        else if (response[objEnd] == '}') depth--;
+        objEnd++;
+    }
+
+    std::string objStr = response.substr(objStart, objEnd - objStart);
+
+    result.ratingKey = extractJsonValue(objStr, "ratingKey");
+    result.key = extractJsonValue(objStr, "key");
+    result.title = extractJsonValue(objStr, "title");
+    result.playlistType = "audio";
+    result.smart = false;
+    result.leafCount = (int)ratingKeys.size();
+
+    brls::Logger::info("createPlaylistWithItems: Created playlist '{}' with {} items", title, ratingKeys.size());
+    return !result.ratingKey.empty();
+}
+
+bool PlexClient::deletePlaylist(const std::string& playlistId) {
+    // DELETE /playlists/{playlistId}
+    std::string url = buildApiUrl("/playlists/" + playlistId);
+
+    HttpClient client;
+    std::string response;
+
+    if (!client.del(url, response)) {
+        brls::Logger::error("deletePlaylist: Failed to delete playlist {}", playlistId);
+        return false;
+    }
+
+    brls::Logger::info("deletePlaylist: Deleted playlist {}", playlistId);
+    return true;
+}
+
+bool PlexClient::renamePlaylist(const std::string& playlistId, const std::string& newTitle) {
+    // PUT /playlists/{playlistId}?title={newTitle}
+    std::string url = buildApiUrl("/playlists/" + playlistId + "?title=" + HttpClient::urlEncode(newTitle));
+
+    HttpClient client;
+    std::string response;
+
+    if (!client.put(url, "", response)) {
+        brls::Logger::error("renamePlaylist: Failed to rename playlist {}", playlistId);
+        return false;
+    }
+
+    brls::Logger::info("renamePlaylist: Renamed playlist {} to '{}'", playlistId, newTitle);
+    return true;
+}
+
+bool PlexClient::addToPlaylist(const std::string& playlistId, const std::vector<std::string>& ratingKeys) {
+    if (ratingKeys.empty()) return true;
+
+    // Build URI
+    std::string keysStr;
+    for (size_t i = 0; i < ratingKeys.size(); i++) {
+        if (i > 0) keysStr += ",";
+        keysStr += ratingKeys[i];
+    }
+
+    std::string uri = "server://" + m_currentServer.machineIdentifier +
+                      "/com.plexapp.plugins.library/library/metadata/" + keysStr;
+
+    // PUT /playlists/{playlistId}/items?uri={uri}
+    std::string url = buildApiUrl("/playlists/" + playlistId + "/items?uri=" + HttpClient::urlEncode(uri));
+
+    HttpClient client;
+    std::string response;
+
+    if (!client.put(url, "", response)) {
+        brls::Logger::error("addToPlaylist: Failed to add items to playlist {}", playlistId);
+        return false;
+    }
+
+    brls::Logger::info("addToPlaylist: Added {} items to playlist {}", ratingKeys.size(), playlistId);
+    return true;
+}
+
+bool PlexClient::removeFromPlaylist(const std::string& playlistId, const std::string& playlistItemId) {
+    // DELETE /playlists/{playlistId}/items/{playlistItemId}
+    std::string url = buildApiUrl("/playlists/" + playlistId + "/items/" + playlistItemId);
+
+    HttpClient client;
+    std::string response;
+
+    if (!client.del(url, response)) {
+        brls::Logger::error("removeFromPlaylist: Failed to remove item {} from playlist {}", playlistItemId, playlistId);
+        return false;
+    }
+
+    brls::Logger::info("removeFromPlaylist: Removed item {} from playlist {}", playlistItemId, playlistId);
+    return true;
+}
+
+bool PlexClient::clearPlaylist(const std::string& playlistId) {
+    // DELETE /playlists/{playlistId}/items
+    std::string url = buildApiUrl("/playlists/" + playlistId + "/items");
+
+    HttpClient client;
+    std::string response;
+
+    if (!client.del(url, response)) {
+        brls::Logger::error("clearPlaylist: Failed to clear playlist {}", playlistId);
+        return false;
+    }
+
+    brls::Logger::info("clearPlaylist: Cleared playlist {}", playlistId);
+    return true;
+}
+
+bool PlexClient::movePlaylistItem(const std::string& playlistId, const std::string& playlistItemId, const std::string& afterItemId) {
+    // PUT /playlists/{playlistId}/items/{playlistItemId}/move?after={afterItemId}
+    std::string url = buildApiUrl("/playlists/" + playlistId + "/items/" + playlistItemId + "/move");
+    if (!afterItemId.empty()) {
+        url += "&after=" + afterItemId;
+    }
+
+    HttpClient client;
+    std::string response;
+
+    if (!client.put(url, "", response)) {
+        brls::Logger::error("movePlaylistItem: Failed to move item {} in playlist {}", playlistItemId, playlistId);
+        return false;
+    }
+
+    brls::Logger::info("movePlaylistItem: Moved item {} after {} in playlist {}", playlistItemId, afterItemId, playlistId);
+    return true;
+}
+
+// ============================================================================
+// Play Queue API
+// ============================================================================
+
+static void parsePlayQueueItems(const std::string& json, PlexClient& client,
+                                 PlexClient::PlayQueueContainer& result) {
+    // Parse container-level fields
+    result.playQueueID = client.extractJsonIntPublic(json, "playQueueID");
+    result.playQueueSelectedItemID = client.extractJsonIntPublic(json, "playQueueSelectedItemID");
+    result.playQueueSelectedItemOffset = client.extractJsonIntPublic(json, "playQueueSelectedItemOffset");
+    result.playQueueSelectedMetadataItemID = client.extractJsonIntPublic(json, "playQueueSelectedMetadataItemID");
+    result.playQueueTotalCount = client.extractJsonIntPublic(json, "playQueueTotalCount");
+    result.playQueueVersion = client.extractJsonIntPublic(json, "playQueueVersion");
+
+    // playQueueShuffled is a boolean in JSON
+    std::string shuffledStr = client.extractJsonValuePublic(json, "playQueueShuffled");
+    result.playQueueShuffled = (shuffledStr == "true" || shuffledStr == "1");
+
+    result.playQueueSourceURI = client.extractJsonValuePublic(json, "playQueueSourceURI");
+
+    // Parse Metadata array items
+    result.items.clear();
+    size_t metaPos = json.find("\"Metadata\"");
+    if (metaPos == std::string::npos) return;
+
+    // Find the array start
+    size_t arrStart = json.find('[', metaPos);
+    if (arrStart == std::string::npos) return;
+
+    // Where the Metadata array actually ends.
+    //
+    // This used to be json.find(']', arrStart) — the FIRST ']' after the array
+    // opened. Every Metadata entry contains nested arrays of its own (Media,
+    // Part, Stream, Genre), so that ']' lands inside the first entry, and the
+    // loop below broke as soon as it moved past it. Exactly one item was ever
+    // parsed, however many the server sent: a play queue of 4026 tracks
+    // arrived, was reported as 4026 by playQueueTotalCount, and became a queue
+    // of one. Match the bracket properly instead, skipping over quoted strings
+    // so a ']' inside a title cannot end the array early.
+    size_t arrEnd = std::string::npos;
+    {
+        int bracketDepth = 0;
+        bool inString = false;
+        for (size_t i = arrStart; i < json.size(); i++) {
+            const char c = json[i];
+            if (inString) {
+                if (c == '\\') { i++; continue; }   // skip the escaped char
+                if (c == '"') inString = false;
+                continue;
+            }
+            if (c == '"') { inString = true; continue; }
+            if (c == '[') bracketDepth++;
+            else if (c == ']') {
+                if (--bracketDepth == 0) { arrEnd = i; break; }
+            }
+        }
+    }
+
+    // Parse each object in the Metadata array
+    size_t pos = arrStart;
+    while ((pos = json.find('{', pos)) != std::string::npos) {
+        if (arrEnd != std::string::npos && pos > arrEnd) break;
+
+        // Find matching closing brace
+        int depth = 1;
+        size_t objEnd = pos + 1;
+        while (objEnd < json.size() && depth > 0) {
+            if (json[objEnd] == '{') depth++;
+            else if (json[objEnd] == '}') depth--;
+            objEnd++;
+        }
+
+        std::string obj = json.substr(pos, objEnd - pos);
+
+        // Only parse if it has playQueueItemID (skip nested objects)
+        std::string pqItemId = client.extractJsonValuePublic(obj, "playQueueItemID");
+        if (!pqItemId.empty()) {
+            PlexClient::PlayQueueItem item;
+            item.playQueueItemID = std::stoi(pqItemId);
+            item.ratingKey = client.extractJsonValuePublic(obj, "ratingKey");
+            item.title = client.extractJsonValuePublic(obj, "title");
+            item.grandparentTitle = client.extractJsonValuePublic(obj, "grandparentTitle");
+            item.parentTitle = client.extractJsonValuePublic(obj, "parentTitle");
+            item.thumb = client.extractJsonValuePublic(obj, "thumb");
+            item.parentThumb = client.extractJsonValuePublic(obj, "parentThumb");
+            item.grandparentThumb = client.extractJsonValuePublic(obj, "grandparentThumb");
+            item.duration = client.extractJsonIntPublic(obj, "duration");
+            item.index = client.extractJsonIntPublic(obj, "index");
+            item.type = client.extractJsonValuePublic(obj, "type");
+            // Without this the item stays MediaType::UNKNOWN, and everything
+            // downstream that asks "is this music?" answers no — most visibly
+            // MusicQueue::isMusicQueue(), which is what picks the Now Playing
+            // layout. A queue of tracks then opens in the video player.
+            //
+            // It went unnoticed because createPlayQueue was failing: the caller
+            // fell back to building the queue client-side from MediaItems that
+            // already carried a type. Fixing the play queue is what first put
+            // this path in front of anyone.
+            item.mediaType = client.parseMediaTypePublic(item.type);
+            // 0-10, 0 when unrated. Server play queues are the usual source for
+            // music, so without this the media session's heart would only be
+            // right for offline / client-side queues.
+            item.userRating = (float)client.extractJsonIntPublic(obj, "userRating");
+
+            if (!item.ratingKey.empty()) {
+                result.items.push_back(item);
+            }
+        }
+
+        pos = objEnd;
+    }
+}
+
+// A play-queue source URI names the provider that holds the item:
+//
+//     server://{machineIdentifier}/{providerId}/{path}
+//
+// which for anything in the library is com.plexapp.plugins.library, e.g.
+// server://546684a3…/com.plexapp.plugins.library/library/metadata/2814936.
+// The path stays unescaped here; createPlayQueue percent-encodes the whole
+// URI once when it goes in as a query parameter.
+//
+// These used to build library://{machineIdentifier}/item/… — which mixes the
+// two documented shapes, since a library:// authority is a library *section*
+// UUID, not a machine identifier. The server answered 400, PlayerActivity
+// quietly fell back to a client-side queue, and music kept playing without a
+// server play queue: no playQueueItemID on timeline reports, no continuity to
+// other clients, no server-side shuffle or repeat.
+static constexpr const char* kLibraryProviderId = "com.plexapp.plugins.library";
+
+std::string PlexClient::buildPlayQueueURI(const std::string& ratingKey) {
+    return "server://" + m_currentServer.machineIdentifier + "/" +
+           kLibraryProviderId + "/library/metadata/" + ratingKey;
+}
+
+std::string PlexClient::buildPlayQueueDirectoryURI(const std::string& ratingKey) {
+    // An album or season: the queue is its children, and the server expands them in order.
+    return "server://" + m_currentServer.machineIdentifier + "/" +
+           kLibraryProviderId + "/library/metadata/" + ratingKey + "/children";
+}
+
+bool PlexClient::createPlayQueue(const std::string& uri, const std::string& type,
+                                  PlayQueueContainer& result,
+                                  const std::string& key,
+                                  int shuffle, int repeat, int continuous) {
+    std::string params = "?type=" + type + "&uri=" + HttpClient::urlEncode(uri);
+    if (!key.empty()) {
+        params += "&key=" + HttpClient::urlEncode("/library/metadata/" + key);
+    }
+    if (shuffle) params += "&shuffle=1";
+    if (repeat) params += "&repeat=1";
+    if (continuous) params += "&continuous=1";
+
+    std::string url = buildApiUrl("/playQueues" + params);
+
+    HttpClient client;
+    HttpRequest req;
+    req.url = url;
+    req.method = "POST";
+    req.headers["Accept"] = "application/json";
+    // A play queue is created for a device and belongs to it, so identify
+    // ourselves. This is the one difference between the POSTs to this server
+    // that work — /:/timeline and the Live TV tune both send these — and this
+    // one, which sent nothing but Accept and was answered 400. The spec does
+    // not list the header as required here, but the spec also does not
+    // describe a 400 for a well-formed request, and it has already been wrong
+    // about this server once.
+    {
+        const auto& vc = platform::getVideoConstraints();
+        req.headers["X-Plex-Client-Identifier"] = PLEX_CLIENT_ID;
+        req.headers["X-Plex-Product"] = PLEX_CLIENT_NAME;
+        req.headers["X-Plex-Version"] = PLEX_CLIENT_VERSION;
+        req.headers["X-Plex-Platform"] = vc.plexPlatform;
+        req.headers["X-Plex-Device"] = vc.plexDevice;
+        req.headers["X-Plex-Device-Name"] = vc.plexDevice;
+    }
+    HttpResponse resp = client.request(req);
+
+    if (resp.statusCode != 200) {
+        // The body is where Plex says what it objected to, and it is short.
+        // Logging the status alone left a 400 on this call looking like a
+        // network blip for as long as it took to notice the URI was wrong.
+        brls::Logger::error("createPlayQueue: Failed ({}) uri={} body: {}",
+                            resp.statusCode, redactTokensInUrl(uri),
+                            redactBodyForLog(resp.body.substr(0, 300)));
+        if (isAuthError(resp.statusCode)) handleUnauthorized();
+        return false;
+    }
+
+    parsePlayQueueItems(resp.body, *this, result);
+    brls::Logger::info("createPlayQueue: Created PQ {} with {} items (type={})",
+                       result.playQueueID, result.playQueueTotalCount, type);
+    return result.playQueueID > 0;
+}
+
+bool PlexClient::createPlayQueueFromPlaylist(int playlistID, const std::string& type,
+                                              PlayQueueContainer& result, int shuffle,
+                                              const std::string& key) {
+    std::string params = "?type=" + type + "&playlistID=" + std::to_string(playlistID);
+    if (!key.empty()) {
+        params += "&key=" + HttpClient::urlEncode("/library/metadata/" + key);
+    }
+    if (shuffle) params += "&shuffle=1";
+
+    std::string url = buildApiUrl("/playQueues" + params);
+
+    HttpClient client;
+    HttpRequest req;
+    req.url = url;
+    req.method = "POST";
+    req.headers["Accept"] = "application/json";
+    {
+        const auto& vc = platform::getVideoConstraints();
+        req.headers["X-Plex-Client-Identifier"] = PLEX_CLIENT_ID;
+        req.headers["X-Plex-Product"] = PLEX_CLIENT_NAME;
+        req.headers["X-Plex-Version"] = PLEX_CLIENT_VERSION;
+        req.headers["X-Plex-Platform"] = vc.plexPlatform;
+        req.headers["X-Plex-Device"] = vc.plexDevice;
+        req.headers["X-Plex-Device-Name"] = vc.plexDevice;
+    }
+    HttpResponse resp = client.request(req);
+
+    if (resp.statusCode != 200) {
+        brls::Logger::error("createPlayQueueFromPlaylist: Failed ({}) body: {}",
+                            resp.statusCode, redactBodyForLog(resp.body.substr(0, 300)));
+        if (isAuthError(resp.statusCode)) handleUnauthorized();
+        return false;
+    }
+
+    parsePlayQueueItems(resp.body, *this, result);
+    brls::Logger::info("createPlayQueueFromPlaylist: Created PQ {} from playlist {} ({} items)",
+                       result.playQueueID, playlistID, result.playQueueTotalCount);
+    return result.playQueueID > 0;
+}
+
+bool PlexClient::getPlayQueue(int playQueueID, PlayQueueContainer& result) {
+    std::string url = buildApiUrl("/playQueues/" + std::to_string(playQueueID));
+
+    HttpClient client;
+    HttpRequest req;
+    req.url = url;
+    req.method = "GET";
+    req.headers["Accept"] = "application/json";
+    HttpResponse resp = client.request(req);
+
+    if (resp.statusCode != 200) {
+        brls::Logger::error("getPlayQueue: Failed to get PQ {} ({})", playQueueID, resp.statusCode);
+        if (isAuthError(resp.statusCode)) handleUnauthorized();
+        return false;
+    }
+
+    parsePlayQueueItems(resp.body, *this, result);
+    return result.playQueueID > 0;
+}
+
+bool PlexClient::addToPlayQueue(int playQueueID, const std::string& uri, bool playNext) {
+    std::string params = "?uri=" + HttpClient::urlEncode(uri);
+    if (playNext) params += "&next=1";
+
+    std::string url = buildApiUrl("/playQueues/" + std::to_string(playQueueID) + params);
+
+    HttpClient client;
+    std::string response;
+    if (!client.put(url, "", response)) {
+        brls::Logger::error("addToPlayQueue: Failed to add to PQ {}", playQueueID);
+        return false;
+    }
+
+    brls::Logger::info("addToPlayQueue: Added to PQ {} (next={})", playQueueID, playNext);
+    return true;
+}
+
+bool PlexClient::clearPlayQueue(int playQueueID) {
+    std::string url = buildApiUrl("/playQueues/" + std::to_string(playQueueID) + "/items");
+
+    HttpClient client;
+    std::string response;
+    if (!client.del(url, response)) {
+        brls::Logger::error("clearPlayQueue: Failed to clear PQ {}", playQueueID);
+        return false;
+    }
+
+    brls::Logger::info("clearPlayQueue: Cleared PQ {}", playQueueID);
+    return true;
+}
+
+bool PlexClient::removeFromPlayQueue(int playQueueID, int playQueueItemID) {
+    std::string url = buildApiUrl("/playQueues/" + std::to_string(playQueueID) +
+                                  "/items/" + std::to_string(playQueueItemID));
+
+    HttpClient client;
+    std::string response;
+    if (!client.del(url, response)) {
+        brls::Logger::error("removeFromPlayQueue: Failed to remove item {} from PQ {}",
+                           playQueueItemID, playQueueID);
+        return false;
+    }
+
+    brls::Logger::info("removeFromPlayQueue: Removed item {} from PQ {}",
+                       playQueueItemID, playQueueID);
+    return true;
+}
+
+bool PlexClient::movePlayQueueItem(int playQueueID, int playQueueItemID, int afterItemID) {
+    std::string url = buildApiUrl("/playQueues/" + std::to_string(playQueueID) +
+                                  "/items/" + std::to_string(playQueueItemID) + "/move");
+    if (afterItemID > 0) {
+        url += "?after=" + std::to_string(afterItemID);
+    }
+
+    HttpClient client;
+    std::string response;
+    if (!client.put(url, "", response)) {
+        brls::Logger::error("movePlayQueueItem: Failed to move item {} in PQ {}",
+                           playQueueItemID, playQueueID);
+        return false;
+    }
+
+    brls::Logger::info("movePlayQueueItem: Moved item {} after {} in PQ {}",
+                       playQueueItemID, afterItemID, playQueueID);
+    return true;
+}
+
+bool PlexClient::shufflePlayQueue(int playQueueID, PlayQueueContainer& result) {
+    std::string url = buildApiUrl("/playQueues/" + std::to_string(playQueueID) + "/shuffle");
+
+    HttpClient client;
+    HttpRequest req;
+    req.url = url;
+    req.method = "PUT";
+    req.headers["Accept"] = "application/json";
+    HttpResponse resp = client.request(req);
+
+    if (resp.statusCode != 200) {
+        brls::Logger::error("shufflePlayQueue: Failed ({})", resp.statusCode);
+        return false;
+    }
+
+    parsePlayQueueItems(resp.body, *this, result);
+    brls::Logger::info("shufflePlayQueue: Shuffled PQ {} ({} items)", playQueueID, result.playQueueTotalCount);
+    return true;
+}
+
+bool PlexClient::unshufflePlayQueue(int playQueueID, PlayQueueContainer& result) {
+    std::string url = buildApiUrl("/playQueues/" + std::to_string(playQueueID) + "/unshuffle");
+
+    HttpClient client;
+    HttpRequest req;
+    req.url = url;
+    req.method = "PUT";
+    req.headers["Accept"] = "application/json";
+    HttpResponse resp = client.request(req);
+
+    if (resp.statusCode != 200) {
+        brls::Logger::error("unshufflePlayQueue: Failed ({})", resp.statusCode);
+        return false;
+    }
+
+    parsePlayQueueItems(resp.body, *this, result);
+    brls::Logger::info("unshufflePlayQueue: Unshuffled PQ {} ({} items)", playQueueID, result.playQueueTotalCount);
+    return true;
+}
+
+} // namespace vitaplex

@@ -1,0 +1,322 @@
+/**
+ * VitaPlex - Live TV Tab
+ * Browse live TV channels and program guide
+ */
+
+#pragma once
+
+#include <borealis.hpp>
+#include <memory>
+#include <set>
+#include <string>
+#include "app/plex_client.hpp"
+
+namespace vitaplex {
+
+// Program guide item
+struct GuideProgram {
+    std::string title;
+    std::string summary;
+    int64_t startTime = 0;
+    int64_t endTime = 0;
+    std::string ratingKey;
+    std::string metadataKey;  // EPG metadata path for transcode/recording
+    std::string thumb;        // Show poster / episode still for the hero card
+    bool isRecording = false;
+    int durationMinutes = 30;  // Duration in minutes
+};
+
+// Channel with programs for EPG grid
+struct EPGChannel {
+    LiveTVChannel channel;
+    std::vector<GuideProgram> programs;
+};
+
+// DVR Recording
+struct DVRRecording {
+    std::string ratingKey;
+    std::string title;
+    std::string summary;
+    int64_t scheduledTime = 0;
+    std::string status;  // scheduled, recording, completed
+    std::string channelTitle;
+    std::string mediaSubscriptionId;  // For cancellation
+};
+
+class LiveTVTab : public brls::Box {
+public:
+    LiveTVTab();
+    ~LiveTVTab();
+
+    void onFocusGained() override;
+    void willDisappear(bool resetState) override;
+    void draw(NVGcontext* vg, float x, float y, float width, float height,
+              brls::Style style, brls::FrameContext* ctx) override;
+    brls::View* getNextFocus(brls::FocusDirection direction, brls::View* currentView) override;
+
+private:
+    brls::View* findFirstFocusableInBox(brls::Box* box);
+    brls::View* findLastFocusableInBox(brls::Box* box);
+    bool isDescendantOf(brls::View* view, brls::View* ancestor);
+
+    // Hide rows/cards that have scrolled out of their viewport so borealis
+    // doesn't draw the whole off-screen subtree every frame (see draw()).
+    void cullToViewport(brls::Box* content, brls::View* viewport, bool vertical);
+    void loadChannels();
+    void refreshCurrentPrograms();  // Lightweight refresh: only update "now playing" info
+    void loadGuide();
+    void loadRecordings();
+    // Fetch the DVR's scheduled recordings (GET /media/subscriptions/scheduled)
+    // and, once known, paint a red "will record" dot on the matching guide
+    // cells. Split from loadRecordings so the guide can update its dots
+    // independently of the (now data-only) subscriptions fetch.
+    void loadScheduled();
+    void refreshRecordingDots();   // (re)apply dots to m_epgCells from m_scheduledKeys
+    bool isProgramScheduled(const std::string& metaKey, const std::string& progKey) const;
+    void buildEPGGrid();
+    // Build ONE fully-detached guide row for `channel` (channel column +
+    // lazy RowLogo entry + HScrollingFrame of program cells + all the
+    // m_epgCells / m_epgRowRanges / m_rowProgramScrolls bookkeeping) and
+    // attach it to `intoBox` last. Shared by buildEPGGrid's synchronous
+    // first screenful and the progressive chunks that append the rest.
+    void appendGuideRow(const LiveTVChannel& channel, brls::Box* intoBox);
+
+    // Resumable row construction for the progressive build. A row is too
+    // expensive to build inside one frame (~160ms on Vita — streaming one
+    // whole row per tick held the guide at ~5fps for the whole fill), so
+    // the work is sliced into time-budgeted pieces that a chunk tick can
+    // stop and resume mid-row:
+    //   start  — row box + channel column + (detached) scroll/content
+    //   cells  — append program cells until done or the deadline passes
+    //   finish — bookkeeping vectors + attach to the live guide box
+    // The cursor owns the partially built (still detached) row between
+    // ticks; nothing in draw() can see it until finish registers it.
+    struct GuideRowCursor {
+        size_t rowIndex = 0;             // next channel to build
+        brls::Box* rowBox = nullptr;     // non-null while mid-row (detached)
+        brls::HScrollingFrame* scroll = nullptr;
+        brls::Box* programsBox = nullptr;
+        std::shared_ptr<const LiveTVChannel> capturedChannel;
+        size_t cellsBegin = 0;           // m_epgCells size at row start
+        size_t nextProgram = 0;          // resume point in programs[]
+        int64_t lastEndTime = 0;         // gap-fill accumulator
+        brls::Image* logoImg = nullptr;  // RowLogo registered at finish
+        std::string logoUrl;
+    };
+    void startGuideRowStream(const LiveTVChannel& channel, GuideRowCursor& cur);
+    bool streamGuideRowCells(GuideRowCursor& cur, int64_t deadlineUs);
+    void finishGuideRowStream(GuideRowCursor& cur, brls::Box* intoBox);
+
+    // Progressive guide build: queue a brls::sync tick that spends at most
+    // the frame budget building rows (resuming mid-row via the cursor),
+    // then chains the next tick so a frame renders in between. `gen` must
+    // still match m_gridBuildGen when the tick runs (and the tab must
+    // still be alive) or it bails — a reload rebuilt the grid.
+    // `buildStartUs` anchors the completion log's total wall time.
+    void scheduleGuideRowChunk(std::shared_ptr<GuideRowCursor> cur, int gen, int64_t buildStartUs);
+    // Attach a freshly built (orphan) guide content box to the scroll frame,
+    // parking focus safely first — see buildEPGGrid for why rows are built
+    // detached (per-addView relayout froze the UI for seconds otherwise).
+    void swapInGuideBox(brls::Box* newGuideBox);
+    void onChannelSelected(const LiveTVChannel& channel);
+    void onProgramSelected(const GuideProgram& program, const LiveTVChannel& channel);
+    void scheduleRecording(const GuideProgram& program, const LiveTVChannel& channel);
+    void cancelRecording(const DVRRecording& recording);
+    std::string formatTime(int64_t timestamp);
+
+    // New layout helpers
+    void buildHero();                                // build the empty hero shell
+    void updateHeroForChannel(const LiveTVChannel& channel);  // populate hero with current program
+    void updateHeroForProgram(const LiveTVChannel& channel,   // populate hero with a specific
+                              const GuideProgram& program);    // program (hover-driven)
+    void resizeHeroThumbToImage(brls::Image* img);   // resize the hero thumb box to the loaded
+                                                     // image's natural aspect (no letterbox)
+    void updateCurrentTimeLine();    // reposition the cyan "now" rule each second
+
+    // Hover-driven hero updates are debounced: focus events only record the
+    // wanted channel/program here, and draw() applies it once focus has
+    // rested. Applying immediately cost a dozen setText/setWidth calls (each
+    // a synchronous full-tree relayout) plus a thumbnail HTTP fetch per
+    // dpad press — the single biggest cost of navigating the guide on Vita.
+    void queueHeroForChannel(const LiveTVChannel& channel);
+    void queueHeroForProgram(const LiveTVChannel& channel, const GuideProgram& program);
+    void applyPendingHero();
+
+    // UI Components
+    brls::Label* m_titleLabel = nullptr;
+    brls::Box* m_scrollContent = nullptr;       // Direct child of the tab — no outer page scroll
+
+    // On-Now hero
+    brls::Box*   m_heroBox          = nullptr;
+    brls::Image* m_heroThumb        = nullptr;
+    brls::Box*   m_heroThumbHolder  = nullptr;  // fixed-size holder so the image keeps its slot while loading
+    brls::Box*   m_heroLiveBadge    = nullptr;
+    brls::Label* m_heroChannelName  = nullptr;
+    brls::Label* m_heroChannelId    = nullptr;
+    brls::Label* m_heroTitleLabel   = nullptr;
+    brls::Label* m_heroSummaryLabel = nullptr;
+    brls::Label* m_heroStartLabel   = nullptr;
+    brls::Label* m_heroEndLabel     = nullptr;
+    brls::Label* m_heroPctLabel     = nullptr;
+    brls::Box*   m_heroProgressTrack = nullptr;
+    brls::Box*   m_heroProgressFill  = nullptr;
+    brls::Box*   m_heroWatchBtn     = nullptr;
+    brls::Box*   m_heroRecordBtn    = nullptr;
+    LiveTVChannel m_heroChannel;
+    GuideProgram  m_heroProgram;
+    bool          m_heroProgramValid = false;
+    std::shared_ptr<std::atomic<bool>> m_heroThumbAlive;  // ImageLoader cancel handle
+
+    // Lazily-loaded channel logos: buildEPGGrid only records url+targets;
+    // draw() requests a row's logo the first time that row is actually
+    // visible. Queueing all ~32 fetches during the build made them part of
+    // the tab-open stall and left them racing the EPG fetch for workers.
+    struct RowLogo {
+        brls::Box*   row = nullptr;
+        brls::Image* img = nullptr;
+        std::string  url;
+        bool requested = false;
+    };
+    std::vector<RowLogo> m_rowLogos;
+    std::shared_ptr<std::atomic<bool>> m_logoAlive;  // generation guard for
+                                                     // in-flight logo loads
+
+    // EPG Guide section
+    brls::Label* m_guideLabel = nullptr;
+    brls::Box* m_guideContainer = nullptr;      // Contains time header + grid
+    brls::HScrollingFrame* m_timeHeaderScroll = nullptr;
+    brls::Box* m_timeHeaderBox = nullptr;       // Horizontal time slots
+    brls::ScrollingFrame* m_guideScrollV = nullptr;  // Vertical scroll inside the guide block
+    brls::Box* m_guideBox = nullptr;            // Contains channel rows; scrolls inside m_guideScrollV
+    brls::Box* m_currentTimeLine = nullptr;     // Absolute-positioned cyan rule over the program area
+    // Per-row HScrollingFrame for the program cells. The channel column
+    // sits *outside* this scroll on the left so it stays put when the
+    // programs scroll horizontally. draw() reads the focused row's
+    // offset and applies it to every other row + the time header so
+    // they all move together.
+    std::vector<brls::HScrollingFrame*> m_rowProgramScrolls;
+    // Content box of each row's HScrollingFrame, parallel to
+    // m_rowProgramScrolls. The cross-row scroll sync moves these directly
+    // via setTranslationX (a plain float store — exactly how borealis
+    // applies scroll offsets internally) instead of setContentOffsetX,
+    // which invalidates and re-runs Yoga layout over the whole ~1500-view
+    // grid — per row, per frame, while the anchor row's scroll animates.
+    std::vector<brls::Box*> m_rowProgramBoxes;
+
+    // Batch text rendering for the EPG cells. The patched nanovg lets
+    // us flush every visible cell's title (and separately, every
+    // subtitle) as a single render call instead of one per Label —
+    // ~100 cells per build x ~2 labels each = ~200 draw calls otherwise.
+    // Cells themselves are intentionally label-less; draw() walks this
+    // vector after the standard Box::draw to paint the text on top.
+    struct EpgCellInfo {
+        brls::Box* cell = nullptr;     // owns the rect / focus (background is
+                                       // painted batched in draw(), not by the Box)
+        brls::HScrollingFrame* scroll = nullptr;  // viewport the cell lives in
+        brls::Box* row = nullptr;      // owning channel row — culled rows let the
+                                       // batch pass skip their cells outright
+        bool onNow = false;            // currently airing (fill + accent border)
+        std::string title;
+        // Three widths of the same time text. draw() picks the longest that fits
+        // the cell, so every row reads the same and focus changes nothing — the
+        // grid used to show the full range on the focused row only, which made
+        // the text jump around under the cursor.
+        std::string subtitle;          // start-end + " · on now" if currently airing
+        std::string range;             // start-end, no suffix
+        std::string startLabel;        // just the start time ("7:00 PM")
+        // Keys used to match this airing against the DVR's scheduled grabs
+        // (GET /media/subscriptions/scheduled → Metadata.key / ratingKey), kept
+        // so refreshRecordingDots() can re-evaluate after the recordings load
+        // even if the guide drew first. `scheduled` drives the red "will
+        // record" dot, painted in the batched draw pass (a child view would be
+        // overpainted by the batched cell fill).
+        std::string metaKey;
+        std::string progKey;
+        bool scheduled = false;
+    };
+    std::vector<EpgCellInfo> m_epgCells;
+
+    // Cells grouped by channel row ([begin,end) into m_epgCells, which is
+    // built strictly row-by-row). The batch text pass iterates these so a
+    // culled row skips all its cells in one visibility check instead of
+    // touching every cell struct in the grid every frame.
+    struct EpgRowRange {
+        brls::Box* row = nullptr;
+        size_t begin = 0;
+        size_t end = 0;
+    };
+    std::vector<EpgRowRange> m_epgRowRanges;
+
+    // Per-frame cost accounting (logged on Vita every few hundred frames
+    // so a hardware log pinpoints where guide frame time goes).
+    int64_t m_perfLastFrameUs = 0;
+    int64_t m_perfFrameUs = 0;
+    int64_t m_perfCullUs  = 0;
+    int64_t m_perfSyncUs  = 0;
+    int64_t m_perfDrawUs  = 0;
+    int64_t m_perfTextUs  = 0;
+    int     m_perfFrames  = 0;
+
+    // Data
+    std::vector<LiveTVChannel> m_channels;
+    std::vector<EPGChannel> m_epgChannels;
+    std::vector<DVRRecording> m_recordings;
+    // EPG metadata keys + rating keys of airings the DVR is scheduled to
+    // record (from /media/subscriptions/scheduled). A guide cell whose
+    // metadataKey or ratingKey is in here gets the red recording dot.
+    std::set<std::string> m_scheduledKeys;
+    int64_t m_guideStartTime = 0;  // Current time rounded to 30 min
+    int m_hoursToShow = 12;        // Hours of programming to show (12 hours)
+    bool m_loaded = false;
+    int64_t m_lastFullLoadTime = 0;   // Timestamp of last full channel/EPG load
+    int64_t m_lastRefreshTime = 0;    // Timestamp of last "now playing" refresh
+
+    // Process-lifetime snapshot of the parsed guide. borealis' TabFrame
+    // destroys and recreates the entire LiveTVTab every time the Live TV
+    // sidebar item is focused (removeView(activeTab) + creator()), so no
+    // per-instance state survives a tab switch — which is why the guide
+    // otherwise refetches (~1.8MB grid) and reparses (~750 programs) on every
+    // open. This static keeps the last parsed channel list + programs alive
+    // across those rebuilds so a re-open within the staleness window shows the
+    // guide instantly with no network and no reparse. Keyed by server +
+    // window so it invalidates on a server switch or a guide-hours change;
+    // recording dots and now-playing come from separate always-fresh fetches.
+    struct GuideSnapshot {
+        bool valid = false;
+        std::string serverId;                 // machine id — invalidate on server switch
+        int hours = 0;                        // guide window — invalidate on setting change
+        int64_t builtAt = 0;                  // epoch of the underlying grid fetch
+        std::vector<LiveTVChannel> channels;  // parsed channels WITH programs
+    };
+    static GuideSnapshot s_guideSnapshot;
+
+    // Per-frame optimisation caches — see draw() / updateCurrentTimeLine().
+    // The wall-clock-driven time line and the cross-row scroll sync both
+    // produce identical output across most frames; cache the last applied
+    // state so we can short-circuit the Yoga / scroll setter calls when
+    // nothing has actually changed.
+    int64_t m_lastTimeLineUpdateSec = 0;   // Wall-clock second of last time-line update
+    bool    m_timeLineBasePlaced    = false; // positionLeft anchored once; per-second
+                                             // movement rides setTranslationX (free)
+    float   m_lastTimeLineHeight    = -1;  // Last applied height in px (-1 = unset)
+    float   m_lastSyncedScrollX     = -1;  // Last anchor offset propagated to other rows
+    brls::HScrollingFrame* m_lastAnchorScroll = nullptr;  // row whose offset we follow
+
+    // Debounced hero update (see queueHeroFor* / applyPendingHero).
+    LiveTVChannel m_pendingHeroChannel;
+    GuideProgram  m_pendingHeroProgram;
+    bool    m_pendingHeroHasProgram = false;
+    bool    m_heroUpdatePending     = false;
+    int64_t m_lastHoverUs           = 0;   // CPU time of the last hover event
+
+    // Progressive guide build generation — buildEPGGrid() bumps this and
+    // captures the new value into every row chunk it schedules; a pending
+    // chunk whose generation no longer matches (a reload rebuilt the
+    // grid) bails out instead of appending stale rows into the new guide.
+    int m_gridBuildGen = 0;
+
+    // Alive flag for crash prevention on quick tab switching
+    std::shared_ptr<bool> m_alive = std::make_shared<bool>(true);
+};
+
+} // namespace vitaplex
