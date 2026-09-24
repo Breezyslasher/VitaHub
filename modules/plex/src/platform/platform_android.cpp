@@ -26,9 +26,11 @@
 // SDL_main symbol here and forward it to the shared entry point.
 extern "C" int VitaPlexMainEntry(int argc, char* argv[]);
 
+#ifndef VITAHUB  // inside VitaHub the hub owns the entry point (hub/core)
 extern "C" int SDL_main(int argc, char* argv[]) {
     return VitaPlexMainEntry(argc, argv);
 }
+#endif
 
 namespace vitaplex {
 namespace platform {

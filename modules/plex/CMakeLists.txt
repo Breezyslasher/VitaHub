@@ -50,18 +50,32 @@ set(PLEX_SOURCES
     src/platform/platform_common.cpp
 )
 
+# One platform_<name>.cpp, plus each platform's extras, as in Vita_plex.
+# Windows (SMTC, toasts, shell), Linux (MPRIS) and the Vita/PS4 notification
+# probes are added from the top-level CMakeLists.txt, next to their probes.
 if(PLATFORM_PSV)
     list(APPEND PLEX_SOURCES
         src/platform/platform_psv.cpp
         src/utils/vita_install.cpp
         src/utils/shell_integration_psv.cpp)
+elseif(PLATFORM_PS4)
+    list(APPEND PLEX_SOURCES
+        src/platform/platform_ps4.cpp
+        src/utils/ps4_install.cpp
+        src/utils/shell_integration_ps4.cpp)
+elseif(PLATFORM_SWITCH)
+    list(APPEND PLEX_SOURCES src/platform/platform_switch.cpp)
+elseif(PLATFORM_ANDROID)
+    list(APPEND PLEX_SOURCES
+        src/platform/platform_android.cpp
+        src/platform/android_assets.cpp
+        src/platform/android_mpv_surface.cpp
+        src/platform/android_media_browser.cpp
+        src/utils/shell_integration_android.cpp)
+elseif(PLATFORM_IOS OR PLATFORM_TVOS)
+    list(APPEND PLEX_SOURCES src/platform/platform_ios.mm)
 else()
     list(APPEND PLEX_SOURCES src/platform/platform_desktop.cpp)
-    if(VITAPLEX_MPRIS)
-        list(APPEND PLEX_SOURCES
-            src/utils/now_playing_mpris.cpp
-            src/utils/shell_integration_dbus.cpp)
-    endif()
 endif()
 
 add_library(vitahub_plex STATIC ${PLEX_SOURCES})
@@ -70,13 +84,8 @@ vitahub_module_target(vitahub_plex plex)
 vitahub_module_version(plex PLEX_VERSION PLEX_DISPLAY_VERSION)
 target_compile_definitions(vitahub_plex PRIVATE
     VITA_PLEX_VERSION=\"${PLEX_VERSION}\"
-    VITA_PLEX_DISPLAY_VERSION=\"${PLEX_DISPLAY_VERSION}\"
-    VITAPLEX_HAVE_MBEDCRYPTO=1)
+    VITA_PLEX_DISPLAY_VERSION=\"${PLEX_DISPLAY_VERSION}\")
 
-if(VITAPLEX_HAVE_PSV_NOTIFY)
-    target_compile_definitions(vitahub_plex PRIVATE VITAPLEX_HAVE_PSV_NOTIFY=1)
-endif()
-if(VITAPLEX_MPRIS)
-    target_compile_definitions(vitahub_plex PRIVATE VITAPLEX_MPRIS=1)
-    target_link_libraries(vitahub_plex PRIVATE PkgConfig::DBUS)
+if(PLATFORM_SWITCH AND USE_DEKO3D)
+    target_compile_definitions(vitahub_plex PRIVATE VITAPLEX_NRO_DEKO3D)
 endif()

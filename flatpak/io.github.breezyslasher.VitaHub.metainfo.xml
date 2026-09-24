@@ -1,0 +1,54 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.github.breezyslasher.VitaHub</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>Apache-2.0</project_license>
+  <name>VitaHub</name>
+  <summary>Plex, Audiobookshelf, Suwayomi and Music Assistant in one app</summary>
+  <description>
+    <p>
+      VitaHub brings four controller-friendly clients together in one app with
+      one interface, built on borealis and libmpv.
+    </p>
+    <ul>
+      <li>Plex: movies, TV, music, photos, Live TV and DVR, downloads, SyncLounge</li>
+      <li>Audiobookshelf: audiobooks and podcasts with progress sync and downloads</li>
+      <li>Suwayomi: manga with paged and webtoon readers, tracking and extensions</li>
+      <li>Music Assistant: local playback and control of your network players</li>
+    </ul>
+  </description>
+  <launchable type="desktop-id">io.github.breezyslasher.VitaHub.desktop</launchable>
+  <categories>
+    <category>AudioVideo</category>
+    <category>Video</category>
+    <category>Audio</category>
+    <category>Player</category>
+  </categories>
+  <url type="homepage">https://github.com/Breezyslasher/VitaHub</url>
+  <url type="bugtracker">https://github.com/Breezyslasher/VitaHub/issues</url>
+  <developer id="io.github.breezyslasher">
+    <name>Breezyslasher</name>
+  </developer>
+  <content_rating type="oars-1.1"/>
+  <screenshots>
+    <screenshot type="default">
+      <caption>Home</caption>
+      <image>https://raw.githubusercontent.com/Breezyslasher/Vita_plex/main/Screenshots/Beta-1.0.0/home_page_new.png</image>
+    </screenshot>
+    <screenshot>
+      <caption>Movie details</caption>
+      <image>https://raw.githubusercontent.com/Breezyslasher/Vita_plex/main/Screenshots/Beta-1.0.0/movie_info_page.png</image>
+    </screenshot>
+    <screenshot>
+      <caption>TV show</caption>
+      <image>https://raw.githubusercontent.com/Breezyslasher/Vita_plex/main/Screenshots/Beta-1.0.0/tv_show.png</image>
+    </screenshot>
+    <screenshot>
+      <caption>Live TV</caption>
+      <image>https://raw.githubusercontent.com/Breezyslasher/Vita_plex/main/Screenshots/Beta-1.0.0/live_tv.png</image>
+    </screenshot>
+  </screenshots>
+  <releases>
+    <release version="0.1.0" date="2026-09-24"/>
+  </releases>
+</component>

@@ -4,39 +4,554 @@ on:
   push:
     branches: ['**']
   pull_request:
+    branches: [main]
   workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version override (leave empty to use APP_VERSION)'
+        type: string
+        default: ''
+      platform:
+        description: which platform to build
+        type: choice
+        options:
+        - all
+        - mingw64
+        - macos
+        - nx
+        - psvita
+        - ps4
+        - appimage
+        - flatpak
+        - android
+        - aur
+        - deb
+      pre_release:
+        description: 'Upload artifacts to a GitHub pre-release'
+        type: boolean
+        default: false
+      publish_pre_release:
+        description: 'Publish the pre-release automatically (off = leave it a draft to edit and publish by hand)'
+        type: boolean
+        default: true
+      disable_builtin_nsp:
+        description: disable builtin NSP
+        type: boolean
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Build matrix
+# ─────────────────────────────────────────────────────────────────────────────
 jobs:
+
+  resolve-version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.resolve.outputs.version }}
+      version_number: ${{ steps.resolve.outputs.version_number }}
+      version_tag: ${{ steps.resolve.outputs.version_tag }}
+      version_code: ${{ steps.resolve.outputs.version_code }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Resolve build version
+        id: resolve
+        run: |
+          # Read base version from VERSION file
+          APP_VERSION="$(cat VERSION | tr -d '\n')"
+          BASE="${APP_VERSION#v}"
+          BASE_NUM=$(echo "$BASE" | grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)?' | head -1)
+          if [[ -z "$BASE_NUM" ]]; then
+            BASE_NUM="0.0.0"
+          fi
+
+          if [[ -n "${{ inputs.version }}" ]]; then
+            V="${{ inputs.version }}"
+            # Also re-derive BASE_NUM from the override. Otherwise the
+            # numeric build (NUM = ${BASE_NUM}.${run_number}, used by
+            # CMake / Vita / PS4 / deb) keeps reading the previous
+            # VERSION-file value while the display version jumps ahead
+            # — producing a mismatch like "Display: Beta 1.0.2" but
+            # "Numeric: 1.0.1.450". The VERSION file isn't updated
+            # until the save-version job runs AFTER resolve-version,
+            # so we can't lean on it here.
+            OVERRIDE_NUM=$(echo "${V#v}" | grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)?' | head -1)
+            if [[ -n "$OVERRIDE_NUM" ]]; then
+              BASE_NUM="$OVERRIDE_NUM"
+            fi
+          elif [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            V="${APP_VERSION}"
+          else
+            # Non-release: use base version + build number (e.g. 2.1.0.456)
+            V="${BASE}.${{ github.run_number }}"
+          fi
+          V="${V#v}"
+          # Extract numeric version for CMake / Vita / PS4 / deb (no labels).
+          #
+          # Drop the github.run_number suffix on any "intentional" build —
+          # artifact filenames and embedded SFOs then read "1.0.2"
+          # instead of "1.0.2.450". An intentional build is either:
+          #   - a tag push (refs/tags/v…) — git-tagged release
+          #   - any workflow_dispatch with a version override — the user
+          #     typed a number into the form, which is by definition a
+          #     release or pre-release. pre_release=true vs false just
+          #     decides where the artifact is published; both want a
+          #     clean numeric version.
+          # Plain pushes to a branch keep the suffix so consecutive CI
+          # builds remain distinguishable from one another.
+          IS_RELEASE=false
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            IS_RELEASE=true
+          elif [[ -n "${{ inputs.version }}" ]]; then
+            IS_RELEASE=true
+          fi
+          if [[ "$IS_RELEASE" == "true" ]]; then
+            NUM="${BASE_NUM}"
+          else
+            NUM="${BASE_NUM}.${{ github.run_number }}"
+          fi
+          # Filename/tag-safe version (spaces → hyphens)
+          TAG="${V// /-}"
+
+          # Android versionCode, derived from the numeric version so it moves
+          # in lockstep with the version the in-app updater compares. It used
+          # to be github.run_number, which grows on EVERY push - so a dev
+          # build from a later run outranked a newer release, and Android
+          # refused the update as a downgrade ("App not installed") even
+          # though the updater offered it by version string. Encode
+          # major.minor.patch.build as M*10^8 + m*10^6 + p*10^4 + (build%10^4).
+          # The 10^8 base clears the old run-number codes (~32M today), so a
+          # build with this scheme supersedes any run-number install without
+          # a manual reinstall; monotonic with version thereafter.
+          IFS='.' read -r VC_MAJ VC_MIN VC_PAT VC_BLD <<< "${NUM}"
+          VC_MAJ=$((10#${VC_MAJ:-0})); VC_MIN=$((10#${VC_MIN:-0}))
+          VC_PAT=$((10#${VC_PAT:-0})); VC_BLD=$((10#${VC_BLD:-0} % 10000))
+          VERSION_CODE=$((VC_MAJ*100000000 + VC_MIN*1000000 + VC_PAT*10000 + VC_BLD))
+
+          echo "version=${V}" >> "$GITHUB_OUTPUT"
+          echo "version_number=${NUM}" >> "$GITHUB_OUTPUT"
+          echo "version_tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "version_code=${VERSION_CODE}" >> "$GITHUB_OUTPUT"
+          echo "Display version: ${V}"
+          echo "Numeric version: ${NUM}"
+          echo "Android versionCode: ${VERSION_CODE}"
+          echo "Tag/filename version: ${TAG}"
+
   # ───────────────────────────────────────────────
-  # PS Vita — VitaHub.vpk
-  # Same SDK image and portlibs as Vita_plex's CI.
+  # Save version override to VERSION file
+  # ───────────────────────────────────────────────
+  save-version:
+    needs: [resolve-version]
+    runs-on: ubuntu-latest
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.version != '' }}
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref }}
+      - name: Update VERSION file
+        run: |
+          echo "${{ inputs.version }}" > VERSION
+          echo "Updated VERSION to: ${{ inputs.version }}"
+          cat VERSION
+      - name: Commit and push
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add VERSION
+          git diff --cached --quiet && echo "No changes to commit" && exit 0
+          git commit -m "Update APP_VERSION to ${{ inputs.version }}"
+          git push
+
+  upload-release:
+    needs: [ resolve-version, build-mingw, build-nx, build-macos, build-appimage, build-aur, build-ps4, build-vita, build-android ]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    if: startsWith(github.ref, 'refs/tags/')
+    steps:
+      - name: Download Assets
+        uses: actions/download-artifact@v4
+      - name: Package Windows assets
+        run: |
+          # build-mingw uploads these as VitaHub-mingw-*; this globbed
+          # VitaHub-windows-* and so matched nothing. Latent rather than
+          # costly — every recent release came from the pre-release job, which
+          # globs the right name — but a tag-triggered release would have
+          # shipped without a Windows build at all.
+          for p in VitaHub-mingw-*; do
+            [[ -d $p ]] || continue
+            out="VitaHub-windows-${p#VitaHub-mingw-}"
+            7z a -mx=9 "$out.7z" ./$p/* && rm -rf $p
+          done
+          # The installer is a separate artifact; lift the exe out of its
+          # directory so the upload glob below can name it.
+          for p in VitaHub-setup-*; do
+            [[ -d $p ]] || continue
+            for exe in "$p"/*.exe; do
+              [ -f "$exe" ] && mv "$exe" "./$(basename "$exe")"
+            done
+            rm -rf "$p"
+          done
+      # Sign every asset so the in-app updater can verify authenticity before
+      # installing (see src/utils/update_verify.cpp): detached ECDSA-P256 /
+      # SHA-256 signatures published beside each asset as "<asset>.sig". No-op
+      # unless the UPDATE_SIGNING_KEY secret (EC private key, PEM) is set, so
+      # forks release normally and client verification stays inert until the
+      # matching public key is compiled in. Signs the same set uploaded below.
+      - name: Sign release assets
+        env:
+          UPDATE_SIGNING_KEY: ${{ secrets.UPDATE_SIGNING_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "${UPDATE_SIGNING_KEY:-}" ]; then
+            echo "UPDATE_SIGNING_KEY not set — skipping asset signing (verification ships inert)."
+            exit 0
+          fi
+          keyfile="$(mktemp)"
+          trap 'rm -f "$keyfile"' EXIT
+          printf '%s\n' "$UPDATE_SIGNING_KEY" > "$keyfile"
+          shopt -s nullglob
+          signed=0
+          for f in \
+              VitaHub-windows-*.7z \
+              VitaHub-Setup-*.exe \
+              VitaHub-macos-*/* \
+              VitaHub-switch-*/*.nro \
+              VitaHub-nx-*/*.nro \
+              VitaHub-ps4-*/* \
+              VitaHub-vita-*/*.vpk \
+              VitaHub-appimage-*/*.AppImage; do
+            [ -f "$f" ] || continue
+            case "$f" in *.sig) continue ;; esac
+            openssl dgst -sha256 -sign "$keyfile" -out "$f.sig" "$f"
+            echo "signed $f"
+            signed=$((signed + 1))
+          done
+          echo "Signed $signed asset(s)."
+      - name: Release and Upload Assets
+        id: release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: VitaHub ${{ github.ref_name }}
+          tag_name: ${{ github.ref_name }}
+          generate_release_notes: true
+          draft: true
+          files: |
+            VitaHub-windows-*.7z
+            VitaHub-windows-*.7z.sig
+            VitaHub-Setup-*.exe
+            VitaHub-Setup-*.exe.sig
+            VitaHub-macos-*/*
+            VitaHub-switch-*/*.nro
+            VitaHub-switch-*/*.nro.sig
+            VitaHub-nx-*/*.nro
+            VitaHub-nx-*/*.nro.sig
+            VitaHub-ps4-*/*
+            VitaHub-vita-*/*.vpk
+            VitaHub-vita-*/*.vpk.sig
+            VitaHub-appimage-*/*.AppImage
+            VitaHub-appimage-*/*.AppImage.sig
+            VitaHub-aur-*/*.pkg.tar.*
+            VitaHub-android-*/*
+      # draft: true above is what keeps the upload working on a repo with
+      # immutable releases, but nothing published the draft afterwards, so
+      # every tag-triggered release stopped at "Draft" until someone
+      # published it by hand. Same PATCH the pre-release job uses.
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api -X PATCH \
+            "repos/${{ github.repository }}/releases/${{ steps.release.outputs.id }}" \
+            -F draft=false
+
+  # ───────────────────────────────────────────────
+  # Pre-release — manually triggered
+  # ───────────────────────────────────────────────
+  upload-prerelease:
+    needs: [resolve-version, build-mingw, build-nx, build-macos, build-appimage, build-aur, build-ps4, build-vita, build-android, build-deb]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    if: ${{ !cancelled() && !failure() && github.event_name == 'workflow_dispatch' && inputs.pre_release == true }}
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+      - name: Rename artifacts for release
+        env:
+          FVER: ${{ needs.resolve-version.outputs.version_tag }}
+        run: |
+          mkdir -p release
+
+          # What did we actually get? Helpful when one of the per-
+          # platform globs further down silently misses (Switch NROs
+          # in particular have a history of being dropped because the
+          # artifact name changed without the rename loop following).
+          echo "=== Downloaded artifact directories ==="
+          ls -d */ 2>/dev/null || true
+          echo "=== All *.nro found ==="
+          find . -name "*.nro" -print 2>/dev/null || true
+          echo "======================================="
+
+          # Vita VPK
+          for f in $(find . -name "*.vpk"); do
+            cp "$f" "release/VitaHub.${FVER}.vpk"
+          done
+
+          # Android APKs (Gradle names them VitaHub-{abi}.apk)
+          for apk in $(find . -name "*.apk"); do
+            abi=$(basename "$apk" .apk | sed 's/VitaHub-//')
+            [ -n "$abi" ] && cp "$apk" "release/VitaHub.${FVER}-${abi}.apk"
+          done
+
+          # Windows — zip each arch (exe + dlls + resources)
+          for dir in VitaHub-mingw-*; do
+            [ -d "$dir" ] || continue
+            arch=$(echo "$dir" | sed -E 's/VitaHub-mingw-([^-]+)-.*/\1/')
+            (cd "$dir" && zip -r "../release/VitaHub.${FVER}-windows-${arch}.zip" .)
+          done
+
+          # Windows installer. Its own artifact (VitaHub-setup-*), so the loop
+          # above cannot see it — and anything not copied into release/ here is
+          # silently dropped, since that directory is what gets signed and
+          # uploaded. The step is skipped on a runner without makensis, so a
+          # missing installer is not an error.
+          for dir in VitaHub-setup-*; do
+            [ -d "$dir" ] || continue
+            arch=$(echo "$dir" | sed -E 's/VitaHub-setup-([^-]+)-.*/\1/')
+            exe=$(find "$dir" -name "*.exe" | head -1)
+            [ -n "$exe" ] && cp "$exe" "release/VitaHub.${FVER}-windows-${arch}-setup.exe"
+          done
+
+          # AppImages
+          for ai in $(find . -name "VitaHub-*.AppImage"); do
+            base=$(basename "$ai")
+            arch=$(echo "$base" | sed -E 's/VitaHub-(.+)-[0-9]+\.AppImage/\1/')
+            cp "$ai" "release/VitaHub.${FVER}-${arch}.AppImage"
+          done
+
+          # Switch NRO. Walk every *.nro the download step pulled
+          # down — we don't care what the artifact directory was
+          # named (history has it as VitaHub-nx-*, VitaHub-switch-*,
+          # NX-*…). Pull the driver name out of the *containing
+          # artifact directory* when it follows the convention; fall
+          # back to the bare basename otherwise so we still ship
+          # *something* even when the upload step's name changes.
+          while IFS= read -r nro; do
+            [ -z "$nro" ] && continue
+            top=$(echo "$nro" | awk -F/ '{print $2}')
+            driver=$(echo "$top" | sed -nE 's/^(VitaHub-)?(nx|switch|NX)-([A-Za-z0-9]+).*$/\3/p')
+            [ -z "$driver" ] && driver=$(basename "$nro" .nro | tr -d ' ' | tr -dc 'A-Za-z0-9_-')
+            [ -z "$driver" ] && driver=switch
+            cp "$nro" "release/VitaHub.${FVER}-switch-${driver}.nro"
+          done < <(find . -type f -name "*.nro")
+
+          # PS4 pkg
+          for f in $(find . -path "*ps4*" -name "*.pkg"); do
+            cp "$f" "release/VitaHub.${FVER}-ps4.pkg"
+          done
+
+          # macOS DMG
+          for dir in VitaHub-macos-*; do
+            [ -d "$dir" ] || continue
+            tag=$(echo "$dir" | sed -E 's/VitaHub-macos-([^-]+)-.*/\1/')
+            dmg=$(find "$dir" -name "*.dmg" | head -1)
+            [ -n "$dmg" ] && cp "$dmg" "release/VitaHub.${FVER}-macOS-${tag}.dmg"
+          done
+
+          # Deb
+          for f in $(find . -name "*.deb"); do
+            arch=$(dpkg-deb -f "$f" Architecture 2>/dev/null || echo "amd64")
+            cp "$f" "release/VitaHub.${FVER}-Linux_${arch}.deb"
+          done
+
+          # AUR
+          for f in $(find . -name "*.pkg.tar.zst"); do
+            cp "$f" "release/VitaHub.${FVER}-Linux.pkg.tar.zst"
+          done
+
+          echo "Release files:"
+          ls -lh release/
+      # This repo has immutable releases: a release is read-only the moment
+      # it publishes. Two consequences, and one step each below.
+      #
+      # First, a re-run for a version that already published cannot add or
+      # replace assets — which is how re-running to complete a set after one
+      # platform failed to build ends in:
+      #
+      #   Error: Cannot upload asset VitaHub.Beta-1.2.6-arm64-v8a.apk
+      #   to an immutable release.
+      #
+      # So clear the previous attempt first. Guarded to pre-releases: a real
+      # release is never deleted by this job.
+      - name: Clear a previously published pre-release for this version
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.resolve-version.outputs.version_tag }}
+        run: |
+          set -euo pipefail
+          # The exit status is what says "no such release", not the output:
+          # gh api prints the error body to stdout on a 404, so reading the
+          # output captures {"message":"Not Found",...} and hands it on as
+          # an id. One call, status-checked, parsed locally.
+          if ! release=$(gh api "repos/${{ github.repository }}/releases/tags/$TAG" 2>/dev/null); then
+            echo "No existing release for $TAG — nothing to clear."
+            exit 0
+          fi
+
+          id=$(jq -r '.id // empty' <<<"$release")
+          prerelease=$(jq -r '.prerelease // false' <<<"$release")
+          if [[ -z "$id" ]]; then
+            echo "No release id for $TAG — nothing to clear."
+            exit 0
+          fi
+          if [[ "$prerelease" != "true" ]]; then
+            echo "::error::Release $TAG already exists and is not a pre-release."
+            echo "::error::Refusing to delete it. Bump the version or remove it by hand."
+            exit 1
+          fi
+          echo "Deleting previously published pre-release $TAG (id=$id)"
+          gh api -X DELETE "repos/${{ github.repository }}/releases/$id"
+
+          # Deleting a release leaves its tag behind, and the next run's
+          # draft targets a different commit — publishing then fails with
+          # "We weren't able to create the release for you. Make sure you
+          # have a valid tag." Remove the tag so the recreate is clean.
+          if gh api "repos/${{ github.repository }}/git/refs/tags/$TAG" >/dev/null 2>&1; then
+            echo "Deleting tag $TAG left behind by that release"
+            gh api -X DELETE "repos/${{ github.repository }}/git/refs/tags/$TAG"
+          else
+            echo "No tag $TAG to remove."
+          fi
+
+      # Sign every release asset so the in-app updater can verify authenticity
+      # before it installs (see src/utils/update_verify.cpp): detached
+      # ECDSA-P256 / SHA-256 signatures, published beside each asset as
+      # "<asset>.sig". No-op unless the UPDATE_SIGNING_KEY secret (the EC
+      # private key, PEM) is configured, so forks and unconfigured repos still
+      # release normally — and client verification stays inert until the
+      # matching public key is compiled into update_verify.cpp. Runs before
+      # "Create pre-release" so the .sig files are part of the release/* upload.
+      - name: Sign release assets
+        env:
+          UPDATE_SIGNING_KEY: ${{ secrets.UPDATE_SIGNING_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "${UPDATE_SIGNING_KEY:-}" ]; then
+            echo "UPDATE_SIGNING_KEY not set — skipping asset signing (verification ships inert)."
+            exit 0
+          fi
+          keyfile="$(mktemp)"
+          trap 'rm -f "$keyfile"' EXIT
+          printf '%s\n' "$UPDATE_SIGNING_KEY" > "$keyfile"
+          shopt -s nullglob
+          signed=0
+          for f in release/*; do
+            [ -f "$f" ] || continue
+            case "$f" in *.sig) continue ;; esac
+            # Raw DER ECDSA-Sig-Value (SEQUENCE{r,s}) over SHA-256 — exactly
+            # what mbedtls_pk_verify() consumes on the client.
+            openssl dgst -sha256 -sign "$keyfile" -out "$f.sig" "$f"
+            echo "signed $(basename "$f")"
+            signed=$((signed + 1))
+          done
+          echo "Signed $signed asset(s)."
+
+      # Second, a prerelease publishes as soon as it is created, so its
+      # assets would be attaching to something already read-only. Created as
+      # a DRAFT on purpose; the publish step below flips it live once every
+      # asset is attached.
+      - name: Create pre-release
+        id: prerelease
+        uses: softprops/action-gh-release@v2
+        with:
+          name: VitaHub ${{ needs.resolve-version.outputs.version }}
+          tag_name: ${{ needs.resolve-version.outputs.version_tag }}
+          prerelease: true
+          draft: true
+          generate_release_notes: true
+          files: release/*
+      # Skipped when publish_pre_release is off, which leaves the release a
+      # draft: assets attached, notes editable, yours to publish when the
+      # description reads the way you want. Publishing is what makes it
+      # immutable, so this is the last moment it can be edited freely.
+      - name: Publish the pre-release
+        if: ${{ inputs.publish_pre_release }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        # -F (not -f) so draft is sent as a JSON boolean rather than the
+        # string "false", which the API would reject.
+        run: |
+          gh api -X PATCH \
+            "repos/${{ github.repository }}/releases/${{ steps.prerelease.outputs.id }}" \
+            -F draft=false
+      - name: Note the draft was left unpublished
+        if: ${{ !inputs.publish_pre_release }}
+        run: |
+          echo "::notice::Pre-release left as a draft. Edit the notes, then publish it here:"
+          echo "::notice::${{ steps.prerelease.outputs.url }}"
+
+  # ───────────────────────────────────────────────
+  # PS Vita — VPK
   # ───────────────────────────────────────────────
   build-vita:
+    needs: [resolve-version]
+    if: ${{ inputs.platform == 'psvita' || inputs.platform == 'all' ||  github.event_name != 'workflow_dispatch' }}
     name: PS Vita
     runs-on: ubuntu-latest
     container:
+      # Pinned, not :latest. A rolling rebuild of :latest moved the base
+      # distro (breaking "apk add") and swapped vdpm onto pacman in the same
+      # week — both landed as build failures with no change on our side.
+      # 2026.08 is the series switchfin itself builds its vita-packages
+      # against, so it matches the assets fetched below.
       image: vitasdk/vitasdk:2026.08
 
     steps:
       - name: Install build requirements
+        # vitasdk/vitasdk:latest is a rolling image and its base distro is not
+        # a fixed contract — it was Alpine (apk) and a rebuild moved it, which
+        # broke this step with "apk: not found". Detect the package manager
+        # instead of assuming one, and treat "already installed" as success so
+        # a future base swap doesn't fail the build again.
         run: |
           set -eu
-          # python3 + patch: the private WebRTC mbedTLS (modules/music) is
-          # patched and configured with mbedTLS' own scripts/config.py.
-          if command -v apt-get >/dev/null 2>&1; then
-            apt-get update
-            DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-              cmake ninja-build git zstd tar pkg-config wget curl xz-utils python3 patch bzip2
-          elif command -v apk >/dev/null 2>&1; then
-            apk update && apk add cmake ninja git zstd tar pkgconf wget curl xz python3 patch bzip2
+          pkgs_apk="cmake ninja git zstd tar pkgconf python3 patch bzip2"
+          pkgs_apt="cmake ninja-build git zstd tar pkg-config python3 patch bzip2"
+          if command -v apk >/dev/null 2>&1; then
+            apk update && apk add $pkgs_apk
+          elif command -v apt-get >/dev/null 2>&1; then
+            apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends $pkgs_apt
+          elif command -v dnf >/dev/null 2>&1; then
+            dnf install -y cmake ninja-build git zstd tar pkgconf-pkg-config
+          elif command -v pacman >/dev/null 2>&1; then
+            pacman -Sy --noconfirm cmake ninja git zstd tar pkgconf
+          else
+            echo "No supported package manager found; relying on the image's toolchain"
           fi
+          # wget is used by the dependency step below and is not in every base.
+          if ! command -v wget >/dev/null 2>&1; then
+            if command -v apk >/dev/null 2>&1; then apk add wget
+            elif command -v apt-get >/dev/null 2>&1; then apt-get install -y --no-install-recommends wget
+            fi
+          fi
+          for tool in cmake ninja git wget; do
+            command -v "$tool" >/dev/null 2>&1 || { echo "::error::$tool missing after dependency install"; exit 1; }
+          done
 
       - name: Checkout
         uses: actions/checkout@v4
         with:
           submodules: recursive
 
+      # The pinned portlibs are identical between runs, so fetch them once
+      # and cache the files — the key IS the pin list, so bumping a version
+      # naturally misses and refetches. The fetch itself aborts any
+      # transfer that crawls below 100 KB/s for 30s and retries: GitHub's
+      # release-asset CDN intermittently serves an edge at dial-up speed,
+      # and a retry lands on a healthy one instead of waiting it out.
       - name: Cache Vita portlibs
+        id: cache-vita-portlibs
         uses: actions/cache@v4
         with:
           path: portlib-cache
@@ -46,26 +561,103 @@ jobs:
         env:
           BASE_URL: https://github.com/dragonflylee/switchfin/releases/download/vita-packages
         run: |
+          # NOTE: vita-packages is a ROLLING release on switchfin's side —
+          # version bumps REPLACE the old assets, so stale pins here 404.
+          # Current list: https://github.com/dragonflylee/switchfin/releases/tag/vita-packages
+          #
+          # Use the *-vita.pkg.tar.xz assets, not the legacy *-arm.tar.xz ones.
+          # The -arm files are bare sysroot trees (include/ + lib/, no .PKGINFO)
+          # from the pre-pacman vdpm era; feeding them to pacman fails with
+          # "missing package metadata ... invalid or corrupted package". The
+          # -vita.pkg.tar.xz assets are real pacman packages.
           set -eu
+          fetch() {
+            if command -v curl >/dev/null 2>&1; then
+              curl -fL --retry 4 --retry-all-errors \
+                   --speed-limit 102400 --speed-time 30 -o "$2" "$1"
+            else
+              wget --tries=4 --read-timeout=30 -O "$2" "$1"
+            fi
+          }
           mkdir -p portlib-cache
           for pkg in mbedtls-3.6.7-1 curl-8.16.0-3 ffmpeg-n6.0-3 mpv-0.36.0-3; do
             f="portlib-cache/${pkg}-vita.pkg.tar.xz"
-            [ -s "$f" ] || curl -fL --retry 4 --retry-all-errors \
-              --speed-limit 102400 --speed-time 30 -o "$f" "$BASE_URL/${pkg}-vita.pkg.tar.xz"
+            [ -s "$f" ] || fetch "$BASE_URL/${pkg}-vita.pkg.tar.xz" "$f"
           done
-          VDPM_NONINTERACTIVE=1 vdpm libass harfbuzz fribidi freetype libpng libwebp || true
-          # Plain tar.xz rooted like the SDK; unpacking them is what
-          # pacman --upgrade would do minus the package database.
-          for f in portlib-cache/*-vita.pkg.tar.xz; do
-            tar -xJf "$f" -C "$VITASDK" \
-                --exclude=.PKGINFO --exclude=.MTREE --exclude=.BUILDINFO --exclude=.INSTALL
-          done
-          find "$VITASDK" -name libmpv.a -print -quit | grep -q . || { echo "libmpv.a missing"; exit 1; }
+          cp portlib-cache/*-vita.pkg.tar.xz .
+
+          # Packages carried by the VitaSDK repo go in by name.
+          VDPM_NONINTERACTIVE=1 vdpm libass harfbuzz fribidi freetype libpng libwebp
+
+          # The switchfin packages above are LOCAL FILES, and they can no
+          # longer be appended to that same command. VitaSDK 2026.08 moved
+          # vdpm onto pacman, where the install path is `pacman --sync` —
+          # which resolves repository names only and rejects paths with
+          # "target not found: .../curl-8.16.0-3-arm.tar.xz ... did you mean
+          # -U/--upgrade instead of -S/--sync?". Local packages have to go
+          # through `--upgrade`, invoked with the same root/db/cache
+          # arguments vdpm builds internally (see vdpm's run_pacman).
+          # $VITASDK/bin/pacman is not where it lives in every image, and the
+          # old fallback for that case was `vdpm <local files>` — which is the
+          # very thing that fails, because modern vdpm forwards to
+          # `pacman --sync` and --sync resolves repository names, not paths.
+          # A missing binary therefore looked like a working fallback and
+          # failed with "target not found: .../curl-8.16.0-3-vita.pkg.tar.xz".
+          # Look in the places it actually turns up, including PATH — the
+          # image has a pacman there; the build-requirements step above uses
+          # it.
+          PACMAN="${VDPM_PACMAN:-}"
+          if [ -z "$PACMAN" ] || [ ! -x "$PACMAN" ]; then
+            PACMAN=""
+            for cand in "$VITASDK/bin/pacman" "$VITASDK/usr/bin/pacman" \
+                        "$(command -v pacman 2>/dev/null || true)"; do
+              if [ -n "$cand" ] && [ -x "$cand" ]; then PACMAN="$cand"; break; fi
+            done
+          fi
+          echo "pacman for local packages: ${PACMAN:-<none found>}"
+
+          if [ -n "$PACMAN" ]; then
+            mkdir -p "$VITASDK/var/lib/pacman" "$VITASDK/var/cache/pacman/pkg" "$VITASDK/var/log"
+            # --config only when there is one to point at: a pacman taken from
+            # PATH has its own default, and naming a file that does not exist
+            # is a hard error.
+            set -- --root "$VITASDK" \
+                   --dbpath "$VITASDK/var/lib/pacman" \
+                   --cachedir "$VITASDK/var/cache/pacman/pkg" \
+                   --logfile "$VITASDK/var/log/pacman.log" \
+                   --noscriptlet --noconfirm --noprogressbar
+            CONF="${VDPM_PACMAN_CONF:-$VITASDK/etc/pacman.conf}"
+            [ -f "$CONF" ] && set -- --config "$CONF" "$@"
+            "$PACMAN" "$@" --upgrade $PWD/*-vita.pkg.tar.xz
+          else
+            # No pacman anywhere. These are plain tar.xz rooted the same way
+            # --root would place them, so unpacking them is the same result
+            # minus the package database — which nothing in this build reads.
+            # The dot-files are pacman's own metadata, not part of the SDK.
+            echo "no pacman found; unpacking the packages directly"
+            for f in $PWD/*-vita.pkg.tar.xz; do
+              tar -xJf "$f" -C "$VITASDK" \
+                  --exclude=.PKGINFO --exclude=.MTREE --exclude=.BUILDINFO --exclude=.INSTALL
+            done
+          fi
+
+          # Fail here rather than in the compiler: nothing installed surfaces
+          # hundreds of lines later as an unrelated-looking error. Searched
+          # rather than looked up at a fixed path, because the sysroot layout
+          # is the image's business and is not worth a second thing to keep in
+          # step with it.
+          if ! find "$VITASDK" \( -name 'libmpv.a' -o -name 'libcurl.a' \) -print -quit | grep -q .; then
+            echo "Vita dependencies did not install: no libmpv.a or libcurl.a under $VITASDK" >&2
+            exit 1
+          fi
+
           git config --system --add safe.directory "$GITHUB_WORKSPACE"
 
       - name: Build
         run: |
-          cmake -B build -G Ninja -DPLATFORM_PSV=ON
+          cmake -B build -G Ninja -DPLATFORM_PSV=ON \
+          -DAPP_VERSION=${{ needs.resolve-version.outputs.version_number }} \
+          -DAPP_DISPLAY_VERSION="${{ needs.resolve-version.outputs.version }}"
           cmake --build build
 
       - name: Upload VPK
@@ -73,46 +665,1340 @@ jobs:
         with:
           name: VitaHub-vita-${{ github.run_number }}
           path: build/VitaHub.vpk
-
-      - name: Upload ELF (crash symbolication)
+      - name: Upload ELF
         uses: actions/upload-artifact@v4
         with:
           name: VitaHub-elf-${{ github.run_number }}
           path: build/VitaHub
 
+             
   # ───────────────────────────────────────────────
-  # Linux desktop — development build
+  # Android — switchfin-style APK build
   # ───────────────────────────────────────────────
-  build-linux:
-    name: Linux desktop
-    runs-on: ubuntu-24.04
-
+  build-android:
+    needs: [resolve-version]
+    if: ${{ inputs.platform == 'android' || inputs.platform == 'all' || github.event_name != 'workflow_dispatch' }}
+    name: Android
+    runs-on: ubuntu-latest
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+    - uses: actions/checkout@v4
+      with:
+        submodules: recursive
+    - uses: nttld/setup-ndk@v1
+      id: setup-ndk
+      with:
+        ndk-version: r27d
+        link-to-sdk: true
+    - name: Install dependency
+      run: |
+        # The Azure-internal mirror is the fastest choice from these runners
+        # on a healthy day, so keep it first — but let apt's mirror method
+        # fall back to the public archive when a request fails outright,
+        # which is what the Ign:/stall pattern in the logged crawls was.
+        # amd64 only: the arm64 runners use the ports mirror instead.
+        if [ "$(dpkg --print-architecture)" = "amd64" ] && [ -f /etc/apt/sources.list.d/ubuntu.sources ]; then
+          printf 'http://azure.archive.ubuntu.com/ubuntu/\tpriority:1\nhttp://archive.ubuntu.com/ubuntu/\tpriority:2\n' \
+            | sudo tee /etc/apt/apt-mirrors.txt >/dev/null
+          sudo sed -i 's|^URIs: .*|URIs: mirror+file:/etc/apt/apt-mirrors.txt|' /etc/apt/sources.list.d/ubuntu.sources
+        fi
+        sudo apt-get -o Acquire::Retries=3 update
+        sudo apt-get -o Acquire::Retries=3 install -y ninja-build pkg-config meson nasm make zstd
+    - name: Cache depends
+      id: cache-deps
+      uses: actions/cache@v4
+      with:
+        path: jniLibs
+        key: jniLibs-${{ hashFiles('scripts/android/Makefile') }}
+    - name: Build packages
+      if: steps.cache-deps.outputs.cache-hit != 'true'
+      run: |
+        make -C scripts/android TMPDIR=${{ runner.temp }} download
+        make -C scripts/android TMPDIR=${{ runner.temp }} ABI=armeabi-v7a \
+          ANDROID_NDK=${{ steps.setup-ndk.outputs.ndk-path }} build
+        make -C scripts/android TMPDIR=${{ runner.temp }} ABI=arm64-v8a \
+          ANDROID_NDK=${{ steps.setup-ndk.outputs.ndk-path }} build
+    - name: Bump version
+      uses: chkfung/android-version-actions@v1.2.2
+      with:
+        gradlePath: app/platform/android/app/build.gradle
+        versionCode: ${{ needs.resolve-version.outputs.version_code }}
+        versionName: ${{ needs.resolve-version.outputs.version }}
+    - name: Prepare Android sources and native dependencies
+      run: |
+        rm -rf app/platform/android/app/libs
+        mkdir -p app/platform/android/app/libs
+        for abi in armeabi-v7a arm64-v8a x86_64; do
+          src_libdir="jniLibs/${abi}/lib"
+          [ -d "${src_libdir}" ] || continue
+
+          # Normalize optional linker names for CMake (-lpng/-lbz2/-lzstd).
+          for missing in png bz2 zstd; do
+            [ -e "${src_libdir}/lib${missing}.so" ] && continue
+            [ -e "${src_libdir}/lib${missing}.a" ] && continue
+            candidate="$(find "${src_libdir}" -maxdepth 1 -type f \( -name "lib${missing}*.so*" -o -name "lib${missing}*.a" \) | head -n1)"
+            [ -n "${candidate}" ] || continue
+            ln -sfn "$(basename "${candidate}")" "${src_libdir}/lib${missing}.so"
+            echo "Aliased ${src_libdir}/lib${missing}.so -> $(basename "${candidate}")"
+          done
+
+          # Only stage runtime .so files for packaging to keep Gradle memory low.
+          dst_libdir="app/platform/android/app/libs/${abi}"
+          mkdir -p "${dst_libdir}"
+          find "${src_libdir}" -maxdepth 1 \( -name "*.so" -o -name "*.so.*" \) -exec cp -a {} "${dst_libdir}/" \;
+        done
+    - name: Build APK
+      # build_libromfs_generator.sh must run before Gradle/CMake configure because
+      # borealis's toolchain.cmake unconditionally checks that the generator binary
+      # exists when PLATFORM_ANDROID is set — even though USE_LIBROMFS=OFF means
+      # the generator is never actually used to embed anything.
+      # Resources are loaded via APK assets (see build.gradle syncBorealisResources).
+      run: |
+        ${{ github.workspace }}/lib/borealis/build_libromfs_generator.sh
+        # Pass the CI-resolved version through to the native cmake build (via
+        # build.gradle) so the in-app Settings version matches the APK
+        # versionName instead of the possibly-stale VERSION file.
+        cd app/platform/android && ./gradlew assembleRelease \
+          -PappVersion="${{ needs.resolve-version.outputs.version_number }}" \
+          -PappDisplayVersion="${{ needs.resolve-version.outputs.version }}"
+    - name: Upload dist
+      uses: actions/upload-artifact@v4
+      with:
+        name: VitaHub-android-${{ github.run_number }}
+        path: app/platform/android/app/build/outputs/apk/release/*.apk
+
+  # ───────────────────────────────────────────────
+  # AppImage — portable Linux (x86_64 + aarch64)
+  # ───────────────────────────────────────────────
+  build-appimage:
+    needs: [resolve-version]
+    if: ${{ inputs.platform == 'appimage' || inputs.platform == 'all' || github.event_name != 'workflow_dispatch' }}
+    name: AppImage (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+        - { arch: x86_64, runner: ubuntu-24.04 }
+        - { arch: aarch64, runner: ubuntu-24.04-arm }
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
         with:
           submodules: recursive
-
+      - name: Set workspace permissions
+        run: git config --global --add safe.directory $GITHUB_WORKSPACE
+      # Same apt treatment as the deb/AUR jobs: the amd64 Azure mirror
+      # intermittently crawls at KB/s (one run had deb, AUR, Flatpak x86_64
+      # and Android all stuck in it simultaneously while the arm64 legs,
+      # on a different mirror host, finished in under a minute).
+      - name: Cache apt packages
+        if: ${{ runner.os == 'Linux' }}
+        uses: actions/cache@v4
+        with:
+          path: apt-deb-cache
+          key: apt-debs-flatpak-${{ runner.arch }}-v1
       - name: Install dependencies
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            ninja-build pkg-config \
-            libmpv-dev libavformat-dev libavfilter-dev libavcodec-dev libswscale-dev \
-            libswresample-dev libavutil-dev libmp3lame-dev \
-            libcurl4-openssl-dev libmbedtls-dev libssl-dev \
-            libass-dev libfreetype-dev libfribidi-dev libharfbuzz-dev libpng-dev \
-            libwebp-dev libbz2-dev libzstd-dev zlib1g-dev libdbus-1-dev \
-            libx11-dev libxrandr-dev libxinerama-dev libxcursor-dev libxi-dev \
-            libxkbcommon-dev libwayland-dev wayland-protocols libgl-dev
-
-      - name: Build
+          if command -v apt-get >/dev/null 2>&1; then
+            # The Azure-internal mirror is the fastest choice from these runners
+            # on a healthy day, so keep it first — but let apt's mirror method
+            # fall back to the public archive when a request fails outright,
+            # which is what the Ign:/stall pattern in the logged crawls was.
+            # amd64 only: the arm64 runners use the ports mirror instead.
+            if [ "$(dpkg --print-architecture)" = "amd64" ] && [ -f /etc/apt/sources.list.d/ubuntu.sources ]; then
+              printf 'http://azure.archive.ubuntu.com/ubuntu/\tpriority:1\nhttp://archive.ubuntu.com/ubuntu/\tpriority:2\n' \
+                | sudo tee /etc/apt/apt-mirrors.txt >/dev/null
+              sudo sed -i 's|^URIs: .*|URIs: mirror+file:/etc/apt/apt-mirrors.txt|' /etc/apt/sources.list.d/ubuntu.sources
+            fi
+            mkdir -p apt-deb-cache/partial
+            sudo apt-get -o Acquire::Retries=3 update
+            # librtmp1 / libssh-4 are Recommends (not Depends) of
+            # libavformat on Ubuntu 24.04 — without them ldd of the
+            # build's libavformat reports "librtmp.so.1 => not found"
+            # and the bundling loop below silently skips it, then
+            # Steam Deck (which doesn't ship librtmp.so.1) fails at
+            # launch with "error while loading shared libraries:
+            # librtmp.so.1". Pull them in explicitly so they're
+            # present on the build host AND get bundled.
+            sudo apt-get -o Acquire::Retries=3 -o Dir::Cache::archives=$PWD/apt-deb-cache \
+              install -y --no-install-recommends \
+              cmake ninja-build pkg-config \
+              libcurl4-openssl-dev libmbedtls-dev libmpv-dev \
+              libavcodec-dev libavformat-dev libavfilter-dev libswresample-dev libswscale-dev libavutil-dev \
+              libmp3lame-dev libass-dev libfreetype-dev libharfbuzz-dev libfribidi-dev \
+              libpng-dev libwebp-dev libzstd-dev libdbus-1-dev libssl-dev \
+              librtmp1 libssh-gcrypt-4 \
+              libwayland-dev libxkbcommon-dev xorg-dev
+            sudo rm -rf apt-deb-cache/partial apt-deb-cache/lock
+          elif command -v dnf >/dev/null 2>&1; then
+            dnf install -y \
+              cmake ninja-build pkgconf-pkg-config \
+              libcurl-devel mbedtls-devel mpv-devel \
+              ffmpeg-devel lame-devel libass-devel freetype-devel harfbuzz-devel fribidi-devel \
+              libpng-devel libwebp-devel libzstd-devel dbus-devel openssl-devel \
+              wayland-devel libxkbcommon-devel libX11-devel libXrandr-devel libXi-devel libXinerama-devel libXcursor-devel
+          elif command -v microdnf >/dev/null 2>&1; then
+            microdnf install -y \
+              cmake ninja-build pkgconf-pkg-config \
+              libcurl-devel mbedtls-devel mpv-devel \
+              ffmpeg-devel lame-devel libass-devel freetype-devel harfbuzz-devel fribidi-devel \
+              libpng-devel libwebp-devel libzstd-devel dbus-devel openssl-devel \
+              wayland-devel libxkbcommon-devel libX11-devel libXrandr-devel libXi-devel libXinerama-devel libXcursor-devel
+          elif command -v apk >/dev/null 2>&1; then
+            apk add --no-cache \
+              cmake ninja pkgconf \
+              curl-dev mbedtls-dev mpv-dev ffmpeg-dev lame-dev libass-dev freetype-dev harfbuzz-dev fribidi-dev \
+              libpng-dev libwebp-dev zstd-dev dbus-dev openssl-dev wayland-dev libxkbcommon-dev libx11-dev libxrandr-dev libxi-dev libxinerama-dev libxcursor-dev
+          else
+            echo "No supported package manager found; assuming container image already has required build dependencies"
+          fi
+      # Every desktop build FetchContents GLFW (switchfin fork tarball) from
+      # GitHub at configure time — the same codeload CDN that intermittently
+      # crawls. Cache the fetched sources; the key is the borealis pin, since
+      # that submodule owns the FetchContent URLs.
+      - name: Cache FetchContent sources
+        uses: actions/cache@v4
+        with:
+          path: build/_deps
+          key: fetchcontent-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('lib/borealis/library/CMakeLists.txt') }}
+      - name: Build desktop target
         run: |
-          cmake -B build -G Ninja -DPLATFORM_DESKTOP=ON -DCMAKE_BUILD_TYPE=Release
+          cmake -B build -G Ninja -DPLATFORM_DESKTOP=ON \
+             -DAPP_VERSION=${{ needs.resolve-version.outputs.version_number }} \
+             -DAPP_DISPLAY_VERSION="${{ needs.resolve-version.outputs.version }}"
           cmake --build build
 
-      - name: Upload
+          # Make the tarball self-contained: bundle libmpv and any other
+          # non-system shared deps next to the binary, set RPATH so the
+          # loader finds them. Without this SteamOS / Bazzite / any
+          # distro that doesn't ship libmpv.so.2 fails at launch with
+          # "error while loading shared libraries: libmpv.so.2:
+          # cannot open shared object file".
+          #
+          # Skip libs that ARE part of the base system on every modern
+          # Linux: glibc, libstdc++, libgcc_s, OpenGL/EGL/Vulkan,
+          # Wayland/X11/xkb/dbus, plus the dynamic loader itself. Those
+          # belong to the distro and should NOT be shipped (an old
+          # bundled glibc next to a newer host glibc is the classic way
+          # to crash on startup).
+          BUNDLE_DIR=build/lib
+          mkdir -p "$BUNDLE_DIR"
+          # `[-.]` after the prefix means we match both
+          # libwayland-client.so.0 (hyphen) and libwayland.so.0 (dot)
+          # without accidentally catching e.g. libcurl when we meant libc.
+          # Dash must be first inside the bracket to be literal in POSIX ERE.
+          EXCLUDE='^(/lib(64)?/ld-|.*/(libc|libm|libpthread|libdl|librt|libresolv|libutil|libnsl|libstdc\+\+|libgcc_s|libGL|libGLX|libEGL|libGLdispatch|libGLESv|libOpenGL|libvulkan|libX11|libxcb|libXext|libXrandr|libXi|libXinerama|libXcursor|libXrender|libXfixes|libwayland|libxkbcommon|libdbus|libsystemd|libudev|libdrm|libgbm)[-.]|linux-vdso\.so)'
+
+          # Fixed-point walk: start from the binary, bundle every non-excluded
+          # dep, then for each newly bundled lib walk ITS deps too. Previous
+          # version did only one level of recursion past the binary, which
+          # missed librtmp coming in via libavformat-via-libavformat-protocols
+          # on some distros. Loop until no new libs land in $BUNDLE_DIR.
+          # Fail loudly if ldd reports any dep as "not found" — the runtime
+          # loader will hit the same gap on Steam Deck / Bazzite and refuse
+          # to start the binary.
+          declare -A bundled
+          UNRESOLVED=""
+          walk_deps() {
+            local target="$1"
+            while IFS= read -r raw; do
+              # ldd "foo.so" lines look like:
+              #   libfoo.so.1 => /path/to/libfoo.so.1 (0xaddr)
+              #   libfoo.so.1 => not found
+              # We need the path AND must detect the "not found" case
+              # because awk '$3' silently turns it into "not".
+              local needed path
+              needed=$(echo "$raw" | awk '{print $1}')
+              path=$(echo "$raw" | awk '{print $3}')
+              if [ "$path" = "not" ]; then
+                # `not found` — record it; verdict comes after the walk.
+                UNRESOLVED+="${needed} (needed by $(basename "$target"))"$'\n'
+                continue
+              fi
+              [[ -z "$path" || ! -f "$path" ]] && continue
+              [[ "$path" =~ $EXCLUDE ]] && continue
+              local name; name=$(basename "$path")
+              if [ -z "${bundled[$name]+x}" ]; then
+                cp -L "$path" "$BUNDLE_DIR/"
+                bundled[$name]=1
+                # Recurse into the just-bundled lib.
+                walk_deps "$BUNDLE_DIR/$name"
+              fi
+            done < <(ldd "$target" 2>/dev/null | awk '/=>/')
+          }
+          walk_deps build/VitaHub
+
+          echo "Bundled libraries:"; ls -la "$BUNDLE_DIR" || true
+          if [ -n "$UNRESOLVED" ]; then
+            echo "::error::ldd reported unresolved dependencies on the build"
+            echo "host — Steam Deck / Bazzite will hit the same gap. Either"
+            echo "install the missing packages on the build runner or add"
+            echo "their providers to the apt-get install list above."
+            printf '%s' "$UNRESOLVED"
+            exit 1
+          fi
+
+          # Point the binary at $ORIGIN/lib so it finds the bundled
+          # copies before consulting the host's lib path. Falls back to
+          # the system installation if a particular .so isn't bundled
+          # (e.g. the OpenGL stack, which we deliberately skipped).
+          if ! command -v patchelf >/dev/null 2>&1; then
+            if command -v apt-get >/dev/null 2>&1; then
+              sudo apt-get install -y patchelf || apt-get install -y patchelf
+            elif command -v dnf >/dev/null 2>&1; then
+              dnf install -y patchelf
+            elif command -v apk >/dev/null 2>&1; then
+              apk add --no-cache patchelf
+            fi
+          fi
+          # Patch the binary's RPATH to look in $ORIGIN/lib first.
+          # Then patch every BUNDLED lib too — modern ELF uses DT_RUNPATH
+          # which only resolves a library's DIRECT deps; the loader will
+          # NOT cascade the binary's RUNPATH through libavformat when
+          # libavformat asks for librtmp. So even though librtmp.so.1
+          # is sitting in $ORIGIN/lib, the system-built libavformat (no
+          # RUNPATH) couldn't see it and Steam Deck failed with
+          # "error while loading shared libraries: librtmp.so.1".
+          # Giving each bundled lib RPATH=$ORIGIN makes the bundle
+          # self-resolving.
+          patchelf --set-rpath '$ORIGIN/lib' build/VitaHub
+          for so in "$BUNDLE_DIR"/*.so*; do
+            [ -f "$so" ] || continue
+            # `|| true` because some libs (e.g. stripped vendor blobs)
+            # may refuse to be patched; non-fatal for the overall bundle.
+            patchelf --set-rpath '$ORIGIN' "$so" 2>/dev/null || true
+          done
+
+          # ── Package as an AppImage ──────────────────────────────────────
+          # Reuse the bundle just built: binary in usr/bin, bundled libs in
+          # usr/lib (RPATH re-pointed to $ORIGIN/../lib for the AppDir layout),
+          # resources under usr/share/VitaHub. AppRun cd's there first so the
+          # desktop RESOURCE_PREFIX="resources/" resolves. appimagetool runs
+          # extracted (--appimage-extract-and-run) because CI runners have no
+          # FUSE.
+          APPDIR=AppDir
+          rm -rf "$APPDIR"
+          mkdir -p "$APPDIR/usr/bin" "$APPDIR/usr/lib" "$APPDIR/usr/share/VitaHub"
+          cp build/VitaHub "$APPDIR/usr/bin/VitaHub"
+          cp -a build/lib/. "$APPDIR/usr/lib/"
+          cp -r build/resources "$APPDIR/usr/share/VitaHub/resources"
+          patchelf --set-rpath '$ORIGIN/../lib' "$APPDIR/usr/bin/VitaHub"
+          printf '%s\n' '#!/bin/sh' \
+            'HERE="$(dirname "$(readlink -f "$0")")"' \
+            'cd "$HERE/usr/share/VitaHub" || exit 1' \
+            'exec "$HERE/usr/bin/VitaHub" "$@"' > "$APPDIR/AppRun"
+          chmod +x "$APPDIR/AppRun"
+          printf '%s\n' '[Desktop Entry]' 'Type=Application' 'Name=VitaHub' \
+            'Comment=Plex, Audiobookshelf, Suwayomi and Music Assistant in one app' 'Exec=VitaHub' 'Icon=VitaHub' \
+            'Terminal=false' 'Categories=AudioVideo;Video;Network;' > "$APPDIR/VitaHub.desktop"
+          cp app/platform/icon_desktop.png "$APPDIR/VitaHub.png"
+          curl -fsSL "https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-${{ matrix.arch }}.AppImage" -o appimagetool
+          chmod +x appimagetool
+          ARCH=${{ matrix.arch }} ./appimagetool --appimage-extract-and-run "$APPDIR" \
+            "VitaHub-${{ matrix.arch }}-${{ github.run_number }}.AppImage"
+      - name: Upload AppImage artifact
         uses: actions/upload-artifact@v4
         with:
-          name: VitaHub-linux-${{ github.run_number }}
-          path: build/VitaHub
+          name: VitaHub-appimage-${{ matrix.arch }}-${{ github.run_number }}
+          path: VitaHub-${{ matrix.arch }}-${{ github.run_number }}.AppImage
+
+  # ───────────────────────────────────────────────
+  # Flatpak — org.freedesktop.Platform 24.08 (Flathub target)
+  # ───────────────────────────────────────────────
+  build-flatpak:
+    needs: [resolve-version]
+    if: ${{ inputs.platform == 'flatpak' || inputs.platform == 'all' || github.event_name != 'workflow_dispatch' }}
+    name: Flatpak
+    runs-on: ubuntu-24.04
+    container:
+      image: bilelmoussaoui/flatpak-github-actions:freedesktop-24.08
+      options: --privileged
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Stamp the CI-resolved version into VERSION
+        # flatpak-builder builds the vitahub module from this checkout
+        # (source type: dir), and the manifest's cmake reads the VERSION file
+        # for the in-app version — the manifest can't reference CI vars the way
+        # other platforms pass -DAPP_DISPLAY_VERSION. Without this the Flatpak's
+        # Settings version would be the on-disk VERSION (stale on override/tag
+        # builds, missing the build number on dev builds), the same divergence
+        # the Android build had. Stamp the resolved version so they match.
+        run: echo "${{ needs.resolve-version.outputs.version }}" > VERSION
+      - name: Build Flatpak bundle
+        uses: flatpak/flatpak-github-actions/flatpak-builder@v6
+        with:
+          bundle: VitaHub.flatpak
+          manifest-path: flatpak/io.github.breezyslasher.VitaHub.yaml
+          cache-key: flatpak-builder-${{ hashFiles('flatpak/io.github.breezyslasher.VitaHub.yaml') }}
+      - name: Upload Flatpak artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: VitaHub-flatpak-${{ github.run_number }}
+          path: VitaHub.flatpak
+
+  # ───────────────────────────────────────────────
+  # Nintendo Switch — Matrix (opengl + deko3d)
+  # ───────────────────────────────────────────────
+  build-nx:
+    needs: [resolve-version]
+    if: ${{ inputs.platform == 'nx' || inputs.platform == 'all' || github.event_name != 'workflow_dispatch' }}
+    name: NX (${{ matrix.driver }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+        # switchfin's portlibs release currently pins libmpv at 0.36.0-5;
+        # 0.41.0-5 was never published, so the previous URLs 404'd.
+        - { driver: opengl, mpv_pkg: switch-libmpv-0.36.0-5-any.pkg.tar.zst, cmake_extra: "" }
+        - { driver: deko3d, mpv_pkg: switch-libmpv-deko3d-0.36.0-5-any.pkg.tar.zst, cmake_extra: "-DUSE_DEKO3D=ON" }
+    container:
+      image: devkitpro/devkita64:20260219
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      # Same caching + slow-edge-abort treatment as the Vita job; the mpv
+      # package differs per matrix leg, so it is part of the key.
+      - name: Cache Switch portlibs
+        uses: actions/cache@v4
+        with:
+          path: portlib-cache
+          key: switch-portlibs-hacBrewPack-3.05-1_libuam-master-1_dav1d-1.5.4-1_mbedtls-3.6.7-1_libssh2-1.11.1-1_ffmpeg-7.1.5-5_${{ matrix.mpv_pkg }}
+
+      - name: Install switchfin portlibs
+        run: |
+          BASE_URL="https://github.com/dragonflylee/switchfin/releases/download/switch-portlibs"
+          set -eu
+          # NOTE: switch-portlibs is a ROLLING release, exactly like the Vita
+          # one — a version bump REPLACES the asset, so a stale pin here 404s
+          # and the build dies before it compiles a single file. curl's own
+          # error is a bare "(22) 404" with no filename, so name the URL.
+          # Current list: https://github.com/dragonflylee/switchfin/releases/tag/switch-portlibs
+          fetch() {
+            curl -fL --retry 4 --retry-all-errors \
+                 --speed-limit 102400 --speed-time 30 -o "$2" "$1" || {
+              echo "::error::cannot fetch $1 — pin is stale or the asset moved;" \
+                   "check https://github.com/dragonflylee/switchfin/releases/tag/switch-portlibs"
+              return 1
+            }
+          }
+          mkdir -p portlib-cache
+          # Keep this set on ONE switchfin build batch. The whole list below
+          # was built 2026-09-01 07:11-07:17, and ffmpeg-7.1.5-5 declares a
+          # hard `depend = switch-dav1d`. dav1d was pinned at 1.5.3-1 while
+          # ffmpeg was built in the same minute as 1.5.4-1, so the pin was
+          # already off-batch; it only kept working until upstream pruned
+          # 1.5.3-1. Bump versions as a set, not one at a time.
+          for pkg in hacBrewPack-3.05-1-x86_64.pkg.tar.zst \
+                     libuam-master-1-any.pkg.tar.zst \
+                     switch-dav1d-1.5.4-1-any.pkg.tar.zst \
+                     switch-mbedtls-3.6.7-1-any.pkg.tar.zst \
+                     switch-libssh2-1.11.1-1-any.pkg.tar.zst \
+                     switch-ffmpeg-7.1.5-5-any.pkg.tar.zst \
+                     ${{ matrix.mpv_pkg }}; do
+            [ -s "portlib-cache/$pkg" ] || fetch "$BASE_URL/$pkg" "portlib-cache/$pkg"
+          done
+          dkp-pacman --noconfirm -Rdd switch-libmpv || true
+          dkp-pacman --noconfirm -Rdd switch-libmpv-deko3d || true
+          # CRITICAL: install switchfin's ffmpeg too. switch-libmpv-0.36.0-5 was
+          # built against switch-ffmpeg-7.1.5-5; devkitPro's pacman ships a
+          # DIFFERENT FFmpeg 7.1 point release (libavcodec 61.19.100 vs the
+          # 61.19.101 mpv expects). Linking mpv against the mismatched FFmpeg
+          # crashed playback the instant mpv started using libav* (null-deref
+          # right after mpv's FFmpeg version banner). Pull the matching FFmpeg so
+          # mpv and libav* are ABI-consistent — the same rule the iOS job spells
+          # out for its MPVKit frameworks.
+          # switch-ffmpeg-7.1.5-5 is built with the mbedtls + libssh2 protocols,
+          # so it needs those exact libs to link. Pull switchfin's matching
+          # mbedtls / libssh2 so the whole mpv→ffmpeg→tls stack is ABI-consistent.
+          dkp-pacman --noconfirm -U portlib-cache/*.pkg.tar.zst
+      - name: Build
+        run: |
+          cmake -B build -G Ninja \
+            -DPLATFORM_SWITCH=ON \
+            -DAPP_VERSION=${{ needs.resolve-version.outputs.version_number }} \
+            -DAPP_DISPLAY_VERSION="${{ needs.resolve-version.outputs.version }}" \
+            ${{ matrix.cmake_extra }}
+          cmake --build build
+      - name: Upload NRO
+        uses: actions/upload-artifact@v4
+        with:
+          name: VitaHub-switch-${{ matrix.driver }}-${{ github.run_number }}
+          path: build/VitaHub.nro
+
+  # ───────────────────────────────────────────────
+  # iOS / tvOS — full build against prebuilt MPVKit
+  #
+  # Just like the Vita / Switch jobs pull a prebuilt mpv tarball from
+  # switchfin's portlibs, this job pulls MPVKit's prebuilt libmpv + ffmpeg
+  # xcframeworks (https://github.com/mpvkit/MPVKit/releases) and links
+  # against them. MPVKit statically bundles libass / freetype / harfbuzz /
+  # MoltenVK / libplacebo inside Libmpv.xcframework, so the seven Libav*
+  # frameworks plus Libmpv are everything we need.
+  #
+  # Builds for the SIMULATOR so no code-signing identity is required in CI
+  # (device builds need a provisioning profile). The produced .app runs in
+  # the iOS / tvOS Simulator; for a device install, build locally with
+  # -DPLATFORM=OS64 / TVOS and sign in Xcode.
+  # ───────────────────────────────────────────────
+  build-ios:
+    needs: [resolve-version]
+    # Temporarily disabled — the Apple Mobile (iOS/tvOS) build can't be tested
+    # right now, so it's skipped to keep CI green. Re-enable by restoring:
+    #   if: ${{ inputs.platform == 'ios' || inputs.platform == 'tvos' || inputs.platform == 'all' || github.event_name != 'workflow_dispatch' }}
+    if: false
+    name: Apple Mobile (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+        - { target: ios,  cmake_flag: PLATFORM_IOS,  platform_for_toolchain: SIMULATORARM64,      sdk: iphonesimulator }
+        - { target: tvos, cmake_flag: PLATFORM_TVOS, platform_for_toolchain: SIMULATORARM64_TVOS, sdk: appletvsimulator }
+    runs-on: macos-14
+    env:
+      # Pin to a release whose asset names match the loop below. All eight
+      # frameworks MUST come from the same release so libmpv and its ffmpeg
+      # are ABI-consistent.
+      MPVKIT_VERSION: "0.41.0"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Select Xcode
+        run: sudo xcode-select -s /Applications/Xcode.app
+      - name: Cache static libcurl for ${{ matrix.sdk }}
+        id: cache-libcurl
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/libcurl-install
+          key: libcurl-8.14.1-${{ matrix.sdk }}-min14-v1
+      - name: Build static libcurl for ${{ matrix.sdk }}
+        # iOS Simulator SDK ships /usr/lib/libcurl.tbd but tvOS Simulator
+        # SDK does NOT, so build a minimal static libcurl against the
+        # matrix's SDK and link it directly — one code path for both.
+        #
+        # Pinned to 8.14.1: the LAST release with Secure Transport (Apple
+        # TLS, zero extra deps) — curl 8.15.0 removed it, which would
+        # force a cross-built OpenSSL dependency. Plex requires HTTPS
+        # (plex.tv auth, *.plex.direct), so building --without-ssl is not
+        # an option. 8.14.1 also long postdates the cf-socket.c
+        # l_ip/l_port bug that broke 8.7.1.
+        if: steps.cache-libcurl.outputs.cache-hit != 'true'
+        run: |
+          CURL_VERSION=8.14.1
+          PREFIX="${{ github.workspace }}/libcurl-install"
+          SDK_PATH=$(xcrun --sdk ${{ matrix.sdk }} --show-sdk-path)
+          if [ "${{ matrix.target }}" = "ios" ]; then
+            MIN_FLAG="-mios-simulator-version-min=14.0"
+          else
+            MIN_FLAG="-mappletvsimulator-version-min=14.0"
+          fi
+          mkdir -p "$PREFIX"
+          cd /tmp
+          curl -fL "https://curl.se/download/curl-${CURL_VERSION}.tar.gz" | tar xz
+          cd "curl-${CURL_VERSION}"
+          export CC="$(xcrun --sdk ${{ matrix.sdk }} --find clang)"
+          export AR="$(xcrun --sdk ${{ matrix.sdk }} --find ar)"
+          export RANLIB="$(xcrun --sdk ${{ matrix.sdk }} --find ranlib)"
+          export CFLAGS="-arch arm64 -isysroot ${SDK_PATH} ${MIN_FLAG} -O2"
+          # CPPFLAGS must carry the sysroot too: configure's function-
+          # prototype probes run through `clang -E` with CPPFLAGS only
+          # (not CFLAGS). macOS has no /usr/include without -isysroot,
+          # so with empty CPPFLAGS every probe failed ("is prototyped...
+          # no" for socket/fcntl/everything), HAVE_SOCKET never got
+          # defined, and the build died at transfer.c "We cannot compile
+          # without socket() support!".
+          export CPPFLAGS="-arch arm64 -isysroot ${SDK_PATH} ${MIN_FLAG}"
+          export LDFLAGS="-arch arm64 -isysroot ${SDK_PATH} ${MIN_FLAG}"
+          ./configure \
+            --host=aarch64-apple-darwin \
+            --prefix="${PREFIX}" \
+            --disable-shared --enable-static \
+            --with-secure-transport \
+            --without-libpsl --without-libidn2 --without-nghttp2 \
+            --without-zstd --without-brotli --without-librtmp \
+            --without-libssh --without-libssh2 --without-zlib \
+            --disable-ldap --disable-ldaps --disable-rtsp \
+            --disable-dict --disable-telnet --disable-tftp \
+            --disable-pop3 --disable-imap --disable-smtp --disable-gopher \
+            --disable-mqtt --disable-smb --disable-manual \
+            --disable-debug
+          make -j$(sysctl -n hw.ncpu)
+          make install
+          echo "Built libcurl.a: $(file ${PREFIX}/lib/libcurl.a)"
+      - name: Export libcurl env
+        run: |
+          echo "LIBCURL_LIBRARY=${{ github.workspace }}/libcurl-install/lib/libcurl.a" >> $GITHUB_ENV
+          echo "LIBCURL_INCLUDE=${{ github.workspace }}/libcurl-install/include" >> $GITHUB_ENV
+      - name: Build libromfs-generator
+        # borealis's iOS / tvOS toolchain requires this generator to be
+        # built ahead of configure (it embeds resources/ via libromfs).
+        run: ${{ github.workspace }}/lib/borealis/build_libromfs_generator.sh
+      # The 28 xcframeworks total hundreds of MB of GitHub release assets —
+      # the largest download in the workflow. Cache the staged directory;
+      # bump the -v1 suffix if the framework list below changes without
+      # MPVKIT_VERSION moving.
+      - name: Cache MPVKit xcframeworks
+        id: cache-mpvkit
+        uses: actions/cache@v4
+        with:
+          path: mpv-frameworks
+          key: mpvkit-${{ env.MPVKIT_VERSION }}-${{ matrix.target }}-v1
+
+      - name: Download MPVKit xcframeworks
+        if: steps.cache-mpvkit.outputs.cache-hit != 'true' 
+        # MPVKit does NOT statically fold its optional dependencies into
+        # Libmpv.xcframework — libass / freetype / harfbuzz / fribidi /
+        # uchardet / dav1d / libplacebo / MoltenVK / OpenSSL / gnutls / …
+        # ship as separate xcframeworks hosted in mpvkit's per-dependency
+        # build repos. (libmpv-all.zip is NOT a bundle of these either —
+        # it's thin per-slice libmpv.a files only.) This list is the
+        # exact non-GPL "_MPVKit" dependency closure from MPVKit 0.41.0's
+        # Package.swift: Libmpv + the seven Libav* cores + fourteen
+        # dependency frameworks, each pinned to the release Package.swift
+        # references so everything stays ABI-consistent.
+        # Non-GPL variant: LGPL ffmpeg still decodes H.264 / HEVC / VP9 /
+        # AV1 / AAC / AC3 — everything Plex direct-plays.
+        run: |
+          FW_DIR="${{ github.workspace }}/mpv-frameworks"
+          mkdir -p "$FW_DIR"
+          MPVKIT="https://github.com/mpvkit/MPVKit/releases/download/${MPVKIT_VERSION}"
+          DEPS="https://github.com/mpvkit"
+          FRAMEWORKS=(
+            "${MPVKIT}/Libmpv.xcframework.zip"
+            "${MPVKIT}/Libavcodec.xcframework.zip"
+            "${MPVKIT}/Libavdevice.xcframework.zip"
+            "${MPVKIT}/Libavfilter.xcframework.zip"
+            "${MPVKIT}/Libavformat.xcframework.zip"
+            "${MPVKIT}/Libavutil.xcframework.zip"
+            "${MPVKIT}/Libswresample.xcframework.zip"
+            "${MPVKIT}/Libswscale.xcframework.zip"
+            "${DEPS}/openssl-build/releases/download/3.3.5/Libcrypto.xcframework.zip"
+            "${DEPS}/openssl-build/releases/download/3.3.5/Libssl.xcframework.zip"
+            "${DEPS}/gnutls-build/releases/download/3.8.11/gmp.xcframework.zip"
+            "${DEPS}/gnutls-build/releases/download/3.8.11/nettle.xcframework.zip"
+            "${DEPS}/gnutls-build/releases/download/3.8.11/hogweed.xcframework.zip"
+            "${DEPS}/gnutls-build/releases/download/3.8.11/gnutls.xcframework.zip"
+            "${DEPS}/libass-build/releases/download/0.17.4/Libunibreak.xcframework.zip"
+            "${DEPS}/libass-build/releases/download/0.17.4/Libfreetype.xcframework.zip"
+            "${DEPS}/libass-build/releases/download/0.17.4/Libfribidi.xcframework.zip"
+            "${DEPS}/libass-build/releases/download/0.17.4/Libharfbuzz.xcframework.zip"
+            "${DEPS}/libass-build/releases/download/0.17.4/Libass.xcframework.zip"
+            "${DEPS}/libbluray-build/releases/download/1.4.0/Libbluray.xcframework.zip"
+            "${DEPS}/libuavs3d-build/releases/download/1.2.1-xcode/Libuavs3d.xcframework.zip"
+            "${DEPS}/libdovi-build/releases/download/3.3.2/Libdovi.xcframework.zip"
+            "${DEPS}/moltenvk-build/releases/download/1.4.1/MoltenVK.xcframework.zip"
+            "${DEPS}/libshaderc-build/releases/download/2025.5.0/Libshaderc_combined.xcframework.zip"
+            "${DEPS}/lcms2-build/releases/download/2.17.0/lcms2.xcframework.zip"
+            "${DEPS}/libplacebo-build/releases/download/7.351.0-2512/Libplacebo.xcframework.zip"
+            "${DEPS}/libdav1d-build/releases/download/1.5.2-xcode/Libdav1d.xcframework.zip"
+            "${DEPS}/libuchardet-build/releases/download/0.0.8-xcode/Libuchardet.xcframework.zip"
+            "${DEPS}/libluajit-build/releases/download/2.1.0-xcode/Libluajit.xcframework.zip"
+          )
+          for url in "${FRAMEWORKS[@]}"; do
+            name=$(basename "$url")
+            echo "Fetching ${name}"
+            curl -fL --retry 4 --retry-all-errors --retry-delay 2 \
+                 --speed-limit 102400 --speed-time 30 -o "/tmp/${name}" "$url"
+            unzip -qo "/tmp/${name}" -d "$FW_DIR"
+            rm "/tmp/${name}"
+          done
+          echo "Frameworks staged:"; ls -la "$FW_DIR"
+          test -d "$FW_DIR/Libmpv.xcframework"
+      - name: Configure
+        run: |
+          cmake -G Xcode -B build \
+            -D${{ matrix.cmake_flag }}=ON \
+            -DPLATFORM=${{ matrix.platform_for_toolchain }} \
+            -DDEPLOYMENT_TARGET=14.0 \
+            -DBOREALIS_LIBRARY=${{ github.workspace }}/lib/borealis/library \
+            -DAPP_VERSION=${{ needs.resolve-version.outputs.version_number }} \
+            -DAPP_DISPLAY_VERSION="${{ needs.resolve-version.outputs.version }}" \
+            -DLIBROMFS_PREBUILT_GENERATOR=${{ github.workspace }}/lib/borealis/libromfs-generator \
+            -DAPPLE_MPV_XCFRAMEWORKS_DIR=${{ github.workspace }}/mpv-frameworks \
+            -DLIBCURL_INCLUDE_DIR=${{ env.LIBCURL_INCLUDE }} \
+            -DLIBCURL_LIBRARY=${{ env.LIBCURL_LIBRARY }}
+      - name: Build
+        run: |
+          cmake --build build --config Release -- \
+            -sdk ${{ matrix.sdk }} \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO
+      - name: Locate and stage .app
+        run: |
+          APP="$(find build -name 'VitaHub.app' -type d | head -1)"
+          if [ -z "$APP" ]; then echo "VitaHub.app not produced"; exit 1; fi
+          echo "Built: $APP"
+          mkdir -p stage && cp -R "$APP" stage/
+      - name: Upload app
+        uses: actions/upload-artifact@v4
+        with:
+          name: VitaHub-${{ matrix.target }}-${{ github.run_number }}
+          path: stage/VitaHub.app
+
+  # ───────────────────────────────────────────────
+  # PS4
+  # ───────────────────────────────────────────────
+  build-ps4:
+    needs: [resolve-version]
+    if: ${{ inputs.platform == 'ps4' || inputs.platform == 'all' || github.event_name != 'workflow_dispatch' }}
+    name: PS4
+    runs-on: ubuntu-latest
+    container:
+      image: xfangfang/pacbrew:250221
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      # Same caching + slow-edge-abort treatment as the Vita/Switch jobs.
+      - name: Cache PS4 portlibs
+        uses: actions/cache@v4
+        with:
+          path: portlib-cache
+          key: ps4-portlibs-musl-1.5-3_mbedtls-2.28.10-2_sdl2-2.0.18-19_libcurl-7.80.0-5
+
+      - name: Install PS4 portlibs
+        env:
+          BASE_URL: https://github.com/dragonflylee/switchfin/releases/download/pacbrew
+        run: |
+          set -eu
+          fetch() {
+            curl -fL --retry 4 --retry-all-errors \
+                 --speed-limit 102400 --speed-time 30 -o "$2" "$1"
+          }
+          mkdir -p portlib-cache
+          for pkg in musl-1.5-3 mbedtls-2.28.10-2 sdl2-2.0.18-19 libcurl-7.80.0-5; do
+            f="portlib-cache/ps4-openorbis-${pkg}-any.pkg.tar.gz"
+            [ -s "$f" ] || fetch "$BASE_URL/ps4-openorbis-${pkg}-any.pkg.tar.gz" "$f"
+          done
+          pacman --noconfirm -U portlib-cache/*.pkg.tar.gz
+      - name: Build
+        env:
+          OPENORBIS: /opt/pacbrew/ps4/openorbis
+        run: |
+          cmake -B build -DPLATFORM_PS4=ON \
+            -DAPP_VERSION=${{ needs.resolve-version.outputs.version_number }} \
+            -DAPP_DISPLAY_VERSION="${{ needs.resolve-version.outputs.version }}"
+          cmake --build build
+      - name: Upload PS4 artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: VitaHub-ps4-${{ github.run_number }}
+          if-no-files-found: warn
+          path: |
+            build/**/*.pkg
+            build/**/*.oelf
+
+  # ───────────────────────────────────────────────
+  # macOS matrix (explicit job name parity)
+  # ───────────────────────────────────────────────
+  build-macos:
+    needs: [resolve-version]
+    if: ${{ inputs.platform == 'macos' || inputs.platform == 'all' || github.event_name != 'workflow_dispatch' }}
+    name: macOS (${{ matrix.tag }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+        - { tag: Silicon, arch: arm64, target: "11.0", runner: macos-14 }
+        - { tag: Intel, arch: x86_64, target: "11.0", runner: macos-15-intel }
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      # Bottle downloads are the slow half of brew install; cache brew's
+      # download dir so a rerun only unpacks. Keyed per runner arch — the
+      # bottles differ — and refreshed when the formula list changes.
+      - name: Cache Homebrew downloads
+        uses: actions/cache@v4
+        with:
+          path: ~/Library/Caches/Homebrew/downloads
+          key: brew-${{ matrix.tag }}-cmake-ninja-pkgconfig-curl-mbedtls-mpv-libass-freetype-harfbuzz-fribidi-libpng-webp-zstd-glfw
+      - name: Install deps
+        run: brew install cmake ninja pkg-config curl mbedtls mpv libass freetype harfbuzz fribidi libpng webp zstd glfw
+      # Every desktop build FetchContents GLFW (switchfin fork tarball) from
+      # GitHub at configure time — the same codeload CDN that intermittently
+      # crawls. Cache the fetched sources; the key is the borealis pin, since
+      # that submodule owns the FetchContent URLs.
+      - name: Cache FetchContent sources
+        uses: actions/cache@v4
+        with:
+          path: build/_deps
+          key: fetchcontent-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('lib/borealis/library/CMakeLists.txt') }}
+      - name: Build
+        run: |
+          cmake -B build -G Ninja -DPLATFORM_DESKTOP=ON \
+            -DCMAKE_OSX_ARCHITECTURES=${{ matrix.arch }} \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=${{ matrix.target }} \
+            -DAPP_VERSION=${{ needs.resolve-version.outputs.version_number }} \
+            -DAPP_DISPLAY_VERSION="${{ needs.resolve-version.outputs.version }}"
+          cmake --build build
+      - name: Bundle macOS dylibs
+        run: |
+          BIN="build/VitaHub"
+          if [ ! -f "$BIN" ]; then
+            echo "Expected binary not found: $BIN"
+            exit 1
+          fi
+
+          tmpdir="$(mktemp -d)"
+          queue_file="$tmpdir/queue.txt"
+          scanned_file="$tmpdir/scanned.txt"
+          bundled_file="$tmpdir/bundled.txt"
+          printf '%s\n' "$BIN" > "$queue_file"
+          : > "$scanned_file"
+          : > "$bundled_file"
+
+          while [ -s "$queue_file" ]; do
+            current="$(head -n 1 "$queue_file")"
+            tail -n +2 "$queue_file" > "$queue_file.next" || true
+            mv "$queue_file.next" "$queue_file"
+            printf '%s\n' "$current" >> "$scanned_file"
+
+            while IFS= read -r dep; do
+              resolved_dep="$dep"
+              case "$dep" in
+                /usr/lib/*|/System/*|@executable_path/*|@loader_path/*)
+                  continue
+                  ;;
+                @rpath/*)
+                  base_from_rpath="${dep#@rpath/}"
+                  resolved_dep=""
+                  for probe in \
+                    "/usr/local/lib/$base_from_rpath" \
+                    "/opt/homebrew/lib/$base_from_rpath" \
+                    /usr/local/opt/*/lib/"$base_from_rpath" \
+                    /opt/homebrew/opt/*/lib/"$base_from_rpath"; do
+                    if [ -f "$probe" ]; then
+                      resolved_dep="$probe"
+                      break
+                    fi
+                  done
+                  if [ -z "$resolved_dep" ]; then
+                    echo "Skipping unresolved @rpath dependency: $dep"
+                    continue
+                  fi
+                  ;;
+              esac
+
+              if [ ! -f "$resolved_dep" ]; then
+                echo "Skipping missing dependency reference: $dep"
+                continue
+              fi
+
+              base="$(basename "$resolved_dep")"
+              target="build/$base"
+
+              if ! grep -Fxq "$base" "$bundled_file"; then
+                cp -f "$resolved_dep" "$target"
+                install_name_tool -id "@executable_path/$base" "$target"
+                install_name_tool -add_rpath "@executable_path" "$target" 2>/dev/null || true
+                printf '%s\n' "$base" >> "$bundled_file"
+                echo "Bundled $base (from $(basename "$current"))"
+              fi
+
+              install_name_tool -change "$dep" "@executable_path/$base" "$current"
+
+              if ! grep -Fxq "$target" "$scanned_file" && ! grep -Fxq "$target" "$queue_file"; then
+                printf '%s\n' "$target" >> "$queue_file"
+              fi
+            done < <(otool -L "$current" | tail -n +2 | awk '{print $1}')
+          done
+
+          install_name_tool -add_rpath "@executable_path" "$BIN" 2>/dev/null || true
+
+          rm -rf "$tmpdir"
+      - name: Package macOS DMG
+        run: |
+          APP_ROOT="build/dmg-root"
+          APP_DIR="$APP_ROOT/VitaHub.app"
+          MACOS_DIR="$APP_DIR/Contents/MacOS"
+
+          rm -rf "$APP_ROOT"
+          mkdir -p "$MACOS_DIR"
+
+          cp -f build/VitaHub "$MACOS_DIR/VitaHub"
+          cp -R build/resources "$MACOS_DIR/resources"
+          cp -f build/*.dylib "$MACOS_DIR/" 2>/dev/null || true
+          chmod +x "$MACOS_DIR/VitaHub"
+
+          cat > "$APP_DIR/Contents/Info.plist" <<'PLIST'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>CFBundleName</key><string>VitaHub</string>
+            <key>CFBundleDisplayName</key><string>VitaHub</string>
+            <key>CFBundleIdentifier</key><string>com.VitaHub.app</string>
+            <key>CFBundleVersion</key><string>${{ needs.resolve-version.outputs.version_number }}</string>
+            <key>CFBundleShortVersionString</key><string>${{ needs.resolve-version.outputs.version }}</string>
+            <key>CFBundlePackageType</key><string>APPL</string>
+            <key>CFBundleExecutable</key><string>VitaHub</string>
+          </dict>
+          </plist>
+          PLIST
+
+          # hdiutil intermittently loses a race against macOS's own
+          # disk-image helper / XProtect scanning the fresh .app and fails
+          # with "Resource busy" — a known runner flake, unrelated to the
+          # build. Retry with a pause; it clears within an attempt or two.
+          for attempt in 1 2 3 4 5; do
+            if hdiutil create \
+              -volname "VitaHub" \
+              -srcfolder "$APP_ROOT" \
+              -ov \
+              -format UDZO \
+              "build/VitaHub-${{ matrix.tag }}.dmg"; then
+              break
+            fi
+            if [ "$attempt" = 5 ]; then
+              echo "hdiutil create failed after 5 attempts"
+              exit 1
+            fi
+            echo "hdiutil create failed (attempt $attempt) — retrying in 10s"
+            sleep 10
+          done
+      - name: Upload macOS artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: VitaHub-macos-${{ matrix.tag }}-${{ github.run_number }}
+          path: |
+            build/VitaHub
+            build/VitaHub-*.dmg
+            build/*.dylib
+            build/resources/
+
+  # ───────────────────────────────────────────────
+  # MinGW matrix (x64/x86/arm64)
+  # ───────────────────────────────────────────────
+  build-mingw:
+    needs: [resolve-version]
+    if: ${{ inputs.platform == 'mingw64' || inputs.platform == 'all' || github.event_name != 'workflow_dispatch' }}
+    name: MinGW (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+        # No 32-bit Windows row: MSYS2 has retired the mingw32 (i686)
+        # package set — mingw-w64-i686-glfw is gone from the live repo so
+        # the row dies at `pacman -S` with "target not found", and
+        # setup-msys2's msystem allowlist doesn't include CLANG32 so we
+        # can't switch to it without forking the action. x64 + arm64
+        # cover every modern Windows device.
+        - { arch: x64, sys: mingw64, env: x86_64, runner: windows-latest }
+        - { arch: arm64, sys: clangarm64, env: clang-aarch64, runner: windows-11-arm }
+    runs-on: ${{ matrix.runner }}
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: ${{ matrix.sys }}
+          path-type: inherit
+          # Caches the msys2 base + installed packages between runs.
+          cache: true
+          release: ${{ contains(matrix.sys, 'arm64') }}
+          install: >-
+            mingw-w64-${{ matrix.env }}-ninja
+            mingw-w64-${{ matrix.env }}-cc
+            mingw-w64-${{ matrix.env }}-cmake
+            mingw-w64-${{ matrix.env }}-glfw
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      # Same caching + slow-edge-abort treatment as the console jobs: the
+      # pins are the key, and a transfer below 100 KB/s for 30s is aborted
+      # and retried onto a healthy CDN edge.
+      - name: Cache MinGW portlibs
+        uses: actions/cache@v4
+        with:
+          path: portlib-cache
+          key: mingw-portlibs-${{ matrix.env }}-glfw-3.5.0-1_curl-8.21.0-1_mpv-0.41.0-2_libwebp-1.6.0-1
+
+      - name: Install dependency
+        run: |
+          set -eu
+          # NOTE: mingw-packages is a ROLLING release like the Vita and Switch
+          # ones. It replaces assets two ways: a version bump deletes the old
+          # file (curl-8.16.0-1 is simply gone), and a rebuild at the SAME
+          # pkgver-pkgrel silently swaps the contents in place.
+          #
+          # Keep this set on one switchfin build batch. glfw-3.5.0-1,
+          # libwebp-1.6.0-1, mpv-0.41.0-2 and curl-8.21.0-1 were all built
+          # 2026-09-17 07:59-08:24; glfw and libwebp kept their filenames, so
+          # only curl and mpv move here. mpv-0.41.0-1 still resolves, but it
+          # is a 2026-09-01 leftover and the only member that would be off
+          # batch — mpv does not link libcurl, so this is about keeping the
+          # set coherent, not an ABI break.
+          # Current list: https://github.com/dragonflylee/switchfin/releases/tag/mingw-packages
+          mkdir -p portlib-cache
+          for pkg in glfw-3.5.0-1 curl-8.21.0-1 mpv-0.41.0-2 libwebp-1.6.0-1; do
+            f="portlib-cache/${MINGW_PACKAGE_PREFIX}-${pkg}-any.pkg.tar.zst"
+            url="https://github.com/dragonflylee/switchfin/releases/download/mingw-packages/${MINGW_PACKAGE_PREFIX}-${pkg}-any.pkg.tar.zst"
+            # curl reports a bare "(22) 404" with no filename, and this loop
+            # fetches four of them — say which one actually failed.
+            [ -s "$f" ] || curl -fL --retry 4 --retry-all-errors \
+                 --speed-limit 102400 --speed-time 30 -o "$f" "$url" || {
+              echo "::error::cannot fetch ${MINGW_PACKAGE_PREFIX}-${pkg} — pin is stale" \
+                   "or the asset moved; check the mingw-packages release"
+              exit 1
+            }
+          done
+          pacman -U --noconfirm portlib-cache/*.pkg.tar.zst
+      - name: Build
+        run: |
+          cmake -B build -G Ninja -DPLATFORM_DESKTOP=ON -DUSE_SYSTEM_GLFW=ON -DUSE_D3D11=ON \
+          -DAPP_VERSION=${{ needs.resolve-version.outputs.version_number }} \
+          -DAPP_DISPLAY_VERSION="${{ needs.resolve-version.outputs.version }}"
+          cmake --build build
+      - name: Bundle runtime DLLs
+        run: |
+          EXE="build/VitaHub.exe"
+          DLL_DIR="${MINGW_PREFIX}/bin"
+          if [ ! -f "$EXE" ]; then
+            echo "Expected binary not found: $EXE"
+            exit 1
+          fi
+          if [ ! -d "$DLL_DIR" ]; then
+            echo "Expected DLL directory not found: $DLL_DIR"
+            exit 1
+          fi
+
+          queue=("$EXE")
+          declare -A scanned
+          declare -A bundled
+          while [ ${#queue[@]} -gt 0 ]; do
+            current="${queue[0]}"
+            queue=("${queue[@]:1}")
+            scanned["$current"]=1
+
+            mapfile -t dlls < <(objdump -p "$current" | awk '/DLL Name:/{print $3}' | sort -u)
+            for dll in "${dlls[@]}"; do
+              candidate="$DLL_DIR/$dll"
+              target="build/$dll"
+              if [ -f "$candidate" ]; then
+                if [ -z "${bundled[$dll]+x}" ]; then
+                  cp -f "$candidate" "$target"
+                  bundled["$dll"]=1
+                  echo "Bundled $dll (from $(basename "$current"))"
+                fi
+                if [ -z "${scanned[$target]+x}" ]; then
+                  queue+=("$target")
+                fi
+              fi
+            done
+          done
+
+          echo "DLLs bundled into build/:"
+          ls -1 build/*.dll
+      # Authenticode signing is what removes SmartScreen's "Unknown publisher"
+      # prompt. It needs a real certificate, so the step is gated on a secret
+      # and does nothing without one — forks and PR builds are unaffected, the
+      # same way UPDATE_SIGNING_KEY gates the updater's own signatures.
+      #
+      # It runs here, before the portable upload, so the zip carries a signed
+      # exe, and before the installer, so the installer packages the signed
+      # one rather than a copy that would have to be re-signed inside it.
+      #
+      # Deliberately not continue-on-error: with a certificate configured, a
+      # signing failure that quietly shipped unsigned binaries would defeat
+      # the point. Without one the script exits 0, so this cannot break a
+      # build that has no cert.
+      - name: Sign VitaHub.exe
+        shell: pwsh
+        env:
+          WINDOWS_CERT_BASE64: ${{ secrets.WINDOWS_CERT_BASE64 }}
+          WINDOWS_CERT_PASSWORD: ${{ secrets.WINDOWS_CERT_PASSWORD }}
+        run: ./app/platform/windows/sign.ps1 build/VitaHub.exe
+      - name: Upload mingw artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: VitaHub-mingw-${{ matrix.arch }}-${{ github.run_number }}
+          path: |
+            build/VitaHub.exe
+            build/*.dll
+            build/resources/
+      # Windows gets both shapes: the portable folder above, and this installer.
+      # Per-user, into %LOCALAPPDATA%\Programs, so neither install nor the
+      # in-app updater ever needs elevation.
+      #
+      # It runs after the portable upload and is continue-on-error on purpose:
+      # the zip is the primary artifact and an installer problem must not cost
+      # it, nor fail the job and block the release job's !failure() guard.
+      # NSIS is not on the windows-latest image — the first run of this step
+      # found nothing there and silently produced no installer, while the arm64
+      # image happened to have it. Install it rather than hope: choco is
+      # preinstalled on both Windows runners and puts makensis where the build
+      # step looks. pwsh because choco is a Windows tool, not an MSYS2 one.
+      - name: Ensure NSIS
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $nsis = "C:\Program Files (x86)\NSIS\makensis.exe"
+          if (-not (Test-Path $nsis)) {
+            choco install nsis -y --no-progress
+          }
+          if (Test-Path $nsis) { & $nsis /VERSION } else { Write-Host "NSIS still absent" }
+      - name: Build Windows installer
+        continue-on-error: true
+        run: |
+          set -eu
+          MAKENSIS=""
+          for c in "/c/Program Files (x86)/NSIS/makensis.exe" \
+                   "/c/Program Files/NSIS/makensis.exe" \
+                   "/c/Program Files (x86)/NSIS/Bin/makensis.exe" \
+                   "$(command -v makensis || true)"; do
+            [ -n "$c" ] && [ -x "$c" ] && MAKENSIS="$c" && break
+          done
+          if [ -z "$MAKENSIS" ]; then
+            # Say where it looked. The previous silence here read as "the step
+            # ran fine" while it had quietly produced nothing.
+            echo "makensis not found. Looked in:"
+            echo "  /c/Program Files (x86)/NSIS/makensis.exe"
+            echo "  /c/Program Files/NSIS/makensis.exe"
+            echo "  /c/Program Files (x86)/NSIS/Bin/makensis.exe"
+            echo "  \$PATH"
+            ls -la "/c/Program Files (x86)/NSIS" 2>&1 || true
+            echo "No installer will be produced for this arch."
+            exit 0
+          fi
+          echo "using $MAKENSIS"
+          # Absolute, native Windows paths. NSIS resolves a relative File path
+          # against the .nsi's own directory rather than the working directory,
+          # so -DSRCDIR=build sent it looking in app/platform/windows/build and
+          # it failed with "no files found".
+          SRC_WIN=$(cygpath -w "$PWD/build")
+          OUT_WIN=$(cygpath -w "$PWD/build/VitaHub-Setup-${{ matrix.arch }}.exe")
+          NSI_WIN=$(cygpath -w "$PWD/app/platform/windows/installer.nsi")
+          ICO_WIN=$(cygpath -w "$PWD/app/platform/windows")
+          "$MAKENSIS" -V2 \
+            -DVERSION="${APP_VERSION}" \
+            -DDISPLAY_VERSION="${APP_DISPLAY_VERSION}" \
+            -DSRCDIR="$SRC_WIN" \
+            -DOUTFILE="$OUT_WIN" \
+            -DICONDIR="$ICO_WIN" \
+            "$NSI_WIN"
+          ls -la "build/VitaHub-Setup-${{ matrix.arch }}.exe"
+        env:
+          # version_number is already the four-part form VIProductVersion wants
+          # (1.3.8.1862); version is the display string ("Beta 1.3.8.1862").
+          APP_VERSION: ${{ needs.resolve-version.outputs.version_number }}
+          APP_DISPLAY_VERSION: ${{ needs.resolve-version.outputs.version }}
+      # The installer is a second exe and carries its own signature; signing
+      # the payload inside it does not sign it. This is the one users actually
+      # double-click, so it is the one SmartScreen judges. A run where the
+      # installer was never built passes a path that does not exist, which the
+      # script skips rather than failing on.
+      - name: Sign Windows installer
+        shell: pwsh
+        env:
+          WINDOWS_CERT_BASE64: ${{ secrets.WINDOWS_CERT_BASE64 }}
+          WINDOWS_CERT_PASSWORD: ${{ secrets.WINDOWS_CERT_PASSWORD }}
+        run: ./app/platform/windows/sign.ps1 build/VitaHub-Setup-${{ matrix.arch }}.exe
+      - name: Upload Windows installer
+        uses: actions/upload-artifact@v4
+        if: hashFiles(format('build/VitaHub-Setup-{0}.exe', matrix.arch)) != ''
+        with:
+          name: VitaHub-setup-${{ matrix.arch }}-${{ github.run_number }}
+          path: build/VitaHub-Setup-${{ matrix.arch }}.exe
+
+  # ───────────────────────────────────────────────
+  # Debian package-like build
+  # ───────────────────────────────────────────────
+  build-deb:
+    needs: [resolve-version]
+    if: ${{ inputs.platform == 'deb' || inputs.platform == 'all' || github.event_name != 'workflow_dispatch' }}
+    name: Deb build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      # The libmpv-dev closure is ~119 MB of .debs, and the Azure Ubuntu
+      # mirror intermittently serves them at KB/s (a logged run spent 6 of
+      # its 7 minutes in this step: indexes at 149 kB/s, packages at
+      # 513 kB/s). Cache the downloaded .debs keyed on the package list —
+      # apt reuses a cached file whose checksum still matches the index,
+      # so only packages that actually moved refetch. Retries cover the
+      # index fetch, which cannot be cached.
+      - name: Cache apt packages
+        uses: actions/cache@v4
+        with:
+          path: apt-deb-cache
+          key: apt-debs-mpv-dev-v1
+      - name: Install dependencies
+        # Kept minimal: this step dominated the job (3m12s of the deb job's
+        # 4m20s in run 1424), and most of what it named was already coming
+        # in anyway.
+        #
+        # libmpv-dev depends on the whole FFmpeg dev stack (libav*/libsw*),
+        # libass, freetype, harfbuzz, fribidi and libpng, so listing those
+        # again only adds resolution work — verified with `apt-cache
+        # depends --recurse`. libwebp-dev and libmp3lame-dev are NOT among
+        # its dependencies and stay.
+        #
+        # xorg-dev is a metapackage pulling ~173 packages. GLFW names the X
+        # libs it actually needs in its own FATAL_ERROR checks — X11/XKB,
+        # Xrandr, Xinerama, Xcursor, Xi, and Xext for X Shape — which comes
+        # to ~34. The wayland trio stays: GLFW's wayland backend needs
+        # wayland-scanner from libwayland-bin.
+        run: |
+          # The Azure-internal mirror is the fastest choice from these runners
+          # on a healthy day, so keep it first — but let apt's mirror method
+          # fall back to the public archive when a request fails outright,
+          # which is what the Ign:/stall pattern in the logged crawls was.
+          # amd64 only: the arm64 runners use the ports mirror instead.
+          if [ "$(dpkg --print-architecture)" = "amd64" ] && [ -f /etc/apt/sources.list.d/ubuntu.sources ]; then
+            printf 'http://azure.archive.ubuntu.com/ubuntu/\tpriority:1\nhttp://archive.ubuntu.com/ubuntu/\tpriority:2\n' \
+              | sudo tee /etc/apt/apt-mirrors.txt >/dev/null
+            sudo sed -i 's|^URIs: .*|URIs: mirror+file:/etc/apt/apt-mirrors.txt|' /etc/apt/sources.list.d/ubuntu.sources
+          fi
+          mkdir -p apt-deb-cache/partial
+          sudo apt-get -o Acquire::Retries=3 update
+          sudo apt-get -o Acquire::Retries=3 -o Dir::Cache::archives=$PWD/apt-deb-cache \
+            install -y --no-install-recommends \
+            cmake ninja-build build-essential git pkg-config zstd \
+            libcurl4-openssl-dev libmbedtls-dev libmpv-dev \
+            libmp3lame-dev libwebp-dev libdbus-1-dev libssl-dev \
+            wayland-protocols libwayland-bin libwayland-dev libxkbcommon-dev \
+            libx11-dev libxrandr-dev libxinerama-dev libxcursor-dev libxi-dev libxext-dev
+          sudo rm -rf apt-deb-cache/partial apt-deb-cache/lock
+      # Every desktop build FetchContents GLFW (switchfin fork tarball) from
+      # GitHub at configure time — the same codeload CDN that intermittently
+      # crawls. Cache the fetched sources; the key is the borealis pin, since
+      # that submodule owns the FetchContent URLs.
+      - name: Cache FetchContent sources
+        uses: actions/cache@v4
+        with:
+          path: build/_deps
+          key: fetchcontent-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('lib/borealis/library/CMakeLists.txt') }}
+      - name: Build
+        run: |
+          cmake -B build -G Ninja -DPLATFORM_DESKTOP=ON \
+            -DAPP_VERSION=${{ needs.resolve-version.outputs.version_number }} \
+            -DAPP_DISPLAY_VERSION="${{ needs.resolve-version.outputs.version }}"
+          cmake --build build
+          PKGROOT="pkgroot"
+          rm -rf "$PKGROOT"
+          mkdir -p "$PKGROOT/DEBIAN" "$PKGROOT/usr/bin" "$PKGROOT/usr/lib/VitaHub" "$PKGROOT/usr/share/VitaHub" "$PKGROOT/usr/share/applications" "$PKGROOT/usr/share/pixmaps"
+          install -m 755 build/VitaHub "$PKGROOT/usr/lib/VitaHub/VitaHub"
+          {
+            echo '#!/usr/bin/env sh'
+            echo 'cd /usr/share/VitaHub || exit 1'
+            echo 'exec /usr/lib/VitaHub/VitaHub "$@"'
+          } > "$PKGROOT/usr/bin/VitaHub"
+          chmod 755 "$PKGROOT/usr/bin/VitaHub"
+          cp -r build/resources "$PKGROOT/usr/share/VitaHub/resources"
+          install -m 644 app/platform/icon_desktop.png "$PKGROOT/usr/share/pixmaps/VitaHub.png"
+          {
+            echo '[Desktop Entry]'
+            echo 'Type=Application'
+            echo 'Name=VitaHub'
+            echo 'Comment=Plex, Audiobookshelf, Suwayomi and Music Assistant in one app'
+            echo 'Exec=VitaHub'
+            echo 'Icon=VitaHub'
+            echo 'Terminal=false'
+            echo 'Categories=Network;Utility;'
+          } > "$PKGROOT/usr/share/applications/VitaHub.desktop"
+          ARCH="$(dpkg --print-architecture)"
+          {
+            echo "Package: VitaHub"
+            echo "Version: ${{ needs.resolve-version.outputs.version_number }}"
+            echo "Section: utils"
+            echo "Priority: optional"
+            echo "Architecture: ${ARCH}"
+            echo "Maintainer: VitaHub CI <ci@VitaHub.local>"
+            echo "Description: VitaHub desktop build artifact"
+          } > "$PKGROOT/DEBIAN/control"
+          dpkg-deb --build "$PKGROOT" "VitaHub-${{ github.run_number }}_${ARCH}.deb"
+      - name: Upload deb artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: VitaHub-deb-${{ github.run_number }}
+          path: VitaHub-${{ github.run_number }}_*.deb
+
+  # ───────────────────────────────────────────────
+  # AUR-like build
+  # ───────────────────────────────────────────────
+  build-aur:
+    needs: [resolve-version]
+    if: ${{ inputs.platform == 'aur' || inputs.platform == 'all' || github.event_name != 'workflow_dispatch' }}
+    name: AUR build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      # The libmpv-dev closure is ~119 MB of .debs, and the Azure Ubuntu
+      # mirror intermittently serves them at KB/s (a logged run spent 6 of
+      # its 7 minutes in this step: indexes at 149 kB/s, packages at
+      # 513 kB/s). Cache the downloaded .debs keyed on the package list —
+      # apt reuses a cached file whose checksum still matches the index,
+      # so only packages that actually moved refetch. Retries cover the
+      # index fetch, which cannot be cached.
+      - name: Cache apt packages
+        uses: actions/cache@v4
+        with:
+          path: apt-deb-cache
+          key: apt-debs-mpv-dev-v1
+      - name: Install dependencies
+        # Kept minimal: this step dominated the job (3m12s of the deb job's
+        # 4m20s in run 1424), and most of what it named was already coming
+        # in anyway.
+        #
+        # libmpv-dev depends on the whole FFmpeg dev stack (libav*/libsw*),
+        # libass, freetype, harfbuzz, fribidi and libpng, so listing those
+        # again only adds resolution work — verified with `apt-cache
+        # depends --recurse`. libwebp-dev and libmp3lame-dev are NOT among
+        # its dependencies and stay.
+        #
+        # xorg-dev is a metapackage pulling ~173 packages. GLFW names the X
+        # libs it actually needs in its own FATAL_ERROR checks — X11/XKB,
+        # Xrandr, Xinerama, Xcursor, Xi, and Xext for X Shape — which comes
+        # to ~34. The wayland trio stays: GLFW's wayland backend needs
+        # wayland-scanner from libwayland-bin.
+        run: |
+          # The Azure-internal mirror is the fastest choice from these runners
+          # on a healthy day, so keep it first — but let apt's mirror method
+          # fall back to the public archive when a request fails outright,
+          # which is what the Ign:/stall pattern in the logged crawls was.
+          # amd64 only: the arm64 runners use the ports mirror instead.
+          if [ "$(dpkg --print-architecture)" = "amd64" ] && [ -f /etc/apt/sources.list.d/ubuntu.sources ]; then
+            printf 'http://azure.archive.ubuntu.com/ubuntu/\tpriority:1\nhttp://archive.ubuntu.com/ubuntu/\tpriority:2\n' \
+              | sudo tee /etc/apt/apt-mirrors.txt >/dev/null
+            sudo sed -i 's|^URIs: .*|URIs: mirror+file:/etc/apt/apt-mirrors.txt|' /etc/apt/sources.list.d/ubuntu.sources
+          fi
+          mkdir -p apt-deb-cache/partial
+          sudo apt-get -o Acquire::Retries=3 update
+          sudo apt-get -o Acquire::Retries=3 -o Dir::Cache::archives=$PWD/apt-deb-cache \
+            install -y --no-install-recommends \
+            cmake ninja-build build-essential git pkg-config zstd \
+            libcurl4-openssl-dev libmbedtls-dev libmpv-dev \
+            libmp3lame-dev libwebp-dev libdbus-1-dev libssl-dev \
+            wayland-protocols libwayland-bin libwayland-dev libxkbcommon-dev \
+            libx11-dev libxrandr-dev libxinerama-dev libxcursor-dev libxi-dev libxext-dev
+          sudo rm -rf apt-deb-cache/partial apt-deb-cache/lock
+      # Every desktop build FetchContents GLFW (switchfin fork tarball) from
+      # GitHub at configure time — the same codeload CDN that intermittently
+      # crawls. Cache the fetched sources; the key is the borealis pin, since
+      # that submodule owns the FetchContent URLs.
+      - name: Cache FetchContent sources
+        uses: actions/cache@v4
+        with:
+          path: build/_deps
+          key: fetchcontent-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('lib/borealis/library/CMakeLists.txt') }}
+      - name: Build
+        run: |
+          cmake -B build -G Ninja -DPLATFORM_DESKTOP=ON \
+            -DAPP_VERSION=${{ needs.resolve-version.outputs.version_number }} \
+            -DAPP_DISPLAY_VERSION="${{ needs.resolve-version.outputs.version }}"
+          cmake --build build
+          tar --zstd -cf VitaHub-${{ github.run_number }}.pkg.tar.zst -C build VitaHub resources
+      - name: Upload aur artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: VitaHub-aur-${{ github.run_number }}
+          path: VitaHub-${{ github.run_number }}.pkg.tar.zst

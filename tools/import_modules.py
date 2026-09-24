@@ -76,6 +76,7 @@ MODULES = {
             "src/main.cpp",
             "src/updater_stub",
             "src/updater_ps4",
+            "src/utils/vita_stubs.c",
                     "include/player/mpv_player.h",  # unused duplicate of mpv_player.hpp
         ],
         "wrap_headers": {

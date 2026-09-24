@@ -2,101 +2,287 @@ cmake_minimum_required(VERSION 3.16)
 
 # ---------------------------------------------------------------------------
 # VitaHub: Vita_plex, Vita_abs, Vita_Suwayomi and Vita-Music-Assistant in one
-# app. Each service is a module under modules/<id>/ built as a static library;
-# hub/ is the shell (main loop, hub UI, navigation between services).
+# app. Each service is a module under modules/<id>/, built as a static
+# library; hub/ is the shell (main loop, hub UI, navigation) and hub/core is
+# its platform layer and self-updater (from Vita_plex).
 #
-#   cmake -B build -DPLATFORM_PSV=ON       # VitaHub.vpk
-#   cmake -B build -DPLATFORM_DESKTOP=ON   # Linux/macOS dev build
-#
-# Services can be left out with -DVITAHUB_MODULE_<ID>=OFF.
+# This file follows Vita_plex's CMakeLists.txt platform by platform, so the
+# same targets build: pass exactly one of
+#   -DPLATFORM_PSV=ON  -DPLATFORM_SWITCH=ON  -DPLATFORM_PS4=ON
+#   -DPLATFORM_DESKTOP=ON (Linux/macOS/Windows)  -DPLATFORM_ANDROID=ON
+#   -DPLATFORM_IOS=ON  -DPLATFORM_TVOS=ON
+# Services can be left out with -DVITAHUB_MODULE_<ID>=OFF; each one defaults
+# to ON on the platforms its standalone app supports.
 # ---------------------------------------------------------------------------
 
-option(PLATFORM_PSV     "Build for PlayStation Vita"              OFF)
-option(PLATFORM_DESKTOP "Build for Desktop (Linux/macOS)"         OFF)
+option(PLATFORM_PSV     "Build for PlayStation Vita"                   OFF)
+option(PLATFORM_SWITCH  "Build for Nintendo Switch"                    OFF)
+option(PLATFORM_PS4     "Build for PlayStation 4"                      OFF)
+option(PLATFORM_DESKTOP "Build for Desktop (Linux/macOS/Windows)"      OFF)
+option(PLATFORM_ANDROID "Build for Android"                            OFF)
+option(PLATFORM_IOS     "Build for iOS (iPhone / iPad)"                OFF)
+option(PLATFORM_TVOS    "Build for tvOS (Apple TV)"                    OFF)
 
-option(VITAHUB_MODULE_PLEX     "Include Plex (Vita_plex)"                          ON)
-option(VITAHUB_MODULE_ABS      "Include Audiobookshelf (Vita_abs)"                 ON)
-option(VITAHUB_MODULE_SUWAYOMI "Include Suwayomi (Vita_Suwayomi)"                  ON)
-option(VITAHUB_MODULE_MUSIC    "Include Music Assistant (Vita-Music-Assistant)"   ON)
-
-foreach(_P SWITCH PS4 ANDROID IOS TVOS)
+# Default to desktop when nothing is specified
+set(_PLATFORM_COUNT 0)
+foreach(_P PSV SWITCH PS4 DESKTOP ANDROID IOS TVOS)
     if(PLATFORM_${_P})
-        message(FATAL_ERROR
-            "PLATFORM_${_P}: VitaHub currently builds for PS Vita and desktop only. "
-            "The standalone apps still build for ${_P}.")
+        math(EXPR _PLATFORM_COUNT "${_PLATFORM_COUNT} + 1")
     endif()
 endforeach()
-if(PLATFORM_PSV AND PLATFORM_DESKTOP)
-    message(FATAL_ERROR "Set only one of PLATFORM_PSV / PLATFORM_DESKTOP.")
-elseif(NOT PLATFORM_PSV AND NOT PLATFORM_DESKTOP)
-    message(STATUS "No platform selected, defaulting to PLATFORM_DESKTOP=ON")
+if(_PLATFORM_COUNT EQUAL 0)
+    message(STATUS "No platform selected — defaulting to PLATFORM_DESKTOP=ON")
     set(PLATFORM_DESKTOP ON CACHE BOOL "Build for Desktop" FORCE)
+elseif(_PLATFORM_COUNT GREATER 1)
+    message(FATAL_ERROR "More than one PLATFORM_* flag is ON. Set exactly one.")
 endif()
 
 # ---------------------------------------------------------------------------
-# Borealis
+# Borealis paths — must be set before the cmake includes below
 # ---------------------------------------------------------------------------
 set(BOREALIS_DIR     ${CMAKE_CURRENT_SOURCE_DIR}/lib/borealis)
 set(BOREALIS_LIBRARY ${BOREALIS_DIR}/library)
 
-foreach(_P DESKTOP SWITCH PSV PS4 IOS TVOS ANDROID)
-    set(PLATFORM_${_P} ${PLATFORM_${_P}} CACHE BOOL "" FORCE)
-endforeach()
+# Forward into borealis-internal cache variables
+set(PLATFORM_DESKTOP ${PLATFORM_DESKTOP} CACHE BOOL "" FORCE)
+set(PLATFORM_SWITCH  ${PLATFORM_SWITCH}  CACHE BOOL "" FORCE)
+set(PLATFORM_PSV     ${PLATFORM_PSV}     CACHE BOOL "" FORCE)
+set(PLATFORM_PS4     ${PLATFORM_PS4}     CACHE BOOL "" FORCE)
+set(PLATFORM_IOS     ${PLATFORM_IOS}     CACHE BOOL "" FORCE)
+set(PLATFORM_TVOS    ${PLATFORM_TVOS}    CACHE BOOL "" FORCE)
+set(PLATFORM_ANDROID ${PLATFORM_ANDROID} CACHE BOOL "" FORCE)
 
 if(PLATFORM_PSV)
     set(BOREALIS_USE_GXM ON  CACHE BOOL "Use GXM renderer for PS Vita" FORCE)
     set(USE_VITA_SHARK  OFF  CACHE BOOL "Use VitaShark for shader compilation" FORCE)
 endif()
+
 set(USE_LIBROMFS OFF CACHE BOOL "Use libromfs")
+
+# For Android: point LIBROMFS_PREBUILT_GENERATOR at an existing file so that
+# borealis toolchain.cmake's check_libromfs_generator() does not fatal.
+# We force USE_LIBROMFS OFF below, so the generator is never actually invoked.
+if(PLATFORM_ANDROID)
+    set(LIBROMFS_PREBUILT_GENERATOR "${CMAKE_CURRENT_LIST_FILE}" CACHE STRING "" FORCE)
+endif()
 
 include(${BOREALIS_LIBRARY}/cmake/commonOption.cmake)
 include(${BOREALIS_LIBRARY}/cmake/toolchain.cmake)
 
+# FIX: borealis toolchain.cmake forces USE_LIBROMFS=ON for Android, but we use
+# APK-asset extraction instead (see src/platform/android_assets.cpp).  Override
+# it back to OFF so borealis does not try to compile/link libromfs.
+# Also set BRLS_PLATFORM_RESOURCES_PATH which borealis CMakeLists.txt leaves
+# empty for Android — without it BRLS_RESOURCES is undefined and all file loads
+# via fopen("resources/...") fail.
+if(PLATFORM_ANDROID)
+    set(USE_LIBROMFS OFF)
+    set(BRLS_PLATFORM_RESOURCES_PATH "\"resources/\"")
+endif()
+
+# ---------------------------------------------------------------------------
+# Project (after toolchain so cross-compilers are in effect)
+# ---------------------------------------------------------------------------
 project(VitaHub VERSION 1.0.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -frtti -fexceptions")
 
-# ---------------------------------------------------------------------------
-# Versions: VitaHub's own, plus the upstream version each module was imported
-# at (modules/<id>/VERSION, written by tools/import_modules.py).
-# ---------------------------------------------------------------------------
-if(NOT DEFINED APP_VERSION OR APP_VERSION STREQUAL "")
-    file(READ "${CMAKE_CURRENT_SOURCE_DIR}/VERSION" APP_VERSION)
-    string(STRIP "${APP_VERSION}" APP_VERSION)
+# Xcode 15 / iOS SDK 17.5 libc++ workaround. <vector> transitively pulls
+# in <__format/formatter_integral.h> -> <locale>, and <locale> uses
+# struct tm's members (tm_min, tm_hour, tm_sec, …) without including
+# <time.h> first. <wchar.h> only forward-declares tm, so without this
+# clang reports "member access into incomplete type 'tm'" all over the
+# codebase on every TU that pulls in borealis/core/event.hpp ->
+# <algorithm> / <functional>.
+#
+# Force-include the C header <time.h> rather than the C++ wrapper
+# <ctime>. <ctime> just does `using ::size_t _LIBCPP_USING_IF_EXISTS;`
+# which silently no-ops when ::size_t isn't declared yet — and then
+# <__type_traits/aligned_storage.h> can't resolve std::size_t and the
+# whole build collapses. <time.h> actually *defines* size_t / tm /
+# time_t in the global namespace, which makes libc++'s later
+# using-declarations resolve cleanly. <time.h> is also valid C, so
+# the SDL2 C sources (SDL_uikit_main.c et al.) don't need the
+# COMPILE_LANGUAGE:CXX gate the previous iteration carried.
+if(PLATFORM_IOS OR PLATFORM_TVOS)
+    add_compile_options(-include time.h)
 endif()
-if(NOT DEFINED APP_DISPLAY_VERSION OR APP_DISPLAY_VERSION STREQUAL "")
-    set(APP_DISPLAY_VERSION "${APP_VERSION}")
-endif()
-# The SFO wants "XX.YY".
-string(REGEX MATCH "^([0-9]+)\\.([0-9]+)" _sfo "${APP_VERSION}")
-if(_sfo)
-    set(_major "${CMAKE_MATCH_1}")
-    set(_minor "${CMAKE_MATCH_2}")
-else()
-    set(_major 0)
-    set(_minor 1)
-endif()
-if(_major LESS 10)
-    set(_major "0${_major}")
-endif()
-if(_minor LESS 10)
-    set(_minor "0${_minor}")
-endif()
-message(STATUS "VitaHub version: ${APP_VERSION} (${APP_DISPLAY_VERSION})")
 
+# ---------------------------------------------------------------------------
+# Vita VPK metadata
+# ---------------------------------------------------------------------------
 if(PLATFORM_PSV)
     set(VITA_APP_NAME "VitaHub")
     set(VITA_TITLEID  "VHUB00001")
-    set(VITA_VERSION  "${_major}.${_minor}")
+    set(VITA_VERSION  "01.00")
     set(VITA_MKSFOEX_FLAGS "${VITA_MKSFOEX_FLAGS} -d PARENTAL_LEVEL=1 -d ATTRIBUTE2=12")
 endif()
 
 # ---------------------------------------------------------------------------
-# Borealis patches (patches/borealis/, see patches/borealis/README.md). These
-# are the Vita_plex set, which is a superset of what the other apps carried.
+# PSV borealis patch
 # ---------------------------------------------------------------------------
+if(PLATFORM_PSV)
+    set(PSV_PLATFORM_PATCH  ${CMAKE_CURRENT_SOURCE_DIR}/patches/borealis/psv_platform.cpp)
+    set(PSV_PLATFORM_TARGET ${BOREALIS_LIBRARY}/lib/platforms/psv/psv_platform.cpp)
+    if(EXISTS ${PSV_PLATFORM_PATCH})
+        message(STATUS "Applying patch: psv_platform.cpp")
+        configure_file(${PSV_PLATFORM_PATCH} ${PSV_PLATFORM_TARGET} COPYONLY)
+    else()
+        message(FATAL_ERROR "Patch file not found: ${PSV_PLATFORM_PATCH}")
+    endif()
+endif()
+
+# ---------------------------------------------------------------------------
+# Borealis fontstash patch (all platforms): caches kerning advances so
+# stb_truetype's GPOS table walk doesn't run per glyph pair per frame.
+# Big win for any view with lots of text (Live TV titles, library lists);
+# rendering is unchanged visually, just much faster.
+# ---------------------------------------------------------------------------
+set(FONTSTASH_PATCH  ${CMAKE_CURRENT_SOURCE_DIR}/patches/borealis/fontstash.h)
+set(FONTSTASH_TARGET ${BOREALIS_LIBRARY}/include/borealis/extern/nanovg/fontstash.h)
+if(EXISTS ${FONTSTASH_PATCH})
+    message(STATUS "Applying patch: fontstash.h")
+    configure_file(${FONTSTASH_PATCH} ${FONTSTASH_TARGET} COPYONLY)
+else()
+    message(FATAL_ERROR "Patch file not found: ${FONTSTASH_PATCH}")
+endif()
+
+# ---------------------------------------------------------------------------
+# Borealis nanovg patch (all platforms): adds nvgTextBatchBegin/End so
+# views with many text labels of identical style (the EPG grid is the
+# canonical case) can flush all of them in one render call instead of
+# one per text line. Backward-compatible — code that doesn't call the
+# new entry points keeps the original draw-per-text behaviour.
+# ---------------------------------------------------------------------------
+set(NANOVG_PATCH  ${CMAKE_CURRENT_SOURCE_DIR}/patches/borealis/nanovg.c)
+set(NANOVG_TARGET ${BOREALIS_LIBRARY}/lib/extern/nanovg/nanovg.c)
+if(EXISTS ${NANOVG_PATCH})
+    message(STATUS "Applying patch: nanovg.c")
+    configure_file(${NANOVG_PATCH} ${NANOVG_TARGET} COPYONLY)
+else()
+    message(FATAL_ERROR "Patch file not found: ${NANOVG_PATCH}")
+endif()
+
+# ---------------------------------------------------------------------------
+# Borealis Application patch (all platforms): adds a hold-A-to-open-
+# menu shim. Default behaviour is off, so non-Android paths keep the
+# original press-time click semantics; main_activity.cpp flips it on
+# at runtime only when SDL_IsAndroidTV() returns true so the bare
+# 5-button TV remotes (no Menu/Guide key) can still reach the
+# Options context menu via a long-press on OK.
+# ---------------------------------------------------------------------------
+set(BRLS_APP_HPP_PATCH  ${CMAKE_CURRENT_SOURCE_DIR}/patches/borealis/brls_application.hpp)
+set(BRLS_APP_HPP_TARGET ${BOREALIS_LIBRARY}/include/borealis/core/application.hpp)
+if(EXISTS ${BRLS_APP_HPP_PATCH})
+    message(STATUS "Applying patch: borealis application.hpp")
+    configure_file(${BRLS_APP_HPP_PATCH} ${BRLS_APP_HPP_TARGET} COPYONLY)
+else()
+    message(FATAL_ERROR "Patch file not found: ${BRLS_APP_HPP_PATCH}")
+endif()
+
+set(BRLS_APP_CPP_PATCH  ${CMAKE_CURRENT_SOURCE_DIR}/patches/borealis/brls_application.cpp)
+set(BRLS_APP_CPP_TARGET ${BOREALIS_LIBRARY}/lib/core/application.cpp)
+if(EXISTS ${BRLS_APP_CPP_PATCH})
+    message(STATUS "Applying patch: borealis application.cpp")
+    configure_file(${BRLS_APP_CPP_PATCH} ${BRLS_APP_CPP_TARGET} COPYONLY)
+else()
+    message(FATAL_ERROR "Patch file not found: ${BRLS_APP_CPP_PATCH}")
+endif()
+
+# Vita_abs: adds the "password" hint borealis' EditTextDialog shows.
+configure_file(${CMAKE_CURRENT_SOURCE_DIR}/patches/borealis/hints.json
+               ${BOREALIS_DIR}/resources/i18n/en-US/hints.json COPYONLY)
+
+# ---------------------------------------------------------------------------
+# GLFW keyboard mapping patch (desktop only): adds keyboard shortcuts
+# for Start / Back / X / Y / LB / RB on the desktop GLFW backend so
+# the dev workflow doesn't require a physical gamepad.
+# ---------------------------------------------------------------------------
+if(NOT PLATFORM_SWITCH AND NOT PLATFORM_PSV AND NOT PLATFORM_PS4 AND NOT PLATFORM_ANDROID
+   AND NOT PLATFORM_IOS AND NOT PLATFORM_TVOS)
+    set(GLFW_INPUT_PATCH  ${CMAKE_CURRENT_SOURCE_DIR}/patches/borealis/glfw_input.cpp)
+    set(GLFW_INPUT_TARGET ${BOREALIS_LIBRARY}/lib/platforms/glfw/glfw_input.cpp)
+    if(EXISTS ${GLFW_INPUT_PATCH})
+        message(STATUS "Applying patch: glfw_input.cpp")
+        configure_file(${GLFW_INPUT_PATCH} ${GLFW_INPUT_TARGET} COPYONLY)
+    endif()
+
+    # GLFW platform patch (desktop only): keep the main loop ticking while the
+    # window is minimized so OS media-control transport (Linux MPRIS / multimedia
+    # keys, posted onto the loop via brls::sync) still drives playback. Upstream
+    # blocked in glfwWaitEvents() while iconified, freezing sync-task processing.
+    set(GLFW_PLATFORM_PATCH  ${CMAKE_CURRENT_SOURCE_DIR}/patches/borealis/glfw_platform.cpp)
+    set(GLFW_PLATFORM_TARGET ${BOREALIS_LIBRARY}/lib/platforms/glfw/glfw_platform.cpp)
+    if(EXISTS ${GLFW_PLATFORM_PATCH})
+        message(STATUS "Applying patch: glfw_platform.cpp")
+        configure_file(${GLFW_PLATFORM_PATCH} ${GLFW_PLATFORM_TARGET} COPYONLY)
+    endif()
+endif()
+
+# iOS / tvOS embed app resources through libromfs (borealis toolchain.cmake
+# forces USE_LIBROMFS=ON for these platforms). libromfs's own CMakeLists
+# fatals unless we tell it WHAT to embed and under what project name — set
+# both here, before borealis adds the libromfs subdirectory at
+# add_subdirectory(${BOREALIS_LIBRARY}) below. RESOURCE_LOCATION points at
+# our resources/ tree; the generator walks it at build time and bakes every
+# file into libromfs_resources.cpp, which is why RESOURCE_PREFIX is
+# "romfs:/" for these targets (set further down).
+if(PLATFORM_IOS OR PLATFORM_TVOS)
+    # libromfs embeds a SINGLE directory tree, so merge our app resources
+    # with borealis's system resources (i18n/hints.json, img/sys/) into a
+    # staging dir and point the generator at that. The app tree is copied
+    # first; borealis's is overlaid without clobbering (our i18n/en-US/
+    # main.json must survive, but we still need borealis's hints.json and
+    # img/sys/*). Done at configure time so the path exists before
+    # libromfs's CMakeLists validates it.
+    set(IOS_ROMFS_STAGE "${CMAKE_BINARY_DIR}/romfs_stage")
+    file(MAKE_DIRECTORY "${IOS_ROMFS_STAGE}")
+    file(COPY "${CMAKE_CURRENT_SOURCE_DIR}/resources/" DESTINATION "${IOS_ROMFS_STAGE}")
+    file(COPY "${BOREALIS_DIR}/resources/i18n" DESTINATION "${IOS_ROMFS_STAGE}")
+    file(COPY "${BOREALIS_DIR}/resources/img"  DESTINATION "${IOS_ROMFS_STAGE}")
+    set(LIBROMFS_PROJECT_NAME "VitaHub" CACHE STRING "" FORCE)
+    set(LIBROMFS_RESOURCE_LOCATION "${IOS_ROMFS_STAGE}" CACHE PATH "" FORCE)
+endif()
+
+add_subdirectory(${BOREALIS_LIBRARY})
+
+# ---------------------------------------------------------------------------
+# Services (modules/<id>/)
+#
+# Each defaults to ON on the platforms its standalone app builds for:
+#   Plex             every platform
+#   Audiobookshelf   Vita, Switch, PS4, desktop, Android
+#   Suwayomi         Vita, Switch, PS4, desktop, Android
+#   Music Assistant  Vita (its standalone app's only platform) and Linux
+# ---------------------------------------------------------------------------
+set(_abs_default ON)
+set(_music_default OFF)
+if(PLATFORM_IOS OR PLATFORM_TVOS)
+    set(_abs_default OFF)
+endif()
+if(PLATFORM_PSV OR (PLATFORM_DESKTOP AND CMAKE_SYSTEM_NAME STREQUAL "Linux"))
+    set(_music_default ON)
+endif()
+option(VITAHUB_MODULE_PLEX     "Include Plex (Vita_plex)"                          ON)
+option(VITAHUB_MODULE_ABS      "Include Audiobookshelf (Vita_abs)"                 ${_abs_default})
+option(VITAHUB_MODULE_SUWAYOMI "Include Suwayomi (Vita_Suwayomi)"                  ${_abs_default})
+option(VITAHUB_MODULE_MUSIC    "Include Music Assistant (Vita-Music-Assistant)"   ${_music_default})
+
+# Where resources/ is at runtime, for every target.
+if(PLATFORM_PSV)
+    set(VITAHUB_RESOURCE_PREFIX "app0:resources/")
+elseif(PLATFORM_PS4)
+    set(VITAHUB_RESOURCE_PREFIX "/app0/resources/")
+elseif(PLATFORM_SWITCH OR PLATFORM_IOS OR PLATFORM_TVOS OR USE_LIBROMFS)
+    # Switch and iOS/tvOS always use libromfs (set by borealis toolchain.cmake).
+    # Android does NOT: resources are APK assets extracted at startup.
+    set(VITAHUB_RESOURCE_PREFIX "romfs:/")
+else()
+    set(VITAHUB_RESOURCE_PREFIX "resources/")
+endif()
+
 function(vitahub_apply_patch patch target)
     if(NOT EXISTS ${patch})
         message(FATAL_ERROR "Patch file not found: ${patch}")
@@ -104,35 +290,21 @@ function(vitahub_apply_patch patch target)
     configure_file(${patch} ${target} COPYONLY)
 endfunction()
 
-set(_bp ${CMAKE_CURRENT_SOURCE_DIR}/patches/borealis)
-if(PLATFORM_PSV)
-    vitahub_apply_patch(${_bp}/psv_platform.cpp ${BOREALIS_LIBRARY}/lib/platforms/psv/psv_platform.cpp)
-endif()
-vitahub_apply_patch(${_bp}/fontstash.h           ${BOREALIS_LIBRARY}/include/borealis/extern/nanovg/fontstash.h)
-vitahub_apply_patch(${_bp}/nanovg.c              ${BOREALIS_LIBRARY}/lib/extern/nanovg/nanovg.c)
-vitahub_apply_patch(${_bp}/brls_application.hpp  ${BOREALIS_LIBRARY}/include/borealis/core/application.hpp)
-vitahub_apply_patch(${_bp}/brls_application.cpp  ${BOREALIS_LIBRARY}/lib/core/application.cpp)
-# Vita_abs: adds the "password" hint EditTextDialog shows.
-vitahub_apply_patch(${_bp}/hints.json            ${BOREALIS_DIR}/resources/i18n/en-US/hints.json)
-if(PLATFORM_DESKTOP)
-    # Desktop builds read resources/ from the source tree; borealis' own
-    # strings (hint bar labels) live in the submodule, so stage them there.
-    configure_file(${BOREALIS_DIR}/resources/i18n/en-US/hints.json
-                   ${CMAKE_CURRENT_SOURCE_DIR}/resources/i18n/en-US/hints.json COPYONLY)
-    vitahub_apply_patch(${_bp}/glfw_input.cpp    ${BOREALIS_LIBRARY}/lib/platforms/glfw/glfw_input.cpp)
-    vitahub_apply_patch(${_bp}/glfw_platform.cpp ${BOREALIS_LIBRARY}/lib/platforms/glfw/glfw_platform.cpp)
-endif()
-
-add_subdirectory(${BOREALIS_LIBRARY})
-
-# ---------------------------------------------------------------------------
-# Settings shared by every module library
-# ---------------------------------------------------------------------------
-if(PLATFORM_PSV)
-    set(VITAHUB_RESOURCE_PREFIX "app0:resources/")
-else()
-    set(VITAHUB_RESOURCE_PREFIX "resources/")
-endif()
+# Version of the upstream app a module was imported from (modules/<id>/VERSION,
+# e.g. "Beta 1.3.9"): numeric part for API headers, full string for display.
+function(vitahub_module_version id out_numeric out_display)
+    set(_v "0.0.0")
+    if(EXISTS ${PROJECT_SOURCE_DIR}/modules/${id}/VERSION)
+        file(READ ${PROJECT_SOURCE_DIR}/modules/${id}/VERSION _v)
+        string(STRIP "${_v}" _v)
+    endif()
+    string(REGEX MATCH "[0-9]+(\\.[0-9]+)*" _num "${_v}")
+    if(NOT _num)
+        set(_num "0.0.0")
+    endif()
+    set(${out_numeric} "${_num}" PARENT_SCOPE)
+    set(${out_display} "${_v}" PARENT_SCOPE)
+endfunction()
 
 # Links, include paths and definitions every module needs. Module code is
 # compiled exactly as in its standalone repo, plus VITAHUB=1, which gates the
@@ -152,30 +324,541 @@ function(vitahub_module_target target id)
         target_compile_definitions(${target} PRIVATE MINIZ_NO_STDIO MINIZ_NO_TIME)
         target_include_directories(${target} PRIVATE ${PROJECT_SOURCE_DIR}/lib/miniz)
     endif()
-    set_property(GLOBAL APPEND PROPERTY VITAHUB_MODULES ${id})
+    if(PLATFORM_DESKTOP AND APPLE)
+        target_include_directories(${target} PRIVATE /opt/homebrew/include /usr/local/include)
+    endif()
+    if(PLATFORM_IOS OR PLATFORM_TVOS)
+        # Headers from the CI-built curl and the MPVKit frameworks.
+        if(LIBCURL_INCLUDE_DIR)
+            target_include_directories(${target} PRIVATE "${LIBCURL_INCLUDE_DIR}")
+        endif()
+        if(LIBMPV_INCLUDE)
+            target_include_directories(${target} PRIVATE "${LIBMPV_INCLUDE}")
+        endif()
+    endif()
 endfunction()
 
-# Version of the upstream app a module was imported from (modules/<id>/VERSION,
-# e.g. "Beta 1.3.9"): numeric part for API headers, full string for display.
-function(vitahub_module_version id out_numeric out_display)
-    set(_v "0.0.0")
-    if(EXISTS ${PROJECT_SOURCE_DIR}/modules/${id}/VERSION)
-        file(READ ${PROJECT_SOURCE_DIR}/modules/${id}/VERSION _v)
-        string(STRIP "${_v}" _v)
+# Plex's optional platform features are probed further down (with the link
+# libraries, as in Vita_plex); these add what a probe enables to the module.
+function(vitahub_plex_sources)
+    if(TARGET vitahub_plex)
+        foreach(_f ${ARGN})
+            target_sources(vitahub_plex PRIVATE ${PROJECT_SOURCE_DIR}/modules/plex/${_f})
+        endforeach()
     endif()
-    string(REGEX MATCH "[0-9]+(\\.[0-9]+)*" _num "${_v}")
-    if(NOT _num)
-        set(_num "0.0.0")
+endfunction()
+function(vitahub_plex_definitions)
+    if(TARGET vitahub_plex)
+        target_compile_definitions(vitahub_plex PRIVATE ${ARGN})
     endif()
-    set(${out_numeric} "${_num}" PARENT_SCOPE)
-    set(${out_display} "${_v}" PARENT_SCOPE)
 endfunction()
 
-# Optional platform features, probed once for every module.
+set(VITAHUB_MODULE_TARGETS)
+foreach(_m PLEX ABS SUWAYOMI MUSIC)
+    string(TOLOWER ${_m} _id)
+    if(VITAHUB_MODULE_${_m})
+        add_subdirectory(modules/${_id})
+        list(APPEND VITAHUB_MODULE_TARGETS vitahub_${_id})
+        message(STATUS "VitaHub service: ${_id}")
+    endif()
+endforeach()
+
+# ---------------------------------------------------------------------------
+# Hub sources: the shell, plus hub/core (Vita_plex's platform layer and
+# self-updater, renamed to VitaHub by tools/import_modules.py)
+# ---------------------------------------------------------------------------
+set(APP_SOURCES
+    hub/src/main.cpp
+    hub/src/hub.cpp
+    hub/src/hub_settings.cpp
+    hub/src/modules.cpp
+    hub/src/theme.cpp
+
+    hub/core/src/platform/platform_common.cpp
+    hub/core/src/utils/app_update.cpp
+    hub/core/src/utils/http_client.cpp
+    hub/core/src/utils/update_verify.cpp
+)
+
+# Exactly one hub/core/src/platform/platform_<name>.cpp, as in Vita_plex.
 if(PLATFORM_PSV)
-    # SceNotificationUtil download notifications (Vita_plex). Compiled, not
-    # linked: a cross toolchain can't produce an executable for a check.
+    list(APPEND APP_SOURCES hub/core/src/platform/platform_psv.cpp)
+elseif(PLATFORM_PS4)
+    list(APPEND APP_SOURCES hub/core/src/platform/platform_ps4.cpp)
+    # In-app self-update: hand the downloaded PKG to the system installer.
+    list(APPEND APP_SOURCES hub/core/src/utils/ps4_install.cpp)
+elseif(PLATFORM_SWITCH)
+    list(APPEND APP_SOURCES hub/core/src/platform/platform_switch.cpp)
+elseif(PLATFORM_ANDROID)
+    list(APPEND APP_SOURCES hub/core/src/platform/platform_android.cpp)
+elseif(PLATFORM_IOS OR PLATFORM_TVOS)
+    list(APPEND APP_SOURCES hub/core/src/platform/platform_ios.mm)
+else()
+    list(APPEND APP_SOURCES hub/core/src/platform/platform_desktop.cpp)
+endif()
+
+if(PLATFORM_PSV)
+    # pthread stack floor + stdio lock stubs, shared by every module.
+    list(APPEND APP_SOURCES hub/src/vita_stubs.c)
+    # In-app self-update: unzip the downloaded VPK (miniz, sceIo-backed) and
+    # promote it in place via ScePromoterUtility. One miniz for the whole app.
+    list(APPEND APP_SOURCES hub/core/src/utils/vita_install.cpp lib/miniz/miniz.c)
+    include_directories(${CMAKE_CURRENT_SOURCE_DIR}/lib/miniz)
+    add_definitions(-DMINIZ_NO_STDIO -DMINIZ_NO_TIME)
+    set(VITAHUB_HEAP_MB 172 CACHE STRING "newlib heap size in MB (Vita)")
+    add_definitions(-DVITAHUB_HEAP_MB=${VITAHUB_HEAP_MB})
+endif()
+
+# Switch: userAppInit/userAppExit (romfs, sockets, system services init) +
+# pthread_create wrapper (1 MB stack floor for libmpv/ffmpeg threads).
+if(PLATFORM_SWITCH)
+    list(APPEND APP_SOURCES ${BOREALIS_LIBRARY}/lib/platforms/switch/switch_wrapper.c)
+    list(APPEND APP_SOURCES hub/core/src/utils/switch_stubs.c)
+endif()
+
+# Android asset extraction (used by platform_android.cpp).
+if(PLATFORM_ANDROID)
+    list(APPEND APP_SOURCES hub/core/src/platform/android_assets.cpp)
+endif()
+
+set(APP_INCLUDES
+    ${CMAKE_CURRENT_SOURCE_DIR}/hub/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/hub/core/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/hub/core_shim
+    ${BOREALIS_LIBRARY}/include
+    ${BOREALIS_LIBRARY}/include/borealis/extern
+    ${BOREALIS_LIBRARY}/lib/extern/yoga
+)
+
+# ---------------------------------------------------------------------------
+# Target
+# ---------------------------------------------------------------------------
+if(PLATFORM_ANDROID)
+    add_library(${PROJECT_NAME} SHARED ${APP_SOURCES})
+else()
+    add_executable(${PROJECT_NAME} ${APP_SOURCES})
+endif()
+
+if(WIN32)
+    # Link the GUI subsystem instead of the console one. Windows gives every
+    # console-subsystem process a console window, which is the black terminal
+    # that used to sit behind the app. mingw-w64 still uses main() here — no
+    # WinMain needed — and platform::init() re-attaches stdout to the parent
+    # console when the app was started from one, so logs are not lost.
+    set_target_properties(${PROJECT_NAME} PROPERTIES WIN32_EXECUTABLE ON)
+endif()
+
+target_include_directories(${PROJECT_NAME} PRIVATE ${APP_INCLUDES})
+target_compile_definitions(${PROJECT_NAME} PRIVATE VITAHUB=1)
+foreach(_m PLEX ABS SUWAYOMI MUSIC)
+    if(VITAHUB_MODULE_${_m})
+        target_compile_definitions(${PROJECT_NAME} PRIVATE VITAHUB_HAVE_${_m}=1)
+    endif()
+endforeach()
+if(PLATFORM_DESKTOP AND APPLE)
+    target_include_directories(${PROJECT_NAME} PRIVATE
+        /opt/homebrew/include
+        /usr/local/include
+    )
+    target_link_directories(${PROJECT_NAME} PRIVATE
+        /opt/homebrew/lib
+        /usr/local/lib
+    )
+endif()
+
+if(PLATFORM_IOS OR PLATFORM_TVOS)
+    # CI builds a minimal static libcurl from source against the matrix's
+    # SDK and passes both the headers dir and the .a path. Local builds
+    # can do the same or fall back to a Homebrew curl install for the
+    # headers (link will fail without LIBCURL_LIBRARY though — there's
+    # no point hiding that).
+    if(NOT LIBCURL_INCLUDE_DIR AND CURL_INCLUDE_DIR)
+        # Accept the more common variable name as an alias.
+        set(LIBCURL_INCLUDE_DIR "${CURL_INCLUDE_DIR}")
+    endif()
+    if(LIBCURL_INCLUDE_DIR)
+        target_include_directories(${PROJECT_NAME} PRIVATE "${LIBCURL_INCLUDE_DIR}")
+    elseif(EXISTS /opt/homebrew/opt/curl/include)
+        target_include_directories(${PROJECT_NAME} PRIVATE /opt/homebrew/opt/curl/include)
+    elseif(EXISTS /usr/local/opt/curl/include)
+        target_include_directories(${PROJECT_NAME} PRIVATE /usr/local/opt/curl/include)
+    endif()
+    if(LIBCURL_LIBRARY)
+        target_link_libraries(${PROJECT_NAME} "${LIBCURL_LIBRARY}")
+    endif()
+endif()
+
+target_compile_definitions(${PROJECT_NAME} PRIVATE RESOURCE_PREFIX=\"${VITAHUB_RESOURCE_PREFIX}\")
+
+# ---------------------------------------------------------------------------
+# Application version
+#
+# The CI passes the resolved version via -DAPP_VERSION=... (sourced from the
+# VERSION file, or a manual override). When it isn't supplied — e.g. a local
+# dev build — fall back to the VERSION file directly so the value still
+# matches what ships. The result is injected as the VITA_PLEX_VERSION
+# compile definition, which include/app/application.hpp now honours instead
+# of hard-coding a literal. This keeps the Settings → Version cell AND the
+# X-Plex-Version header / User-Agent on every API call in sync with the
+# actual build, rather than a stale "2.0.0" baked into the header.
+# ---------------------------------------------------------------------------
+if(NOT DEFINED APP_VERSION OR APP_VERSION STREQUAL "")
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/VERSION")
+        file(READ "${CMAKE_CURRENT_SOURCE_DIR}/VERSION" APP_VERSION)
+        string(STRIP "${APP_VERSION}" APP_VERSION)
+    else()
+        set(APP_VERSION "0.0.0")
+    endif()
+endif()
+
+# CI can also pass a human-readable display version separately. APP_VERSION
+# is the numeric flavour ("1.0.2" / "1.0.2.455") that goes into Vita SFOs,
+# PS4 pkgs, deb changelogs and the X-Plex-Version API header (which Plex
+# expects to look numeric). APP_DISPLAY_VERSION is what the Settings >
+# Version cell shows the user ("Beta 1.0.2"). When CI doesn't supply it
+# we fall back to APP_VERSION so local dev builds still get something
+# sensible.
+if(NOT DEFINED APP_DISPLAY_VERSION OR APP_DISPLAY_VERSION STREQUAL "")
+    set(APP_DISPLAY_VERSION "${APP_VERSION}")
+endif()
+message(STATUS "App version (numeric): ${APP_VERSION}")
+message(STATUS "App version (display): ${APP_DISPLAY_VERSION}")
+target_compile_definitions(${PROJECT_NAME} PRIVATE
+    VITAHUB_VERSION=\"${APP_VERSION}\"
+    VITAHUB_DISPLAY_VERSION=\"${APP_DISPLAY_VERSION}\")
+
+
+# ---------------------------------------------------------------------------
+# Link libraries
+# ---------------------------------------------------------------------------
+if(PLATFORM_ANDROID)
+    # Android requires libmpv for in-app playback.
+    set(APP_FFMPEG_LIBS mpv)
+    set(APP_FFMPEG_LINK_BLOCK ${APP_FFMPEG_LIBS})
+elseif(PLATFORM_IOS OR PLATFORM_TVOS)
+    # iOS / tvOS: link libmpv + ffmpeg from prebuilt MPVKit xcframeworks.
+    # The Apple platforms have no Homebrew-cross-compiled libmpv, so —
+    # exactly like the Vita / Switch builds pull a prebuilt mpv tarball
+    # from switchfin's portlibs — the CI job downloads MPVKit's release
+    # xcframeworks and points us at the unzipped directory via:
+    #   -DAPPLE_MPV_XCFRAMEWORKS_DIR=/path/with/*.xcframework
+    # We glob every *.xcframework there and link them all (Libmpv plus
+    # the seven Libav* ffmpeg frameworks). With the Xcode generator,
+    # target_link_libraries on a .xcframework resolves the correct
+    # platform/arch slice automatically.
+    #
+    # Headers: MPVKit's Libmpv.framework ships an mpv/ header dir, so
+    # adding each framework slice's Headers to the search path makes the
+    # existing  #include <mpv/client.h>  resolve unchanged. The CI also
+    # passes -DLIBMPV_INCLUDE pointing at the extracted mpv headers as a
+    # belt-and-braces fallback.
+    #
+    # Empty FFMPEG link block — the frameworks ARE the ffmpeg libs, so we
+    # don't also want a bare -lmpv / -lavcodec in the main link list.
+    set(APP_FFMPEG_LIBS "")
+    set(APP_FFMPEG_LINK_BLOCK "")
+    if(APPLE_MPV_XCFRAMEWORKS_DIR)
+        file(GLOB _MPV_XCFRAMEWORKS "${APPLE_MPV_XCFRAMEWORKS_DIR}/*.xcframework")
+        if(NOT _MPV_XCFRAMEWORKS)
+            message(FATAL_ERROR
+                "APPLE_MPV_XCFRAMEWORKS_DIR=${APPLE_MPV_XCFRAMEWORKS_DIR} "
+                "contains no *.xcframework bundles")
+        endif()
+        # Link every xcframework — Xcode resolves the right slice based on
+        # SDKROOT. For headers we only want ONE thing on the include path:
+        # Libmpv's Headers/, so #include <mpv/client.h> works. Adding the
+        # Libav* frameworks' Headers shadows system headers (libavutil
+        # ships a time.h that hijacks our -include <time.h> workaround,
+        # which made every TU explode with the libc++ tm error again).
+        # None of our code includes ffmpeg headers directly anyway.
+        foreach(_xcf ${_MPV_XCFRAMEWORKS})
+            target_link_libraries(${PROJECT_NAME} "${_xcf}")
+            get_filename_component(_xcf_name "${_xcf}" NAME_WE)
+            if(_xcf_name STREQUAL "Libmpv" OR _xcf_name STREQUAL "Libmpv-GPL")
+                # Pick the FIRST slice's Headers — headers are identical
+                # across slices (mpv's public API doesn't vary by arch).
+                file(GLOB _slices LIST_DIRECTORIES TRUE "${_xcf}/*")
+                foreach(_slice ${_slices})
+                    if(IS_DIRECTORY "${_slice}")
+                        file(GLOB _fw "${_slice}/*.framework")
+                        foreach(_f ${_fw})
+                            if(EXISTS "${_f}/Headers")
+                                target_include_directories(${PROJECT_NAME} PRIVATE "${_f}/Headers")
+                                message(STATUS "Using mpv headers from: ${_f}/Headers")
+                                break()
+                            endif()
+                        endforeach()
+                        if(_fw)
+                            break()
+                        endif()
+                    endif()
+                endforeach()
+            endif()
+        endforeach()
+        message(STATUS "Linked MPVKit xcframeworks: ${_MPV_XCFRAMEWORKS}")
+    elseif(LIBMPV_XCFRAMEWORK)
+        # Single combined xcframework fallback.
+        target_include_directories(${PROJECT_NAME} PRIVATE
+            "${LIBMPV_XCFRAMEWORK}/Headers"
+            "${LIBMPV_XCFRAMEWORK}")
+        target_link_libraries(${PROJECT_NAME} "${LIBMPV_XCFRAMEWORK}")
+    elseif(LIBMPV_LIBRARY)
+        target_include_directories(${PROJECT_NAME} PRIVATE "${LIBMPV_INCLUDE}")
+        target_link_libraries(${PROJECT_NAME} "${LIBMPV_LIBRARY}")
+    endif()
+    if(LIBMPV_INCLUDE)
+        target_include_directories(${PROJECT_NAME} PRIVATE "${LIBMPV_INCLUDE}")
+    endif()
+elseif(WIN32)
+    set(APP_FFMPEG_LIBS mpv)
+    set(APP_FFMPEG_LINK_BLOCK ${APP_FFMPEG_LIBS})
+else()
+    set(APP_FFMPEG_LIBS
+        mpv
+        avfilter
+        avformat
+        avcodec
+        swresample
+        swscale
+        avutil
+    )
+    if(APPLE OR PLATFORM_PS4)
+        set(APP_FFMPEG_LINK_BLOCK ${APP_FFMPEG_LIBS})
+    elseif(PLATFORM_SWITCH)
+        # switchfin's switch-ffmpeg is built WITH the mbedtls (rtmp/tls) and
+        # libssh2 (sftp) protocols, so libavformat.a pulls in mbedtls_* /
+        # psa_crypto_init / libssh2_* symbols that devkitPro's lighter ffmpeg
+        # didn't. Put ssh2 + mbedtls inside the SAME --start-group as ffmpeg so
+        # the one-pass static linker resolves the cross-references (ffmpeg ↔
+        # libssh2 ↔ mbedtls); listing mbedtls only in APP_NETWORK_LIBS (before
+        # ffmpeg) left those refs undefined.
+        set(APP_FFMPEG_LINK_BLOCK
+            -Wl,--start-group
+            ${APP_FFMPEG_LIBS}
+            ssh2 mbedtls mbedx509 mbedcrypto z
+            -Wl,--end-group)
+    else()
+        set(APP_FFMPEG_LINK_BLOCK -Wl,--start-group ${APP_FFMPEG_LIBS} -Wl,--end-group)
+    endif()
+endif()
+
+if(PLATFORM_ANDROID)
+    # Android dependency bundle intentionally omits libpng/libbz2/libzstd.
+    # Keeping these out of the explicit link list avoids CI link failures when
+    # those optional transitives are not packaged in jniLibs.
+    set(APP_RENDER_LIBS
+        ass
+        freetype
+        fribidi
+        webp
+        z
+        c
+        harfbuzz
+    )
+elseif(PLATFORM_IOS OR PLATFORM_TVOS)
+    # iOS / tvOS: no standalone render libs. borealis renders through its
+    # OWN bundled nanovg + stb_truetype (no system freetype), and every
+    # mpv-side dependency (libass, freetype, harfbuzz, fribidi, zlib, …)
+    # is statically baked into MPVKit's Libmpv.xcframework. Linking bare
+    # -lass / -lfreetype here would just fail — those dylibs don't exist
+    # in the iOS SDK. libz IS in the SDK, so keep it for anything that
+    # needs zlib directly.
+    set(APP_RENDER_LIBS
+        z
+    )
+elseif(WIN32)
+    set(APP_RENDER_LIBS
+        bz2
+        webp
+        z
+    )
+else()
+    set(APP_RENDER_LIBS
+        ass
+        freetype
+        fribidi
+        png
+        bz2
+        webp
+        z
+        c
+    )
+endif()
+
+if(NOT PLATFORM_PS4 AND NOT WIN32 AND NOT PLATFORM_ANDROID AND NOT PLATFORM_IOS AND NOT PLATFORM_TVOS)
+    list(APPEND APP_RENDER_LIBS
+        zstd
+        harfbuzz
+    )
+endif()
+
+# iOS / tvOS link a prebuilt static libcurl.a supplied via -DLIBCURL_LIBRARY
+# (built from source in the CI step against the matrix's SDK). The iOS
+# Simulator SDK ships /usr/lib/libcurl.tbd, but tvOS Simulator does NOT —
+# tvOS has a tighter public-library allowlist. Building static and linking
+# it directly keeps both targets on the same code path AND avoids relying
+# on whatever curl version Apple happens to ship that year. Empty
+# APP_NETWORK_LIBS here so the bare "-lcurl" / "-lmbedtls" entries don't
+# land in the link line.
+if(PLATFORM_IOS OR PLATFORM_TVOS)
+    set(APP_NETWORK_LIBS "")
+else()
+    set(APP_NETWORK_LIBS
+        curl
+    )
+endif()
+
+# mbedtls is curl's TLS backend on the consoles / desktop Homebrew builds.
+# iOS / tvOS use Secure Transport instead, so mbedtls isn't in the link
+# list there. Switch is also excluded HERE on purpose: its ffmpeg ALSO needs
+# mbedtls, so mbedtls is placed inside the ffmpeg --start-group (after curl)
+# instead — listing it here too would let CMake de-duplicate the in-group copy
+# and re-break the static link order (ffmpeg's mbedtls refs going undefined).
+if(NOT WIN32 AND NOT PLATFORM_IOS AND NOT PLATFORM_TVOS AND NOT PLATFORM_SWITCH)
+    list(APPEND APP_NETWORK_LIBS
+        mbedtls
+        mbedx509
+        mbedcrypto
+    )
+endif()
+
+if(APPLE OR PLATFORM_PS4)
+    # ld64 and lld resolve symbols across archives in any order (and the PS4
+    # toolchain calls ld.lld directly, so -Wl, flags don't apply).
+    target_link_libraries(${PROJECT_NAME} ${VITAHUB_MODULE_TARGETS})
+else()
+    target_link_libraries(${PROJECT_NAME} -Wl,--start-group ${VITAHUB_MODULE_TARGETS} -Wl,--end-group)
+endif()
+
+target_link_libraries(${PROJECT_NAME}
+    borealis
+    ${APP_PLATFORM_LIB}
+    ${APP_NETWORK_LIBS}
+    ${APP_FFMPEG_LINK_BLOCK}
+    ${APP_RENDER_LIBS}
+)
+
+# Update-signature verification (src/utils/update_verify.cpp) uses mbedcrypto,
+# which is linked on every target that installs updates in place: the consoles
+# (Switch gets it via the ffmpeg --start-group above), Android and desktop
+# Linux/macOS. Windows (Schannel, no mbedcrypto) and iOS/tvOS (browser-only
+# updates) compile the stub instead.
+if(NOT WIN32 AND NOT PLATFORM_IOS AND NOT PLATFORM_TVOS)
+    set(_vitaplex_have_mbedcrypto TRUE)
+    if(APPLE)
+        # update_verify.cpp is the ONLY desktop source that includes mbedtls
+        # headers, and Homebrew keeps them in a keg dir (mbedtls is keg-only)
+        # outside the /opt/homebrew/include prefix the other libs use — so the
+        # include path was never needed on macOS before and isn't there. Locate
+        # the header dir and add it (plus the matching keg lib dir); if it can't
+        # be found, fall back to the stub rather than fail the build — the macOS
+        # download is still TLS-verified, so this only drops the extra check.
+        find_path(MBEDTLS_INCLUDE_DIR mbedtls/sha256.h
+            HINTS /opt/homebrew/include /usr/local/include
+                  /opt/homebrew/opt/mbedtls/include /usr/local/opt/mbedtls/include)
+        if(MBEDTLS_INCLUDE_DIR)
+            target_include_directories(${PROJECT_NAME} PRIVATE "${MBEDTLS_INCLUDE_DIR}")
+            target_link_directories(${PROJECT_NAME} PRIVATE
+                /opt/homebrew/opt/mbedtls/lib /usr/local/opt/mbedtls/lib)
+        else()
+            set(_vitaplex_have_mbedcrypto FALSE)
+            message(WARNING "mbedtls headers not found — update signature "
+                            "verification disabled on this macOS build "
+                            "(the download is still TLS-verified)")
+        endif()
+    endif()
+    if(_vitaplex_have_mbedcrypto)
+        target_compile_definitions(${PROJECT_NAME} PRIVATE VITAHUB_HAVE_MBEDCRYPTO=1)
+        # The Plex/ABS/Suwayomi update verifiers are compiled (and disabled
+        # inside VitaHub) as upstream; give them the same switch.
+        foreach(_t vitahub_plex vitahub_abs vitahub_suwayomi)
+            if(TARGET ${_t})
+                target_compile_definitions(${_t} PRIVATE
+                    VITAPLEX_HAVE_MBEDCRYPTO=1 VITAABS_HAVE_MBEDCRYPTO=1 VITASUWAYOMI_HAVE_MBEDCRYPTO=1)
+                if(MBEDTLS_INCLUDE_DIR)
+                    target_include_directories(${_t} PRIVATE "${MBEDTLS_INCLUDE_DIR}")
+                endif()
+            endif()
+        endforeach()
+    endif()
+endif()
+
+if(NOT PLATFORM_SWITCH AND NOT PLATFORM_PS4 AND NOT WIN32 AND NOT PLATFORM_ANDROID AND NOT PLATFORM_IOS AND NOT PLATFORM_TVOS)
+    target_link_libraries(${PROJECT_NAME} mp3lame)
+endif()
+
+# Android needs the android library for AAssetManager (used by asset extraction).
+# Also explicitly link GLESv3/EGL so mpv_player.cpp's GL FBO setup and mpv's
+# OpenGL render backend resolve at link time even if SDL2 doesn't pull them in
+# as a transitive dependency.
+if(PLATFORM_ANDROID)
+    target_link_libraries(${PROJECT_NAME} android log GLESv3 EGL)
+endif()
+
+if(PLATFORM_PSV)
+    # Required for __wrap_pthread_create in src/utils/vita_stubs.c
+    target_link_options(${PROJECT_NAME} PRIVATE "-Wl,--wrap=pthread_create")
+
+    # vita-elf-create appends the SCE module data to the end of the first LOAD
+    # segment, and fails outright if that runs into the second:
+    #
+    #   Cannot allocate 4152 bytes for SCE data at end of segment 0;
+    #   segment 1 overlaps
+    #   Segmentation fault (core dumped)
+    #
+    # Binutils defaults to -z separate-code, which splits the read-only and
+    # executable parts of the image into their own LOAD segments and packs them
+    # tightly instead of padding each out to a page. That leaves nothing after
+    # segment 0 for the blob, and whether a given build packages at all comes
+    # down to where segment 0 happens to end — it worked until a commit adding
+    # about a kilobyte shifted it, with no error in the code and after a clean
+    # compile and link. Confirmed as a layout matter and not a toolchain one by
+    # re-running the last commit that packaged, unchanged, on the same image:
+    # it still passed.
+    #
+    # -z noseparate-code returns to page-padded segments, so segment 0 ends on
+    # a page boundary with the rest of that page free.
+    #
+    # Raising max-page-size was tried first and did nothing, which is worth
+    # recording: the gap is (alignment - end-of-segment-0 mod alignment), so a
+    # bigger alignment moves the figure around without ever guaranteeing it is
+    # large enough. Padding is what is needed here, not alignment.
+    target_link_options(${PROJECT_NAME} PRIVATE "-Wl,-z,noseparate-code")
+
+    target_link_libraries(${PROJECT_NAME}
+        archive
+        zstd
+        vita2d
+        SceNet_stub
+        SceNetCtl_stub
+        SceHttp_stub
+        SceSsl_stub
+        ScePgf_stub
+        SceRtc_stub
+        SceShellSvc_stub
+        SceAppMgr_stub
+        SceTouch_stub
+        SceAudiodec_stub
+        SceVideodec_stub
+        SceAvcodec_stub
+        SceCodecEngine_stub
+        SceAudio_stub
+        SceVshBridge_stub
+        # sceSysmoduleLoadModule in platform_psv.cpp (NET/SSL/HTTP/IME/PGF)
+        # and the in-app self-update promoter (utils/vita_install).
+        ScePromoterUtil_stub
+        SceSysmodule_stub
+    )
+
+    # Download notifications through SceNotificationUtil — the same popup and
+    # notification-list entry the system uses for its own downloads, including
+    # the BGDL progress form (see utils/shell_integration.hpp).
+    #
+    # Probed rather than assumed: the header is generated from vita-headers and
+    # an older SDK may predate it. Compiled, not linked — a cross toolchain has
+    # no business producing an executable for a feature check.
     include(CheckCXXSourceCompiles)
+    set(_saved_try_type "${CMAKE_TRY_COMPILE_TARGET_TYPE}")
     set(CMAKE_TRY_COMPILE_TARGET_TYPE STATIC_LIBRARY)
     check_cxx_source_compiles("
 #include <psp2/notificationutil.h>
@@ -191,125 +874,486 @@ int main() {
     sceNotificationUtilSendNotification((const SceWChar16*)0);
     return SCE_SYSMODULE_NOTIFICATION_UTIL;
 }" VITAPLEX_HAVE_PSV_NOTIFY)
-    unset(CMAKE_TRY_COMPILE_TARGET_TYPE)
-elseif(PLATFORM_DESKTOP AND NOT APPLE)
-    # MPRIS media controls over D-Bus (Vita_plex).
-    find_package(PkgConfig QUIET)
-    if(PkgConfig_FOUND)
-        pkg_check_modules(DBUS IMPORTED_TARGET dbus-1)
-        if(DBUS_FOUND)
-            set(VITAPLEX_MPRIS ON)
+    set(CMAKE_TRY_COMPILE_TARGET_TYPE "${_saved_try_type}")
+
+    if(VITAPLEX_HAVE_PSV_NOTIFY)
+        message(STATUS "Vita download notifications enabled")
+        if(TARGET vitahub_plex)
+            target_compile_definitions(vitahub_plex PRIVATE VITAPLEX_HAVE_PSV_NOTIFY=1)
+        endif()
+        target_link_libraries(${PROJECT_NAME} SceNotificationUtil_stub)
+    else()
+        message(STATUS "SceNotificationUtil unavailable — no Vita download notifications")
+    endif()
+elseif(PLATFORM_SWITCH)
+    # Required for __wrap_pthread_create in src/utils/switch_stubs.c — floors
+    # libmpv/ffmpeg thread stacks above libnx's 128 KB default so they stop
+    # overflowing the moment playback starts.
+    target_link_options(${PROJECT_NAME} PRIVATE "-Wl,--wrap=pthread_create")
+
+    target_link_libraries(${PROJECT_NAME}
+        nx
+        dav1d
+        postproc
+        placebo
+        jpeg
+        uam
+    )
+elseif(PLATFORM_PS4)
+    target_link_libraries(${PROJECT_NAME}
+        SceNet
+        # In-app self-update (utils/ps4_install): BGFT registers the PKG
+        # install; AppInstUtil is initialised alongside it, and the
+        # foreground user id (which the register call needs) comes from
+        # SceUserService.
+        SceBgft
+        SceAppInstUtil
+        SceUserService
+        # sceSystemServiceLaunchApp: hand off to the updater helper (VPLX00003)
+        # at update time, since VitaPlex can't replace its own running title.
+        SceSystemService
+    )
+
+    # The SceShellUI popup for a finished download (see
+    # utils/shell_integration.hpp). sceKernelSendNotificationRequest lives in
+    # libkernel, which is already linked, so there is nothing to add here — but
+    # OrbisNotificationRequest is a reverse-engineered declaration and older
+    # toolchains do not carry it, hence the probe. Compiled, not linked: a
+    # cross toolchain has no business producing an executable for a check.
+    include(CheckCXXSourceCompiles)
+    set(_saved_try_type "${CMAKE_TRY_COMPILE_TARGET_TYPE}")
+    set(CMAKE_TRY_COMPILE_TARGET_TYPE STATIC_LIBRARY)
+    check_cxx_source_compiles("
+#include <orbis/libkernel.h>
+int main() {
+    OrbisNotificationRequest req = {};
+    req.type            = NotificationRequest;
+    req.targetId        = -1;
+    req.useIconImageUri = 0;
+    req.message[0]      = 0;
+    return sceKernelSendNotificationRequest(0, &req, sizeof(req), 0);
+}" VITAPLEX_HAVE_PS4_NOTIFY)
+    set(CMAKE_TRY_COMPILE_TARGET_TYPE "${_saved_try_type}")
+
+    if(VITAPLEX_HAVE_PS4_NOTIFY)
+        message(STATUS "PS4 download notifications enabled")
+        if(TARGET vitahub_plex)
+            target_compile_definitions(vitahub_plex PRIVATE VITAPLEX_HAVE_PS4_NOTIFY=1)
+        endif()
+    else()
+        message(STATUS "OrbisNotificationRequest unavailable — no PS4 download notifications")
+    endif()
+elseif(PLATFORM_IOS OR PLATFORM_TVOS)
+    # System frameworks that mpv + SDL2 + borealis need on iOS/tvOS.
+    # Metal is added even though we render with GLES because libplacebo
+    # (mpv) and modern SDL2 reach for it for surface presentation.
+    set(_APPLE_MOBILE_FRAMEWORKS
+        "-framework UIKit"
+        "-framework Foundation"
+        "-framework CoreFoundation"
+        "-framework CoreGraphics"
+        "-framework QuartzCore"
+        "-framework CoreMedia"
+        "-framework CoreVideo"
+        "-framework CoreImage"
+        "-framework AVFoundation"
+        "-framework AudioToolbox"
+        "-framework CoreAudio"             # MPVKit Package.swift linkedFramework
+        "-framework VideoToolbox"          # mpv hwdec=auto-safe -> VideoToolbox
+        "-framework CoreText"              # libass ass_coretext.c CTFont* APIs
+        "-framework OpenGLES"
+        "-framework Metal"                 # MoltenVK / libplacebo backend
+        "-framework MetalKit"
+        "-framework IOSurface"             # MoltenVK swapchain surfaces
+        "-framework GameController"
+        "-framework CoreServices"
+        "-framework Security"
+        "-framework CFNetwork"             # system libcurl transitive
+        "-framework SystemConfiguration"
+    )
+    target_link_libraries(${PROJECT_NAME} ${_APPLE_MOBILE_FRAMEWORKS})
+    # Apple SDKs ship these as top-level dylibs, not frameworks.
+    # bz2/iconv/expat/resolv mirror MPVKit's Package.swift linkedLibrary
+    # settings; xml2 is libbluray's dep (SDK ships libxml2.tbd).
+    target_link_libraries(${PROJECT_NAME}
+        "-lc++" "-liconv" "-lbz2" "-lexpat" "-lresolv" "-lxml2")
+elseif(PLATFORM_DESKTOP)
+    find_package(Threads REQUIRED)
+    target_link_libraries(${PROJECT_NAME} Threads::Threads)
+    if(APPLE)
+        target_link_libraries(${PROJECT_NAME} "-framework CoreWLAN")
+    elseif(WIN32)
+        # Windows: System Media Transport Controls (media overlay + media keys)
+        # via WinRT. MinGW's WinRT support varies, so feature-probe by actually
+        # compiling + linking a snippet; only enable if it builds, else fall back
+        # to the no-op so the build never breaks. On failure the probe's compiler
+        # output is printed so the toolchain gap is diagnosable from the CI log.
+        set(_smtc_probe "${CMAKE_BINARY_DIR}/smtc_probe.cpp")
+        file(WRITE "${_smtc_probe}" [==[
+#include <windows.h>
+#include <roapi.h>
+#include <wrl.h>
+#include <wrl/wrappers/corewrappers.h>
+#include <windows.media.h>
+#include <systemmediatransportcontrolsinterop.h>
+using Microsoft::WRL::ComPtr;
+using Microsoft::WRL::Wrappers::HStringReference;
+using namespace ABI::Windows::Media;
+typedef ABI::Windows::Foundation::ITypedEventHandler<
+    SystemMediaTransportControls*, SystemMediaTransportControlsButtonPressedEventArgs*> BD;
+struct H : BD {
+    LONG r = 1;
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** p) override {
+        if (riid == __uuidof(IUnknown) || riid == __uuidof(BD)) { *p = static_cast<BD*>(this); return S_OK; }
+        *p = 0; return E_NOINTERFACE;
+    }
+    ULONG STDMETHODCALLTYPE AddRef() override { return (ULONG)++r; }
+    ULONG STDMETHODCALLTYPE Release() override { return (ULONG)--r; }
+    HRESULT STDMETHODCALLTYPE Invoke(ISystemMediaTransportControls*,
+        ISystemMediaTransportControlsButtonPressedEventArgs* a) override {
+        SystemMediaTransportControlsButton b; a->get_Button(&b); return S_OK;
+    }
+};
+int main() {
+    ComPtr<ISystemMediaTransportControlsInterop> interop;
+    RoGetActivationFactory(HStringReference(
+        RuntimeClass_Windows_Media_SystemMediaTransportControls).Get(),
+        IID_PPV_ARGS(&interop));
+    ComPtr<ISystemMediaTransportControls> smtc;
+    interop->GetForWindow((HWND)0, IID_PPV_ARGS(&smtc));
+    smtc->put_IsEnabled(true);
+    smtc->put_IsPlayEnabled(true);
+    smtc->put_IsNextEnabled(1);
+    smtc->put_PlaybackStatus(MediaPlaybackStatus_Playing);
+    ComPtr<ISystemMediaTransportControlsDisplayUpdater> up;
+    smtc->get_DisplayUpdater(&up);
+    up->put_Type(MediaPlaybackType_Music);
+    ComPtr<IMusicDisplayProperties> mp;
+    up->get_MusicProperties(&mp);
+    mp->put_Title(HStringReference(L"x").Get());
+    up->Update();
+    EventRegistrationToken tok;
+    H* cb = new H();
+    smtc->add_ButtonPressed(cb, &tok);
+    cb->Release();
+    return 0;
+}
+]==])
+        try_compile(VITAPLEX_HAVE_SMTC "${CMAKE_BINARY_DIR}/smtc_probe_bin"
+            SOURCES "${_smtc_probe}"
+            LINK_LIBRARIES runtimeobject ole32
+            CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON
+            OUTPUT_VARIABLE _smtc_out)
+        if(VITAPLEX_HAVE_SMTC)
+            message(STATUS "SMTC media controls enabled")
+            vitahub_plex_sources(src/utils/now_playing_smtc.cpp)
+            vitahub_plex_definitions(VITAPLEX_SMTC=1)
+            target_link_libraries(${PROJECT_NAME} runtimeobject ole32 user32)
+
+            # Optional cover-art + album-title extension. Needs the WinRT URI +
+            # RandomAccessStreamReference + IMusicDisplayProperties2 APIs, which
+            # vary on MinGW — probe separately so a gap here only drops the
+            # artwork, never the base SMTC controls above.
+            set(_smtc_thumb_probe "${CMAKE_BINARY_DIR}/smtc_thumb_probe.cpp")
+            file(WRITE "${_smtc_thumb_probe}" [==[
+#include <windows.h>
+#include <roapi.h>
+#include <wrl.h>
+#include <wrl/wrappers/corewrappers.h>
+#include <windows.foundation.h>
+#include <windows.storage.streams.h>
+#include <windows.media.h>
+using Microsoft::WRL::ComPtr;
+using Microsoft::WRL::Wrappers::HStringReference;
+using namespace ABI::Windows::Foundation;
+using namespace ABI::Windows::Storage::Streams;
+using namespace ABI::Windows::Media;
+int main() {
+    ComPtr<IUriRuntimeClassFactory> uf;
+    RoGetActivationFactory(HStringReference(RuntimeClass_Windows_Foundation_Uri).Get(), IID_PPV_ARGS(&uf));
+    ComPtr<IUriRuntimeClass> uri;
+    uf->CreateUri(HStringReference(L"http://x").Get(), &uri);
+    ComPtr<IRandomAccessStreamReferenceStatics> rs;
+    RoGetActivationFactory(HStringReference(RuntimeClass_Windows_Storage_Streams_RandomAccessStreamReference).Get(), IID_PPV_ARGS(&rs));
+    ComPtr<IRandomAccessStreamReference> ref;
+    rs->CreateFromUri(uri.Get(), &ref);
+    ComPtr<ISystemMediaTransportControlsDisplayUpdater> up;
+    up->put_Thumbnail(ref.Get());
+    ComPtr<IMusicDisplayProperties2> m2;
+    m2->put_AlbumTitle(HStringReference(L"x").Get());
+    return 0;
+}
+]==])
+            try_compile(VITAPLEX_HAVE_SMTC_THUMB "${CMAKE_BINARY_DIR}/smtc_thumb_probe_bin"
+                SOURCES "${_smtc_thumb_probe}"
+                LINK_LIBRARIES runtimeobject ole32
+                CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON
+                OUTPUT_VARIABLE _smtc_thumb_out)
+            if(VITAPLEX_HAVE_SMTC_THUMB)
+                message(STATUS "SMTC cover art + album title enabled")
+                vitahub_plex_definitions(VITAPLEX_SMTC_THUMB=1)
+            else()
+                message(STATUS "SMTC cover art unavailable — title/artist only. Probe output:\n${_smtc_thumb_out}")
+            endif()
+
+            # Optional repeat + shuffle toggles. These live on the revision-2
+            # interface (ISystemMediaTransportControls2) + its change-requested
+            # events, which vary on MinGW — probe separately so a gap here only
+            # drops repeat/shuffle, never the base SMTC controls.
+            set(_smtc_modes_probe "${CMAKE_BINARY_DIR}/smtc_modes_probe.cpp")
+            file(WRITE "${_smtc_modes_probe}" [==[
+#include <windows.h>
+#include <roapi.h>
+#include <wrl.h>
+#include <wrl/wrappers/corewrappers.h>
+#include <windows.media.h>
+using Microsoft::WRL::ComPtr;
+using namespace ABI::Windows::Media;
+typedef ABI::Windows::Foundation::ITypedEventHandler<
+    SystemMediaTransportControls*, AutoRepeatModeChangeRequestedEventArgs*> RD;
+typedef ABI::Windows::Foundation::ITypedEventHandler<
+    SystemMediaTransportControls*, ShuffleEnabledChangeRequestedEventArgs*> SD;
+int main() {
+    ComPtr<ISystemMediaTransportControls2> smtc2;
+    smtc2->put_AutoRepeatMode(MediaPlaybackAutoRepeatMode_List);
+    smtc2->put_ShuffleEnabled(true);
+    EventRegistrationToken t1, t2;
+    smtc2->add_AutoRepeatModeChangeRequested((RD*)0, &t1);
+    smtc2->add_ShuffleEnabledChangeRequested((SD*)0, &t2);
+    ComPtr<IAutoRepeatModeChangeRequestedEventArgs> ra;
+    MediaPlaybackAutoRepeatMode m;
+    ra->get_RequestedAutoRepeatMode(&m);
+    ComPtr<IShuffleEnabledChangeRequestedEventArgs> sa;
+    boolean b;
+    sa->get_RequestedShuffleEnabled(&b);
+    return 0;
+}
+]==])
+            try_compile(VITAPLEX_HAVE_SMTC_MODES "${CMAKE_BINARY_DIR}/smtc_modes_probe_bin"
+                SOURCES "${_smtc_modes_probe}"
+                LINK_LIBRARIES runtimeobject ole32
+                CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON
+                OUTPUT_VARIABLE _smtc_modes_out)
+            if(VITAPLEX_HAVE_SMTC_MODES)
+                message(STATUS "SMTC repeat + shuffle enabled")
+                vitahub_plex_definitions(VITAPLEX_SMTC_MODES=1)
+            else()
+                message(STATUS "SMTC repeat/shuffle unavailable. Probe output:\n${_smtc_modes_out}")
+            endif()
+        else()
+            message(STATUS "WinRT SMTC unavailable — disabled. Probe output:\n${_smtc_out}")
+        endif()
+
+        # Windows shell integration: taskbar progress bar, AppUserModelID, and
+        # a toast when a download finishes (see utils/shell_integration.hpp).
+        # The first two are plain COM and always available; the toast needs the
+        # WinRT notification headers, which older mingw-w64 does not ship, so
+        # probe for them the same way SMTC's optional pieces are probed. Without
+        # them notify() flashes the taskbar button instead, which needs nothing.
+        vitahub_plex_sources(src/utils/shell_integration_win.cpp)
+        # shlwapi: propvarutil.h's InitPropVariantFromString is an inline that
+        # calls SHStrDupW, so it is a link-time dependency of the shortcut code
+        # even though nothing here names it.
+        target_link_libraries(${PROJECT_NAME} ole32 shell32 shlwapi propsys user32 uuid)
+
+        set(_toast_probe "${CMAKE_BINARY_DIR}/toast_probe.cpp")
+        file(WRITE "${_toast_probe}" [==[
+#include <windows.h>
+#include <roapi.h>
+#include <wrl.h>
+#include <wrl/wrappers/corewrappers.h>
+#include <windows.ui.notifications.h>
+#include <windows.data.xml.dom.h>
+using Microsoft::WRL::ComPtr;
+using Microsoft::WRL::Wrappers::HStringReference;
+namespace WUN = ABI::Windows::UI::Notifications;
+namespace WDX = ABI::Windows::Data::Xml::Dom;
+int main() {
+    ComPtr<WUN::IToastNotificationManagerStatics> mgr;
+    RoGetActivationFactory(
+        HStringReference(RuntimeClass_Windows_UI_Notifications_ToastNotificationManager).Get(),
+        IID_PPV_ARGS(&mgr));
+    ComPtr<WUN::IToastNotifier> notifier;
+    mgr->CreateToastNotifierWithId(HStringReference(L"x").Get(), &notifier);
+    ComPtr<WDX::IXmlDocument> doc;
+    RoActivateInstance(HStringReference(RuntimeClass_Windows_Data_Xml_Dom_XmlDocument).Get(),
+                       (IInspectable**)doc.GetAddressOf());
+    ComPtr<WDX::IXmlDocumentIO> io;
+    doc.As(&io);
+    io->LoadXml(HStringReference(L"<toast/>").Get());
+    ComPtr<WUN::IToastNotificationFactory> f;
+    RoGetActivationFactory(
+        HStringReference(RuntimeClass_Windows_UI_Notifications_ToastNotification).Get(),
+        IID_PPV_ARGS(&f));
+    ComPtr<WUN::IToastNotification> toast;
+    f->CreateToastNotification(doc.Get(), &toast);
+    notifier->Show(toast.Get());
+    return 0;
+}
+]==])
+        try_compile(VITAPLEX_HAVE_TOAST "${CMAKE_BINARY_DIR}/toast_probe_bin"
+            SOURCES "${_toast_probe}"
+            LINK_LIBRARIES runtimeobject ole32
+            CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON
+            OUTPUT_VARIABLE _toast_out)
+        if(VITAPLEX_HAVE_TOAST)
+            message(STATUS "Toast notifications enabled")
+            vitahub_plex_definitions(VITAPLEX_HAVE_TOAST=1)
+            target_link_libraries(${PROJECT_NAME} runtimeobject)
+
+            # IToastNotifier::Setting is the only call that says WHY a toast was
+            # not displayed — Show() reports handing it over, not that anything
+            # appeared. Probed on its own so a header set without it loses the
+            # diagnostic and nothing else.
+            set(_toastset_probe "${CMAKE_BINARY_DIR}/toastset_probe.cpp")
+            file(WRITE "${_toastset_probe}" [==[
+#include <windows.h>
+#include <roapi.h>
+#include <wrl.h>
+#include <wrl/wrappers/corewrappers.h>
+#include <windows.ui.notifications.h>
+using Microsoft::WRL::ComPtr;
+namespace WUN = ABI::Windows::UI::Notifications;
+int main() {
+    ComPtr<WUN::IToastNotifier> notifier;
+    WUN::NotificationSetting s = WUN::NotificationSetting_Enabled;
+    notifier->get_Setting(&s);
+    return s == WUN::NotificationSetting_DisabledForApplication ||
+           s == WUN::NotificationSetting_DisabledForUser ||
+           s == WUN::NotificationSetting_DisabledByGroupPolicy ||
+           s == WUN::NotificationSetting_DisabledByManifest;
+}
+]==])
+            try_compile(VITAPLEX_HAVE_TOAST_SETTING
+                "${CMAKE_BINARY_DIR}/toastset_probe_bin"
+                SOURCES "${_toastset_probe}"
+                LINK_LIBRARIES runtimeobject ole32
+                CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON
+                OUTPUT_VARIABLE _toastset_out)
+            if(VITAPLEX_HAVE_TOAST_SETTING)
+                message(STATUS "Toast suppression diagnostics enabled")
+                vitahub_plex_definitions(VITAPLEX_HAVE_TOAST_SETTING=1)
+            else()
+                message(STATUS "IToastNotifier::Setting unavailable — a suppressed toast "
+                               "will not say why. Probe output:\n${_toastset_out}")
+            endif()
+
+            # Live download progress inside the toast. Needs the data-binding
+            # half of the API — NotificationData, IToastNotification4::put_Data
+            # and IToastNotifier2::UpdateWithTag — which is newer than the base
+            # toast interfaces and absent from older mingw-w64 header sets.
+            # Probed separately so a gap here costs only the text in the toast:
+            # the taskbar progress bar and the completion toast are unaffected.
+            #
+            # Note the 4. This probe and the code it mirrors both asked
+            # IToastNotification2 for put_Data, which lives on 4 — 2 carries
+            # only Tag, Group and SuppressPopup. The probe failed for that
+            # reason and the failure was read as "mingw-w64 does not ship the
+            # API", so Windows shipped with no progress toast at all while the
+            # headers had it the whole time.
+            #
+            # This probe deliberately mirrors the call sequence in
+            # shell_integration_win.cpp, so if it compiles, that code does too.
+            set(_toastprog_probe "${CMAKE_BINARY_DIR}/toastprog_probe.cpp")
+            file(WRITE "${_toastprog_probe}" [==[
+#include <windows.h>
+#include <roapi.h>
+#include <wrl.h>
+#include <wrl/wrappers/corewrappers.h>
+#include <windows.ui.notifications.h>
+#include <windows.foundation.collections.h>
+using Microsoft::WRL::ComPtr;
+using Microsoft::WRL::Wrappers::HStringReference;
+namespace WUN = ABI::Windows::UI::Notifications;
+int main() {
+    ComPtr<IInspectable> insp;
+    RoActivateInstance(
+        HStringReference(RuntimeClass_Windows_UI_Notifications_NotificationData).Get(), &insp);
+    ComPtr<WUN::INotificationData> data;
+    insp.As(&data);
+    ComPtr<ABI::Windows::Foundation::Collections::IMap<HSTRING, HSTRING>> values;
+    data->get_Values(&values);
+    boolean replaced = false;
+    values->Insert(HStringReference(L"progressValue").Get(),
+                   HStringReference(L"0.5").Get(), &replaced);
+    data->put_SequenceNumber(1);
+    ComPtr<WUN::IToastNotification> toast;
+    ComPtr<WUN::IToastNotification2> toast2;
+    toast.As(&toast2);
+    toast2->put_Tag(HStringReference(L"t").Get());
+    ComPtr<WUN::IToastNotification4> toast4;
+    toast.As(&toast4);
+    toast4->put_Data(data.Get());
+    ComPtr<WUN::IToastNotifier> notifier;
+    ComPtr<WUN::IToastNotifier2> notifier2;
+    notifier.As(&notifier2);
+    WUN::NotificationUpdateResult r = WUN::NotificationUpdateResult_Failed;
+    notifier2->UpdateWithTag(data.Get(), HStringReference(L"t").Get(), &r);
+    ComPtr<WUN::IToastNotificationManagerStatics2> mgr2;
+    RoGetActivationFactory(
+        HStringReference(RuntimeClass_Windows_UI_Notifications_ToastNotificationManager).Get(),
+        IID_PPV_ARGS(&mgr2));
+    ComPtr<WUN::IToastNotificationHistory> history;
+    mgr2->get_History(&history);
+    history->RemoveGroupedTagWithId(HStringReference(L"t").Get(),
+                                    HStringReference(L"").Get(),
+                                    HStringReference(L"a").Get());
+    return 0;
+}
+]==])
+            try_compile(VITAPLEX_HAVE_TOAST_PROGRESS
+                "${CMAKE_BINARY_DIR}/toastprog_probe_bin"
+                SOURCES "${_toastprog_probe}"
+                LINK_LIBRARIES runtimeobject ole32
+                CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON
+                OUTPUT_VARIABLE _toastprog_out)
+            if(VITAPLEX_HAVE_TOAST_PROGRESS)
+                message(STATUS "Live download progress in the toast enabled")
+                vitahub_plex_definitions(VITAPLEX_HAVE_TOAST_PROGRESS=1)
+            else()
+                message(STATUS "Toast data-binding API unavailable — download progress "
+                               "shows on the taskbar button only. Probe output:\n${_toastprog_out}")
+            endif()
+        else()
+            message(STATUS "WinRT toast headers unavailable — download notifications "
+                           "fall back to flashing the taskbar button. Probe output:\n${_toast_out}")
+        endif()
+
+        # Embed a Win32 version resource so the .exe identifies itself as
+        # "VitaPlex" (FileDescription/ProductName). Without it an unpackaged exe
+        # has no identity and Windows labels the media overlay "Unknown app";
+        # with it, the overlay (and Task Manager / file properties) shows the
+        # app name. Compiled by windres under MinGW via CMake's RC language.
+        enable_language(RC)
+        target_sources(${PROJECT_NAME} PRIVATE "${CMAKE_SOURCE_DIR}/app/platform/windows/vitahub.rc")
+    else()
+        # Linux desktop: expose MPRIS media controls over D-Bus so the multimedia
+        # keys and the GNOME/KDE media widget drive playback even when VitaPlex
+        # isn't the focused window. Optional — falls back to a no-op if dbus-1
+        # isn't present at configure time.
+        find_package(PkgConfig QUIET)
+        if(PkgConfig_FOUND)
+            pkg_check_modules(DBUS IMPORTED_TARGET dbus-1)
+            if(DBUS_FOUND)
+                message(STATUS "MPRIS media controls enabled (dbus-1 ${DBUS_VERSION})")
+                vitahub_plex_sources(src/utils/now_playing_mpris.cpp)
+                # Same bus, same availability check: desktop notifications and
+                # the launcher progress bar (see utils/shell_integration.hpp).
+                vitahub_plex_sources(src/utils/shell_integration_dbus.cpp)
+                vitahub_plex_definitions(VITAPLEX_MPRIS=1)
+                target_link_libraries(${PROJECT_NAME} PkgConfig::DBUS)
+                if(TARGET vitahub_plex)
+                    target_link_libraries(vitahub_plex PRIVATE PkgConfig::DBUS)
+                endif()
+            else()
+                message(STATUS "dbus-1 not found — MPRIS media controls disabled")
+            endif()
         endif()
     endif()
 endif()
 
-set(VITAHUB_MODULE_TARGETS)
-foreach(_m PLEX ABS SUWAYOMI MUSIC)
-    string(TOLOWER ${_m} _id)
-    if(VITAHUB_MODULE_${_m})
-        add_subdirectory(modules/${_id})
-        list(APPEND VITAHUB_MODULE_TARGETS vitahub_${_id})
-    endif()
-endforeach()
-
 # ---------------------------------------------------------------------------
-# The hub executable
-# ---------------------------------------------------------------------------
-set(HUB_SOURCES
-    hub/src/main.cpp
-    hub/src/hub.cpp
-    hub/src/hub_settings.cpp
-    hub/src/modules.cpp
-    hub/src/theme.cpp
-
-    # hub/core: Vita_plex's platform layer and self-updater, renamed to VitaHub
-    hub/core/src/platform/platform_common.cpp
-    hub/core/src/utils/app_update.cpp
-    hub/core/src/utils/http_client.cpp
-    hub/core/src/utils/update_verify.cpp
-)
-if(PLATFORM_PSV)
-    # pthread stack floor + stdio lock stubs, shared by every module. miniz is
-    # used by the update installers (utils/vita_install).
-    list(APPEND HUB_SOURCES
-        hub/core/src/platform/platform_psv.cpp
-        hub/core/src/utils/vita_install.cpp
-        hub/src/vita_stubs.c
-        lib/miniz/miniz.c)
-    set_source_files_properties(lib/miniz/miniz.c PROPERTIES COMPILE_DEFINITIONS "MINIZ_NO_STDIO;MINIZ_NO_TIME")
-else()
-    list(APPEND HUB_SOURCES hub/core/src/platform/platform_desktop.cpp)
-endif()
-
-add_executable(${PROJECT_NAME} ${HUB_SOURCES})
-target_include_directories(${PROJECT_NAME} PRIVATE
-    hub/include
-    hub/core/include
-    hub/core_shim
-    lib/miniz
-    ${BOREALIS_LIBRARY}/include
-    ${BOREALIS_LIBRARY}/include/borealis/extern)
-target_compile_definitions(${PROJECT_NAME} PRIVATE
-    VITAHUB=1
-    VITAHUB_VERSION=\"${APP_VERSION}\"
-    VITAHUB_DISPLAY_VERSION=\"${APP_DISPLAY_VERSION}\"
-    VITAHUB_HAVE_MBEDCRYPTO=1
-    RESOURCE_PREFIX=\"${VITAHUB_RESOURCE_PREFIX}\")
-foreach(_m PLEX ABS SUWAYOMI MUSIC)
-    if(VITAHUB_MODULE_${_m})
-        target_compile_definitions(${PROJECT_NAME} PRIVATE VITAHUB_HAVE_${_m}=1)
-    endif()
-endforeach()
-
-# Module libraries reference each other's nothing, but they all reference the
-# hub (vitahub::...) and the hub references them: one link group.
-target_link_libraries(${PROJECT_NAME}
-    -Wl,--start-group ${VITAHUB_MODULE_TARGETS} -Wl,--end-group
-    borealis
-    ${APP_PLATFORM_LIB})
-
-# ---------------------------------------------------------------------------
-# Third-party libraries (union of what the four apps link)
-# ---------------------------------------------------------------------------
-set(APP_FFMPEG_LIBS mpv avfilter avformat avcodec swresample swscale avutil)
-if(APPLE)
-    set(APP_FFMPEG_LINK_BLOCK ${APP_FFMPEG_LIBS})
-else()
-    set(APP_FFMPEG_LINK_BLOCK -Wl,--start-group ${APP_FFMPEG_LIBS} -Wl,--end-group)
-endif()
-
-target_link_libraries(${PROJECT_NAME}
-    curl mbedtls mbedx509 mbedcrypto
-    ${APP_FFMPEG_LINK_BLOCK}
-    ass freetype fribidi png bz2 webp z zstd harfbuzz mp3lame)
-
-if(PLATFORM_PSV)
-    set(VITAHUB_HEAP_MB 172 CACHE STRING "newlib heap size in MB (Vita)")
-    target_compile_definitions(${PROJECT_NAME} PRIVATE VITAHUB_HEAP_MB=${VITAHUB_HEAP_MB})
-    target_link_options(${PROJECT_NAME} PRIVATE
-        "-Wl,--wrap=pthread_create"
-        # See Vita_plex: keeps room at the end of segment 0 for vita-elf-create.
-        "-Wl,-z,noseparate-code")
-    target_link_libraries(${PROJECT_NAME}
-        archive zstd c vita2d
-        SceNet_stub SceNetCtl_stub SceHttp_stub SceSsl_stub ScePgf_stub SceRtc_stub
-        SceShellSvc_stub SceAppMgr_stub SceTouch_stub SceAudiodec_stub SceVideodec_stub
-        SceAvcodec_stub SceCodecEngine_stub SceAudio_stub SceVshBridge_stub
-        ScePromoterUtil_stub SceSysmodule_stub SceCamera_stub ScePower_stub
-        SceLibKernel_stub)
-    if(VITAPLEX_HAVE_PSV_NOTIFY)
-        target_link_libraries(${PROJECT_NAME} SceNotificationUtil_stub)
-    endif()
-elseif(PLATFORM_DESKTOP)
-    find_package(Threads REQUIRED)
-    target_link_libraries(${PROJECT_NAME} Threads::Threads)
-    if(VITAPLEX_MPRIS)
-        target_link_libraries(${PROJECT_NAME} PkgConfig::DBUS)
-    endif()
-endif()
-
-# ---------------------------------------------------------------------------
-# Packaging
+# Platform packaging / post-build
 # ---------------------------------------------------------------------------
 if(PLATFORM_PSV)
     # ── Updater stub (self-update helper), as in Vita_plex ────────────────
@@ -372,5 +1416,237 @@ if(PLATFORM_PSV)
         FILE resources/cacert.pem                         resources/cacert.pem
         FILE ${CMAKE_BINARY_DIR}/vitahub_updater.vpk      updater.vpk
         ${VITA_RES_FILE_ARGS}
+    )
+
+elseif(PLATFORM_PS4)
+    if(PS4)
+        # PS4 variable is defined by the pacbrew toolchain
+        add_self(${PROJECT_NAME})
+        add_pkg(${PROJECT_NAME}
+            ${CMAKE_BINARY_DIR}/ps4
+            "VHUB00002"
+            "VitaHub"
+            "01.00"
+            # https://psdevwiki.com/ps4/param.sfo#ATTRIBUTE - Support PS4 Pro
+            8388608
+        )
+    endif()
+    add_custom_target(${PROJECT_NAME}.data
+        # Copy borealis PS4 base files (sce_module, about/right.sprx)
+        COMMAND "${CMAKE_COMMAND}" -E copy_directory ${BOREALIS_DIR}/ps4 ${CMAKE_BINARY_DIR}/ps4
+        # Override with our custom sce_sys (icon)
+        COMMAND "${CMAKE_COMMAND}" -E copy_directory ${CMAKE_SOURCE_DIR}/app/platform/ps4 ${CMAKE_BINARY_DIR}/ps4
+        # Copy app resources EXCEPT the per-platform icon directories.
+        # The pacbrew pkg-tool generates a .gp4 XML project from the
+        # bundled file list; the "Keyboard & Mouse" directory's '&' is
+        # an unescaped XML entity reference there, which crashes the
+        # tool with "An error occurred while parsing EntityName".
+        # PS4 also doesn't need Switch / Vita / Steam Deck / Touch
+        # icons, so this both unbreaks packaging AND slims the .pkg.
+        COMMAND "${CMAKE_COMMAND}" -E copy_directory
+            ${CMAKE_CURRENT_SOURCE_DIR}/resources/xml      ${CMAKE_BINARY_DIR}/ps4/resources/xml
+        COMMAND "${CMAKE_COMMAND}" -E copy_directory
+            ${CMAKE_CURRENT_SOURCE_DIR}/resources/i18n     ${CMAKE_BINARY_DIR}/ps4/resources/i18n
+        COMMAND "${CMAKE_COMMAND}" -E copy_directory
+            ${CMAKE_CURRENT_SOURCE_DIR}/resources/icons    ${CMAKE_BINARY_DIR}/ps4/resources/icons
+        COMMAND "${CMAKE_COMMAND}" -E copy_directory
+            ${CMAKE_CURRENT_SOURCE_DIR}/resources/font     ${CMAKE_BINARY_DIR}/ps4/resources/font
+        COMMAND "${CMAKE_COMMAND}" -E copy_directory
+            ${CMAKE_CURRENT_SOURCE_DIR}/resources/material ${CMAKE_BINARY_DIR}/ps4/resources/material
+        COMMAND "${CMAKE_COMMAND}" -E copy
+            ${CMAKE_CURRENT_SOURCE_DIR}/resources/cacert.pem ${CMAKE_BINARY_DIR}/ps4/resources/cacert.pem
+        # Only the icon sets the PS4 build actually consumes — the
+        # native Ps4/ set (used by HintIcons::getResPath on __PS4__),
+        # plus the cross-platform Generic and Flairs sets.
+        COMMAND "${CMAKE_COMMAND}" -E copy_directory
+            ${CMAKE_CURRENT_SOURCE_DIR}/resources/images/Ps4
+            ${CMAKE_BINARY_DIR}/ps4/resources/images/Ps4
+        COMMAND "${CMAKE_COMMAND}" -E copy_directory
+            ${CMAKE_CURRENT_SOURCE_DIR}/resources/images/Generic
+            ${CMAKE_BINARY_DIR}/ps4/resources/images/Generic
+        COMMAND "${CMAKE_COMMAND}" -E copy_directory
+            ${CMAKE_CURRENT_SOURCE_DIR}/resources/images/Flairs
+            ${CMAKE_BINARY_DIR}/ps4/resources/images/Flairs
+        # Copy borealis system resources
+        COMMAND "${CMAKE_COMMAND}" -E copy_directory ${BOREALIS_DIR}/resources/i18n ${CMAKE_BINARY_DIR}/ps4/resources/i18n
+        COMMAND "${CMAKE_COMMAND}" -E copy_directory ${BOREALIS_DIR}/resources/img ${CMAKE_BINARY_DIR}/ps4/resources/img
+    )
+    add_dependencies(${PROJECT_NAME} ${PROJECT_NAME}.data)
+
+    # ── PS4 updater helper (self-update) ────────────────────────────────
+    # A second, tiny PS4 app with its own title id (VPLX00003). VitaPlex
+    # cannot replace itself in place: BGFT installs into the running
+    # /user/app/VPLX00002 (locked), the installer returns 0x80990088
+    # "already installed", and uninstalling the running title just kills the
+    # process. So at update time VitaPlex launches this helper and quits;
+    # with VitaPlex closed the helper uninstalls VPLX00002 and hands the
+    # downloaded pkg to the system installer (BGFT), which finishes in the
+    # background. Shipped as its own pkg, installed once (like the Vita
+    # updater stub VPLXUPD01). It has no UI, so it needs only the borealis
+    # PS4 base (sce_module + sce_sys) — no app resources.
+    if(PS4)
+        add_executable(vitahub_updater_ps4 hub/core/src/updater_ps4/main.cpp)
+        target_compile_definitions(vitahub_updater_ps4 PRIVATE __PS4__)
+        # stb_image (vendored with borealis's nanovg) decodes the app icon for
+        # the helper's progress screen — it links no other image/font code.
+        target_include_directories(vitahub_updater_ps4 PRIVATE
+            ${BOREALIS_LIBRARY}/include/borealis/extern/nanovg)
+        # SDL2 is required at RUNTIME, not just to link: the helper calls
+        # SDL_Init(SDL_INIT_VIDEO) before touching any system service, exactly
+        # as borealis's Ps4Platform does ("Initialize here for loading the
+        # system modules"). Without that call every privileged call faults.
+        # Plus the libs whose functions the helper calls: BGFT + AppInstUtil
+        # (+ SceUserService for AppInstUtil's user context). We deliberately do
+        # NOT call SceSysmodule — PS4-Store doesn't either; linking these libs
+        # loads their PRX via the app's NEEDED list.
+        if(NOT TARGET SDL2::SDL2-static)
+            find_package(SDL2 REQUIRED)
+        endif()
+        target_link_libraries(vitahub_updater_ps4
+            SceBgft SceAppInstUtil SceUserService SDL2::SDL2-static)
+        add_custom_target(vitahub_updater_ps4.data
+            COMMAND "${CMAKE_COMMAND}" -E copy_directory
+                ${BOREALIS_DIR}/ps4 ${CMAKE_BINARY_DIR}/ps4_updater
+            COMMAND "${CMAKE_COMMAND}" -E copy_directory
+                ${CMAKE_SOURCE_DIR}/app/platform/ps4 ${CMAKE_BINARY_DIR}/ps4_updater
+            # The progress screen's artwork must be a PLAIN file: sce_sys is the
+            # package metadata dir, so sce_sys/icon0.png is consumed by the pkg
+            # tool and cannot be opened at runtime.
+            COMMAND "${CMAKE_COMMAND}" -E copy
+                ${CMAKE_SOURCE_DIR}/app/platform/ps4/sce_sys/icon0.png
+                ${CMAKE_BINARY_DIR}/ps4_updater/updater_icon.png
+        )
+        add_dependencies(vitahub_updater_ps4 vitahub_updater_ps4.data)
+        add_self(vitahub_updater_ps4)
+        add_pkg(vitahub_updater_ps4
+            ${CMAKE_BINARY_DIR}/ps4_updater
+            "VHUB00003"
+            "VitaHub Updater"
+            "01.00"
+            # Match VitaPlex's SFO attribute (Support PS4 Pro) for consistency.
+            8388608
+        )
+
+        # Bundle the helper's pkg INSIDE VitaPlex's pkg (as /app0/updater.pkg),
+        # so the user only ever installs one app — the same approach the Vita
+        # build uses for its updater stub. When an update needs the helper and
+        # it isn't installed yet, VitaPlex copies this out and installs it
+        # (ps4::installUpdaterApp). The dependency forces the helper's pkg to be
+        # built and copied in BEFORE VitaPlex's pkg is packed.
+        # The pkg tool names its output from the CONTENT_ID
+        # (IV0001-VPLX00003_00-...), not from the target, so the file is located
+        # by glob at build time rather than by a hard-coded path.
+        add_custom_target(vitahub_updater_ps4.bundle
+            COMMAND "${CMAKE_COMMAND}"
+                -DSRC_DIR=${CMAKE_BINARY_DIR}
+                -DDST=${CMAKE_BINARY_DIR}/ps4/updater.pkg
+                -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/bundle_updater_pkg.cmake
+            DEPENDS vitahub_updater_ps4_pkg
+        )
+        add_dependencies(${PROJECT_NAME}_pkg vitahub_updater_ps4.bundle)
+    endif()
+
+elseif(PLATFORM_SWITCH)
+    # Which release asset the in-app updater must download (see
+    # utils/app_update.cpp assetSuffix): the deko3d and opengl NROs are
+    # separate assets, and swapping drivers via an update would strand the
+    # user with shaders their build cannot load.
+    if(USE_DEKO3D)
+        target_compile_definitions(${PROJECT_NAME} PRIVATE VITAHUB_NRO_DEKO3D)
+    endif()
+    # Build NRO with embedded romfs resources (matches switchfin approach).
+    # nx_create_nro doesn't embed romfs or set metadata correctly, so we
+    # call nacptool + elf2nro manually.
+    if(USE_DEKO3D)
+        gen_dksh("${CMAKE_CURRENT_SOURCE_DIR}/resources/shaders")
+    endif()
+    add_custom_target(${PROJECT_NAME}.nro ALL DEPENDS ${PROJECT_NAME}
+        # Generate NACP metadata (author, version shown in hbmenu)
+        COMMAND ${NX_NACPTOOL_EXE} --create "VitaHub" "Breezyslasher"
+            "${PROJECT_VERSION}" ${PROJECT_NAME}.nacp
+        # Assemble romfs: app resources + borealis system resources
+        COMMAND ${CMAKE_COMMAND} -E copy_directory
+            ${CMAKE_CURRENT_SOURCE_DIR}/resources ${CMAKE_BINARY_DIR}/resources
+        COMMAND ${CMAKE_COMMAND} -E copy_directory
+            ${BOREALIS_DIR}/resources/i18n ${CMAKE_BINARY_DIR}/resources/i18n
+        COMMAND ${CMAKE_COMMAND} -E copy_directory
+            ${BOREALIS_DIR}/resources/img ${CMAKE_BINARY_DIR}/resources/img
+        # Build NRO with icon, metadata, and romfs
+        COMMAND ${NX_ELF2NRO_EXE} ${PROJECT_NAME}.elf ${PROJECT_NAME}.nro
+            --icon=${CMAKE_CURRENT_SOURCE_DIR}/app/platform/icon_switch.jpg
+            --nacp=${PROJECT_NAME}.nacp
+            --romfsdir=${CMAKE_BINARY_DIR}/resources
+    )
+
+elseif(PLATFORM_IOS OR PLATFORM_TVOS)
+    # iOS / tvOS: turn the executable into a proper .app bundle.
+    # Resources are embedded via borealis's libromfs (RESOURCE_PREFIX
+    # is "romfs:/", same as Switch), so we don't need a separate
+    # resources/ copy step — the libromfs generator vacuums them up.
+    #
+    # The bundle ships an Info.plist + launch storyboard + asset
+    # catalog from app/platform/ios/, with substituted version /
+    # bundle-id strings. Code-signing is left to the developer (Xcode
+    # auto-sign or a manual identity); CI just produces the unsigned
+    # .app, which can be re-signed for sideloading via AltStore or
+    # ldid for TrollStore devices.
+    set_target_properties(${PROJECT_NAME} PROPERTIES
+        MACOSX_BUNDLE TRUE
+        MACOSX_BUNDLE_BUNDLE_NAME            "VitaHub"
+        MACOSX_BUNDLE_BUNDLE_VERSION         "${APP_VERSION}"
+        MACOSX_BUNDLE_SHORT_VERSION_STRING   "${APP_DISPLAY_VERSION}"
+        MACOSX_BUNDLE_GUI_IDENTIFIER         "io.github.breezyslasher.vitahub"
+        MACOSX_BUNDLE_INFO_PLIST             "${CMAKE_SOURCE_DIR}/app/platform/ios/Info.plist.in"
+        XCODE_ATTRIBUTE_PRODUCT_BUNDLE_IDENTIFIER "io.github.breezyslasher.vitahub"
+    )
+    if(PLATFORM_IOS)
+        set_target_properties(${PROJECT_NAME} PROPERTIES
+            XCODE_ATTRIBUTE_TARGETED_DEVICE_FAMILY "1,2"
+            XCODE_ATTRIBUTE_IPHONEOS_DEPLOYMENT_TARGET "14.0")
+    elseif(PLATFORM_TVOS)
+        set_target_properties(${PROJECT_NAME} PROPERTIES
+            XCODE_ATTRIBUTE_TARGETED_DEVICE_FAMILY "3"
+            XCODE_ATTRIBUTE_TVOS_DEPLOYMENT_TARGET "14.0")
+    endif()
+
+    # Splash storyboard + asset catalog (icons). Both live under
+    # app/platform/ios/ — iphoneos/Splash.storyboard for iOS,
+    # tvos/Splash.storyboard for tvOS.
+    if(PLATFORM_IOS)
+        target_sources(${PROJECT_NAME} PRIVATE
+            ${CMAKE_SOURCE_DIR}/app/platform/ios/iphoneos/Splash.storyboard)
+        set_source_files_properties(
+            ${CMAKE_SOURCE_DIR}/app/platform/ios/iphoneos/Splash.storyboard
+            PROPERTIES MACOSX_PACKAGE_LOCATION Resources)
+    elseif(PLATFORM_TVOS)
+        target_sources(${PROJECT_NAME} PRIVATE
+            ${CMAKE_SOURCE_DIR}/app/platform/ios/tvos/Splash.storyboard)
+        set_source_files_properties(
+            ${CMAKE_SOURCE_DIR}/app/platform/ios/tvos/Splash.storyboard
+            PROPERTIES MACOSX_PACKAGE_LOCATION Resources)
+    endif()
+    if(EXISTS "${CMAKE_SOURCE_DIR}/app/platform/ios/Images.xcassets")
+        target_sources(${PROJECT_NAME} PRIVATE
+            ${CMAKE_SOURCE_DIR}/app/platform/ios/Images.xcassets)
+        set_source_files_properties(
+            ${CMAKE_SOURCE_DIR}/app/platform/ios/Images.xcassets
+            PROPERTIES MACOSX_PACKAGE_LOCATION Resources)
+    endif()
+
+elseif(PLATFORM_DESKTOP)
+    # Copy app resources next to the binary so relative paths resolve.
+    # Also copy borealis system resources (i18n/hints.json, img/sys/) which
+    # are not checked in to resources/ but are required by borealis at runtime.
+    add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_directory
+            ${CMAKE_CURRENT_SOURCE_DIR}/resources
+            $<TARGET_FILE_DIR:${PROJECT_NAME}>/resources
+        COMMAND ${CMAKE_COMMAND} -E copy_directory
+            ${BOREALIS_DIR}/resources/i18n
+            $<TARGET_FILE_DIR:${PROJECT_NAME}>/resources/i18n
+        COMMAND ${CMAKE_COMMAND} -E copy_directory
+            ${BOREALIS_DIR}/resources/img
+            $<TARGET_FILE_DIR:${PROJECT_NAME}>/resources/img
+        COMMENT "Copying resources (app + borealis) for desktop build"
     )
 endif()

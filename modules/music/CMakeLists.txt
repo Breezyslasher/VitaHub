@@ -209,3 +209,8 @@ if(PLATFORM_PSV)
 else()
     target_link_libraries(vitahub_music PUBLIC datachannel-static)
 endif()
+
+if(PLATFORM_PSV)
+    # QR sign-in (camera), clock control in the player and QR scanner.
+    target_link_libraries(vitahub_music PUBLIC SceCamera_stub ScePower_stub)
+endif()

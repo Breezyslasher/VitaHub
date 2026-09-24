@@ -521,13 +521,6 @@ bool needsHardExit() {
 }  // namespace platform
 }  // namespace vitahub
 
-#ifdef __ANDROID__
-// Java -> native: a link arrived while the app was already running, so there is
-// a UI to open it with right now. onCreate's link takes the polled path instead.
-extern "C" JNIEXPORT void JNICALL
-Java_org_VitaPlex_app_VitaPlexActivity_nativeDeepLink(JNIEnv*, jclass) {
-    brls::sync([]() {
-        vitahub::platform::invokeDeepLinkHandler();
-    });
-}
-#endif
+// VitaHub: Java_org_VitaPlex_app_VitaPlexActivity_nativeDeepLink (a plex://
+// link arriving while the app runs) is exported by the Plex module's copy of
+// this file, which owns Plex deep links; defining it here too would clash.

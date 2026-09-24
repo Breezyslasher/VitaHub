@@ -1,9 +1,13 @@
 #!/usr/bin/env python3
-"""Generate VitaHub's PS Vita LiveArea art from the four service icons.
+"""Generate VitaHub's icons and store art from the four service icons.
 
-Writes app/platform/psv/sce_sys/{icon0,pic0}.png and
-livearea/contents/{bg,startup}.png. The Vita only accepts 8-bit palette
-PNGs there, so every image is quantised before saving.
+- PS Vita: app/platform/psv/sce_sys/{icon0,pic0}.png and
+  livearea/contents/{bg,startup}.png (8-bit palette PNGs, as the Vita
+  requires).
+- Every other platform: a 1024 px master icon (app/platform/icon_master.png)
+  and the sizes each packaging format wants, derived from it: desktop,
+  Switch (.jpg), PS4 sce_sys, iOS/tvOS asset catalog, Android launcher
+  mipmaps + TV banner, and the Windows .ico.
 
 Needs Pillow:  pip install pillow
 """
@@ -86,5 +90,51 @@ def main():
     save_indexed(startup, os.path.join(OUT, "livearea", "contents", "startup.png"))
 
 
+def master_icon(size=1024):
+    """The 2x2 service grid on a dark rounded tile."""
+    tile = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+    ImageDraw.Draw(tile).rounded_rectangle([0, 0, size - 1, size - 1], size // 5, fill=BG + (255,))
+    pad = size // 9
+    tile.alpha_composite(icon_grid(size - 2 * pad, size // 28, size // 11), (pad, pad))
+    return tile
+
+
+def save(img, path, **kw):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    img.save(path, **kw)
+    print("wrote", os.path.relpath(path, ROOT))
+
+
+def other_platforms():
+    plat = os.path.join(ROOT, "app", "platform")
+    master = master_icon()
+    save(master, os.path.join(plat, "icon_master.png"))
+    save(master.resize((256, 256), Image.LANCZOS), os.path.join(plat, "icon_desktop.png"))
+    # Switch hbmenu icon: 256x256 JPEG, no alpha.
+    flat = Image.new("RGB", (1024, 1024), BG)
+    flat.paste(master, (0, 0), master)
+    save(flat.resize((256, 256), Image.LANCZOS), os.path.join(plat, "icon_switch.jpg"), quality=92)
+    # PS4 sce_sys.
+    save(master.resize((256, 256), Image.LANCZOS), os.path.join(plat, "ps4", "sce_sys", "icon0.png"))
+    save(banner(1920, 1080, 440, 128, "Movies · Audiobooks · Manga · Music").convert("RGB"),
+         os.path.join(plat, "ps4", "sce_sys", "pic0.png"))
+    # iOS / tvOS asset catalog: every size the catalog's Contents.json names.
+    iconset = os.path.join(plat, "ios", "Images.xcassets", "AppIcon.appiconset")
+    for fn in sorted(os.listdir(iconset)):
+        if fn.endswith(".png"):
+            n = int(fn[:-4])
+            # App Store icons must not have an alpha channel.
+            save(flat.resize((n, n), Image.LANCZOS), os.path.join(iconset, fn))
+    # Android launcher icons + Android TV banner.
+    res = os.path.join(plat, "android", "app", "src", "main", "res")
+    for density, n in (("mdpi", 48), ("hdpi", 72), ("xhdpi", 96), ("xxhdpi", 144)):
+        save(master.resize((n, n), Image.LANCZOS), os.path.join(res, "mipmap-" + density, "ic_launcher.png"))
+    save(banner(320, 180, 110, 30, "Media hub"), os.path.join(res, "drawable-xhdpi", "banner.png"))
+    # Windows .ico with the usual sizes.
+    save(master, os.path.join(plat, "windows", "vitahub.ico"),
+         sizes=[(16, 16), (24, 24), (32, 32), (48, 48), (64, 64), (128, 128), (256, 256)])
+
+
 if __name__ == "__main__":
     main()
+    other_platforms()

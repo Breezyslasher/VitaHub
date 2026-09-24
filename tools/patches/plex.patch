@@ -72,6 +72,22 @@ index ade1e5f..db8fba0 100644
  
      // Main loop handled by Borealis
      while (brls::Application::mainLoop()) {
+diff --git a/modules/plex/src/platform/platform_android.cpp b/modules/plex/src/platform/platform_android.cpp
+index caeb3e9..e1cb013 100644
+--- a/modules/plex/src/platform/platform_android.cpp
++++ b/modules/plex/src/platform/platform_android.cpp
+@@ -26,9 +26,11 @@
+ // SDL_main symbol here and forward it to the shared entry point.
+ extern "C" int VitaPlexMainEntry(int argc, char* argv[]);
+ 
++#ifndef VITAHUB  // inside VitaHub the hub owns the entry point (hub/core)
+ extern "C" int SDL_main(int argc, char* argv[]) {
+     return VitaPlexMainEntry(argc, argv);
+ }
++#endif
+ 
+ namespace vitaplex {
+ namespace platform {
 diff --git a/modules/plex/src/platform/platform_psv.cpp b/modules/plex/src/platform/platform_psv.cpp
 index 38eab11..9bf1509 100644
 --- a/modules/plex/src/platform/platform_psv.cpp

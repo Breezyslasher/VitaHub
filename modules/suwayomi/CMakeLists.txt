@@ -42,8 +42,15 @@ set(SUWAYOMI_SOURCES
     src/utils/perf_overlay.cpp
 )
 
+# One platform_<name>.cpp, plus each platform's extras, as upstream.
 if(PLATFORM_PSV)
     list(APPEND SUWAYOMI_SOURCES src/platform/platform_vita.cpp src/utils/vita_install.cpp)
+elseif(PLATFORM_PS4)
+    list(APPEND SUWAYOMI_SOURCES src/platform/platform_ps4.cpp src/utils/ps4_install.cpp)
+elseif(PLATFORM_SWITCH)
+    list(APPEND SUWAYOMI_SOURCES src/platform/platform_switch.cpp)
+elseif(PLATFORM_ANDROID)
+    list(APPEND SUWAYOMI_SOURCES src/platform/platform_android.cpp src/platform/android_assets.cpp)
 else()
     list(APPEND SUWAYOMI_SOURCES src/platform/platform_desktop.cpp)
 endif()
@@ -54,10 +61,13 @@ vitahub_module_target(vitahub_suwayomi suwayomi)
 vitahub_module_version(suwayomi SUWAYOMI_VERSION SUWAYOMI_DISPLAY_VERSION)
 target_compile_definitions(vitahub_suwayomi PRIVATE
     VITA_SUWAYOMI_VERSION=\"${SUWAYOMI_VERSION}\"
-    VITA_SUWAYOMI_DISPLAY_VERSION=\"${SUWAYOMI_DISPLAY_VERSION}\"
-    VITASUWAYOMI_HAVE_MBEDCRYPTO=1)
+    VITA_SUWAYOMI_DISPLAY_VERSION=\"${SUWAYOMI_DISPLAY_VERSION}\")
 
 if(PLATFORM_DESKTOP AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
-    # As upstream: the Linux build decodes WebP via libwebp, not FFmpeg.
+    # As upstream: FFmpeg is only used for rare AVIF/HEIF pages, and Linux
+    # distros ship different FFmpeg versions, so the Linux build goes without.
     target_compile_definitions(vitahub_suwayomi PRIVATE VITASUWAYOMI_NO_FFMPEG)
+endif()
+if(PLATFORM_SWITCH AND USE_DEKO3D)
+    target_compile_definitions(vitahub_suwayomi PRIVATE VITASUWAYOMI_NRO_DEKO3D)
 endif()
